@@ -47,8 +47,8 @@ pub struct SynopsisRelationship {
 pub struct SynopsisSummary {
     /// Human-readable Japanese synopsis (3–5 sentences)
     pub human_summary_ja: String,
-    /// Short translation context memo (300–800 chars) for subtitle translation API
-    pub llm_context_short_ja: String,
+    /// Short translation context memo (150–300 chars, max 500) for subtitle translation API
+    pub translation_context_short_ja: String,
     /// Longer structured translation context as Markdown (optional, for reference)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_context_markdown: Option<String>,
@@ -69,6 +69,37 @@ pub struct SynopsisSummary {
     pub central_conflict: Option<String>,
     #[serde(default)]
     pub translation_guidelines: Vec<String>,
+}
+
+/// Replace Chinese names in a generated text with their Japanese kanji equivalents
+/// from proper nouns and merged cast entries.
+fn normalize_names_in_context(text: &str, nouns: &[ProperNoun], cast: &[MergedCastEntry]) -> String {
+    // Collect (chinese, japanese_kanji) pairs where conversion actually changed the text
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+
+    for noun in nouns {
+        if !noun.japanese_kanji.is_empty() && noun.japanese_kanji != noun.chinese {
+            pairs.push((&noun.chinese, &noun.japanese_kanji));
+        }
+    }
+    for entry in cast {
+        let ja = &entry.character_ja_kanji;
+        let zh = &entry.character_zh;
+        if !ja.is_empty() && !zh.is_empty() && ja != zh {
+            pairs.push((zh, ja));
+        }
+    }
+
+    // Sort by Chinese text length descending to avoid partial matches
+    pairs.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
+    // Deduplicate by Chinese text
+    pairs.dedup_by(|a, b| a.0 == b.0);
+
+    let mut result = text.to_string();
+    for (zh, ja) in &pairs {
+        result = result.replace(*zh, *ja);
+    }
+    result
 }
 
 fn build_cast_context(cast: &[MergedCastEntry]) -> String {
@@ -109,7 +140,7 @@ pub async fn summarize_synopsis(
     let provider = resolve_provider(&state, &env_store, &app)?;
     let client = LlmClient::new(provider);
 
-    let cast_context = build_cast_context(&merged_cast.unwrap_or_default());
+    let cast_context = build_cast_context(merged_cast.as_deref().unwrap_or_default());
 
     // --- Web search for external drama context ---
     let web_context = web_search::search_drama_context(
@@ -142,26 +173,35 @@ pub async fn summarize_synopsis(
 
     // --- System prompt for translation context ---
     let system_context = concat!(
-        "You are preparing translation context for an LLM that will translate drama subtitles into Japanese.\n\n",
-        "Produce a JSON object with these fields:\n",
-        "- human_summary_ja: A short human-readable Japanese synopsis (3-5 sentences).\n",
-        "- llm_context_short_ja: A very short translation context memo in Japanese.\n\n",
-        "IMPORTANT for llm_context_short_ja:\n",
-        "- Do NOT write a long synopsis or detailed character biographies.\n",
-        "- Extract only the minimum information needed for subtitle translation.\n",
-        "- Keep it within 300-500 Japanese characters if possible, and NEVER exceed 800 characters.\n",
-        "- Write it as a single paragraph (not Markdown, not bullet points, not headings).\n",
-        "- Include only: setting/world type, main characters and core relationships,\n",
-        "  important factions or status terms, translation policy for names and titles.\n",
-        "- Prefer Japanese kanji names from the cast dictionary.\n",
-        "- If the historical period is unclear, describe it as a fictional ancient-Chinese-style setting.\n\n",
-        "Rules (both fields):\n",
-        "- Use the web search results (【Web検索結果】) as the primary factual source.\n",
-        "- Supplement with the provided synopsis text where search results are incomplete.\n",
-        "- If search results and synopsis conflict, prefer the search results.\n",
-        "- Do not invent facts not supported by search results or synopsis.\n",
-        "- All search results are in Chinese or English. Produce ALL output in Japanese.\n",
-        "- Return valid JSON: {\"human_summary_ja\": \"...\", \"llm_context_short_ja\": \"...\"}.",
+        "あなたは、ドラマ字幕を日本語に翻訳するLLMへ渡すための短い背景メモを作成します。\n\n",
+        "これは人間向けのあらすじではありません。\n",
+        "字幕翻訳に必要な最小限の設定情報だけを抽出してください。\n\n",
+        "出力するJSONオブジェクト:\n",
+        "- human_summary_ja: 人間向けの短い日本語あらすじ（3〜5文）\n",
+        "- translation_context_short_ja: 翻訳LLMに渡す短い背景メモ（日本語）\n\n",
+        "【translation_context_short_ja の方針 — 最重要】\n",
+        "- 150〜300字程度、最大500字以内に収める。\n",
+        "- 箇条書きでも短文でもよい。\n",
+        "- 詳細な筋書き・ネタバレ・復讐・殺害・捜索などの具体的展開は一切書かない。\n",
+        "- 恋人・敵などの強い関係性の断定は避ける。\n",
+        "- 長い人物紹介や文学的な要約は不要。\n\n",
+        "含める内容:\n",
+        "- 世界観・時代感（実在史か架空世界か）\n",
+        "- 主要人物と最低限の属性（身分・立場のみ）\n",
+        "- 主要勢力名\n",
+        "- 固有名詞・役名の翻訳方針（対応表の日本語漢字表記を優先）\n",
+        "- 身分語・役職語の訳し方\n\n",
+        "時代設定について:\n",
+        "- 実在の歴史に基づくと確信できる場合のみ実在史として扱う。\n",
+        "- 不明な場合は「古代中国風の架空世界」または「架空世界」と表現する。\n",
+        "- 実在史でも創作要素が強い場合は「〜を下敷きにした創作」と表現する。\n\n",
+        "共通ルール:\n",
+        "- Web検索結果（【Web検索結果】）を最も信頼できる情報源として使う。\n",
+        "- Web検索結果にない情報は、提供されたあらすじで補完する。\n",
+        "- 検索結果とあらすじが矛盾する場合は検索結果を優先する。\n",
+        "- 提供された情報にない事実を創作しない。\n",
+        "- 検索結果は中国語または英語。すべての出力は日本語。\n",
+        "- 有効なJSONを返す: {\"human_summary_ja\": \"...\", \"translation_context_short_ja\": \"...\"}",
     );
 
     // --- System prompt for proper nouns ---
@@ -176,7 +216,7 @@ pub async fn summarize_synopsis(
     #[derive(Deserialize)]
     struct ContextJson {
         human_summary_ja: String,
-        llm_context_short_ja: String,
+        translation_context_short_ja: String,
     }
 
     let ctx: ContextJson = serde_json::from_value(context_result?)
@@ -238,9 +278,16 @@ pub async fn summarize_synopsis(
             ja_kanji_batch::normalize_ja_punctuation(&noun.japanese_kanji);
     }
 
+    // Replace Chinese names in the context memo with Japanese kanji
+    let context_ja = normalize_names_in_context(
+        &ctx.translation_context_short_ja,
+        &proper_nouns,
+        &merged_cast.unwrap_or_default(),
+    );
+
     Ok(SynopsisSummary {
         human_summary_ja: ctx.human_summary_ja,
-        llm_context_short_ja: ctx.llm_context_short_ja,
+        translation_context_short_ja: context_ja,
         llm_context_markdown: None,
         proper_nouns,
         work_type: None,
@@ -251,4 +298,124 @@ pub async fn summarize_synopsis(
         central_conflict: None,
         translation_guidelines: vec![],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_names_replaces_chinese_with_kanji_in_context() {
+        let text = "楚乔（奴籍出身の少女）。諸葛玥とは氷湖での事件を機に絆が生まれる。";
+        let nouns = vec![ProperNoun {
+            chinese: "冰湖".into(),
+            english: "Ice Lake".into(),
+            japanese_kanji: "氷湖".into(),
+            ja_kanji_source: "llm".into(),
+            ja_kanji_confidence: None,
+            ja_kanji_reason: None,
+        }];
+        let cast = vec![
+            MergedCastEntry {
+                actor_zh: "赵丽颖".into(),
+                actor_en_douban: None,
+                actor_en_matched: "Zhao Liying".into(),
+                character_zh: "楚乔".into(),
+                character_en: Some("Chu Qiao".into()),
+                source_en: "Tmdb".into(),
+                character_ja_kanji: "楚喬".into(),
+                character_ja_kanji_source: "llm".into(),
+                character_ja_kanji_confidence: None,
+                character_ja_kanji_note: None,
+                confidence: 0.9,
+                match_reason: "exact".into(),
+                alt_character_en: String::new(),
+            },
+            MergedCastEntry {
+                actor_zh: "林更新".into(),
+                actor_en_douban: None,
+                actor_en_matched: "Lin Gengxin".into(),
+                character_zh: "诸葛玥".into(),
+                character_en: Some("Zhuge Yue".into()),
+                source_en: "Tmdb".into(),
+                character_ja_kanji: "諸葛玥".into(),
+                character_ja_kanji_source: "llm".into(),
+                character_ja_kanji_confidence: None,
+                character_ja_kanji_note: None,
+                confidence: 0.9,
+                match_reason: "exact".into(),
+                alt_character_en: String::new(),
+            },
+        ];
+
+        let result = normalize_names_in_context(text, &nouns, &cast);
+        assert!(result.contains("楚喬"), "should replace 楚乔→楚喬, got: {}", result);
+        assert!(result.contains("諸葛玥"), "should replace 诸葛玥→諸葛玥, got: {}", result);
+        assert!(result.contains("氷湖"), "should replace 冰湖→氷湖, got: {}", result);
+        assert!(!result.contains("楚乔"), "should not contain original 楚乔");
+        assert!(!result.contains("诸葛玥"), "should not contain original 诸葛玥");
+    }
+
+    #[test]
+    fn normalize_names_skips_unchanged_text() {
+        let text = "大夏、燕北、卞唐などの国々。";
+        let nouns = vec![ProperNoun {
+            chinese: "大夏".into(),
+            english: "Daxia".into(),
+            japanese_kanji: "大夏".into(), // same as Chinese — no replacement needed
+            ja_kanji_source: "llm".into(),
+            ja_kanji_confidence: None,
+            ja_kanji_reason: None,
+        }];
+        let cast = vec![];
+
+        let result = normalize_names_in_context(text, &nouns, &cast);
+        // Should be unchanged since kanji equals Chinese
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn normalize_names_longest_first_to_avoid_partial_match() {
+        // 燕北世子 should be replaced before 燕北 to avoid partial match issues
+        let text = "燕北世子・燕洵と燕北の民。";
+        let cast = vec![
+            MergedCastEntry {
+                actor_zh: "窦骁".into(),
+                actor_en_douban: None,
+                actor_en_matched: "Dou Xiao".into(),
+                character_zh: "燕洵".into(),
+                character_en: Some("Yan Xun".into()),
+                source_en: "Tmdb".into(),
+                character_ja_kanji: "燕洵".into(), // unchanged — won't be replaced
+                character_ja_kanji_source: "rule".into(),
+                character_ja_kanji_confidence: None,
+                character_ja_kanji_note: None,
+                confidence: 0.9,
+                match_reason: "exact".into(),
+                alt_character_en: String::new(),
+            },
+        ];
+        let nouns = vec![
+            ProperNoun {
+                chinese: "燕北世子".into(),
+                english: "Yanbei Shizi".into(),
+                japanese_kanji: "燕北世子".into(),
+                ja_kanji_source: "llm".into(),
+                ja_kanji_confidence: None,
+                ja_kanji_reason: None,
+            },
+            ProperNoun {
+                chinese: "燕北".into(),
+                english: "Yanbei".into(),
+                japanese_kanji: "燕北".into(),
+                ja_kanji_source: "llm".into(),
+                ja_kanji_confidence: None,
+                ja_kanji_reason: None,
+            },
+        ];
+
+        // All terms have same Chinese/Japanese, so text stays unchanged
+        let result = normalize_names_in_context(text, &nouns, &cast);
+        assert_eq!(result, text, "unchanged when kanji matches Chinese");
+    }
 }

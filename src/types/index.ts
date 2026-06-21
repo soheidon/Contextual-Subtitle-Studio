@@ -325,8 +325,8 @@ export interface SynopsisRelationship {
 
 export interface SynopsisSummary {
   human_summary_ja: string;
-  /** Short translation context memo (300-800 chars) for subtitle translation API */
-  llm_context_short_ja: string;
+  /** Short translation context memo (150-300 chars, max 500) for subtitle translation API */
+  translation_context_short_ja: string;
   /** Longer Markdown context (optional, for reference) */
   llm_context_markdown?: string | null;
   proper_nouns: ProperNoun[];

@@ -1,9 +1,9 @@
 import { useState, useRef } from "react";
-import { ClipboardPaste, GitMerge, Download, Globe, Loader2, ShieldCheck, FolderOpen, Search, FileText } from "lucide-react";
-import { searchTmdb, scrapeTmdbCredits, buildCharacterDict, scrapeUrl, verifyCharacterDict, saveDramaInfo, loadDramaInfo, parseMdlHtmlPaste, openUrl, summarizeSynopsis, mergeCastEntries, correctJaKanji, enrichDictKanji } from "../../lib/tauri";
-import CharacterDictQuality from "./CharacterDictQuality";
+import { ClipboardPaste, GitMerge, Download, Globe, Loader2, FolderOpen, Search, FileText, Copy, Save } from "lucide-react";
+import { searchTmdb, scrapeTmdbCredits, buildCharacterDict, scrapeUrl, saveDramaInfo, loadDramaInfo, parseMdlHtmlPaste, openUrl, summarizeSynopsis, mergeCastEntries, correctJaKanji, enrichDictKanji } from "../../lib/tauri";
+import { buildPromptText } from "../../lib/prompt";
 import DramaSearchPanel from "./DramaSearchPanel";
-import type { PastedEntry, CharacterDict, QualityReport, DramaInfo, TmdbSearchResult, SynopsisSummary, MergedCastEntry } from "../../types";
+import type { PastedEntry, CharacterDict, DramaInfo, TmdbSearchResult, SynopsisSummary, MergedCastEntry } from "../../types";
 import { useAppLogStore } from "../../stores/useAppLogStore";
 
 function normalizeDoubanUrl(url: string): string | null {
@@ -11,11 +11,6 @@ function normalizeDoubanUrl(url: string): string | null {
   if (!m) return null;
   return `https://movie.douban.com/subject/${m[1]}/celebrities`;
 }
-
-const CONFIDENCE_HIGH = 0.85;
-const CONFIDENCE_MEDIUM = 0.60;
-
-type ConfidenceFilter = "All" | "high" | "medium" | "low";
 
 type Tab = "douban" | "imdb" | "mdl" | "merge";
 
@@ -42,10 +37,7 @@ export default function CharacterDictBuilder() {
   const [dict, setDict] = useState<CharacterDict | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [editableDict, setEditableDict] = useState<Record<string, { kanji: string; reading: string }>>({});
   const [workDir, setWorkDir] = useState<string>("");
-  const [qualityReport, setQualityReport] = useState<QualityReport | null>(null);
-  const [confidenceFilter, setConfidenceFilter] = useState<ConfidenceFilter>("All");
   const [synopsisSummary, setSynopsisSummary] = useState<SynopsisSummary | null>(null);
   const [summarizing, setSummarizing] = useState(false);
   const [summaryError, setSummaryError] = useState<string | null>(null);
@@ -222,8 +214,6 @@ export default function CharacterDictBuilder() {
       }
       if (bundle.character_dict) {
         setDict(bundle.character_dict);
-        const report = await verifyCharacterDict(bundle.character_dict);
-        setQualityReport(report);
       }
       if (bundle.synopsis_summary) {
         setSynopsisSummary(bundle.synopsis_summary);
@@ -390,7 +380,7 @@ export default function CharacterDictBuilder() {
       );
       setSynopsisSummary(summary);
       setEditablePnKanji({});
-      addLog("success", "Synopsis", `要約完了: human_summary=${summary.human_summary_ja.length}文字, short_context=${summary.llm_context_short_ja.length}文字, 固有名詞=${summary.proper_nouns.length}件`);
+      addLog("success", "Synopsis", `要約完了: human_summary=${summary.human_summary_ja.length}文字, context=${summary.translation_context_short_ja.length}文字, 固有名詞=${summary.proper_nouns.length}件`);
       if (workDir) {
         saveDramaInfo(workDir, { metadata: null, synopsis_douban: doubanDrama?.synopsis || null, synopsis_tmdb: tmdbDrama?.synopsis || null, cast_douban: doubanEntries, cast_tmdb: tmdbEntries, cast_mdl: mdlHtmlEntries, character_dict: dict, synopsis_summary: summary, merged_cast: mergedCast })
           .catch((e) => console.error("保存エラー:", e));
@@ -419,9 +409,6 @@ export default function CharacterDictBuilder() {
         addLog("info", "Dictionary", "LLM漢字を辞書に反映しました");
       }
       setDict(result);
-      const report = await verifyCharacterDict(result);
-      setQualityReport(report);
-      setConfidenceFilter("All");
       setActiveTab("merge");
       if (workDir) {
         saveDramaInfo(workDir, { metadata: null, synopsis_douban: doubanDrama?.synopsis || null, synopsis_tmdb: tmdbDrama?.synopsis || null, cast_douban: doubanEntries, cast_tmdb: englishEntries, cast_mdl: mdlHtmlEntries, character_dict: result, synopsis_summary: synopsisSummary, merged_cast: mergedCast })
@@ -434,38 +421,38 @@ export default function CharacterDictBuilder() {
     }
   };
 
-  const handleDownload = async () => {
-    if (!dict) return;
-    const output = Object.entries(dict)
-      .filter(([_, entry]) => entry.ja_kanji_source !== "pending_llm")
-      .map(([key, entry]) => {
-        const edit = editableDict[key] || { kanji: entry.role.japanese_kanji };
-        return {
-          role_en: entry.role.english ?? "",
-          role_cn: entry.role.chinese ?? "",
-          role_ja_kanji: edit.kanji,
-        };
-      });
-    const json = JSON.stringify(output, null, 2);
+  const getPromptInput = () => ({ synopsisSummary, dict, editablePnKanji });
+
+  const handleCopyPrompt = async () => {
+    const prompt = buildPromptText(getPromptInput());
+    try {
+      await navigator.clipboard.writeText(prompt);
+      addLog("info", "Prompt", "プロンプトをクリップボードにコピーしました");
+    } catch {
+      addLog("error", "Prompt", "クリップボードへのコピーに失敗しました");
+    }
+  };
+
+  const handleSavePrompt = async () => {
+    const prompt = buildPromptText(getPromptInput());
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");
       const { writeTextFile } = await import("@tauri-apps/plugin-fs");
-      const defaultPath = workDir ? `${workDir}/characters.json` : undefined;
+      const defaultPath = workDir ? `${workDir}/translation_prompt.txt` : undefined;
       const path = await save({
-        title: "辞書JSONを保存",
+        title: "翻訳プロンプトを保存",
         defaultPath,
-        filters: [{ name: "JSON", extensions: ["json"] }],
+        filters: [{ name: "テキスト", extensions: ["txt"] }],
       });
       if (path) {
-        await writeTextFile(path, json);
+        await writeTextFile(path, prompt);
       }
     } catch {
-      // fallback: browser download
-      const blob = new Blob([json], { type: "application/json" });
+      const blob = new Blob([prompt], { type: "text/plain" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "characters.json";
+      a.download = "translation_prompt.txt";
       a.click();
       URL.revokeObjectURL(url);
     }
@@ -609,15 +596,6 @@ export default function CharacterDictBuilder() {
   };
 
   const canBuild = tmdbEntries.length > 0 || doubanEntries.length > 0;
-  const dictEntries = dict ? Object.entries(dict) : [];
-
-  const filteredEntries = dictEntries.filter(([_, entry]) => {
-    if (confidenceFilter === "All") return true;
-    if (confidenceFilter === "high") return entry.confidence >= CONFIDENCE_HIGH;
-    if (confidenceFilter === "medium") return entry.confidence >= CONFIDENCE_MEDIUM && entry.confidence < CONFIDENCE_HIGH;
-    if (confidenceFilter === "low") return entry.confidence < CONFIDENCE_MEDIUM;
-    return true;
-  });
 
   const tabs: { key: Tab; label: string }[] = [
     { key: "douban", label: "豆瓣" },
@@ -1090,14 +1068,14 @@ export default function CharacterDictBuilder() {
               )}
 
               {/* Translation context memo (short) */}
-              {synopsisSummary?.llm_context_short_ja && (
+              {synopsisSummary?.translation_context_short_ja && (
                 <div className="synopsis-card" style={{ marginTop: 12 }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
                     <div className="synopsis-label" style={{ marginBottom: 0 }}>翻訳用背景メモ</div>
                     <button
                       className="btn btn-secondary btn-sm"
                       onClick={() => {
-                        navigator.clipboard.writeText(synopsisSummary.llm_context_short_ja);
+                        navigator.clipboard.writeText(synopsisSummary.translation_context_short_ja);
                         addLog("info", "Synopsis", "翻訳用背景メモをクリップボードにコピーしました");
                       }}
                       style={{ fontSize: 11 }}
@@ -1105,7 +1083,7 @@ export default function CharacterDictBuilder() {
                       翻訳用背景メモをコピー
                     </button>
                   </div>
-                  <p style={{ fontSize: 13, lineHeight: 1.7, margin: 0 }}>{synopsisSummary.llm_context_short_ja}</p>
+                  <p style={{ fontSize: 13, lineHeight: 1.7, margin: 0 }}>{synopsisSummary.translation_context_short_ja}</p>
                 </div>
               )}
             </div>
@@ -1336,7 +1314,7 @@ export default function CharacterDictBuilder() {
               if (pendingKanji.length > 0) {
                 return (
                   <div style={{ background: "var(--error-bg)", color: "var(--error)", padding: "8px 12px", borderRadius: 4, marginBottom: 12, fontSize: 13, maxWidth: 600 }}>
-                    {pendingKanji.length}件のキャストにLLM漢字変換が未処理です。「LLMで漢字修正」を先に実行してください。未処理のエントリは辞書表示・JSON出力から除外されます。
+                    {pendingKanji.length}件のキャストにLLM漢字変換が未処理です。「俳優・登場人物をまとめる」を先に実行してください（漢字変換含む）。未処理のエントリはプロンプトから除外されます。
                   </div>
                 );
               }
@@ -1349,79 +1327,41 @@ export default function CharacterDictBuilder() {
               style={{ fontSize: 14, padding: "8px 20px" }}
             >
               <GitMerge size={18} />
-              {loading ? "処理中..." : "辞書を構築"}
+              {loading ? "処理中..." : "プロンプトを構築"}
             </button>
           </div>
 
-          {dictEntries.length > 0 && (
-            <>
-              {qualityReport && (
-                <CharacterDictQuality
-                  report={qualityReport}
-                  onFilterChange={setConfidenceFilter}
-                  currentFilter={confidenceFilter}
-                />
-              )}
-
-              <div className="card">
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-                  <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 0 }}>
-                    構築された辞書 ({filteredEntries.length}/{dictEntries.length}件)
-                    {confidenceFilter !== "All" && (
-                      <span style={{ fontSize: 11, color: "var(--text-muted)", marginLeft: 8 }}>
-                        (フィルター: {confidenceFilter === "high" ? "高信頼" : confidenceFilter === "medium" ? "中信頼" : "低信頼"})
-                      </span>
-                    )}
-                  </h3>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <span style={{ fontSize: 11, color: "var(--text-muted)", display: "flex", alignItems: "center" }}>
-                      <ShieldCheck size={12} style={{ marginRight: 4 }} />
-                      ソース & 信頼度付き
-                    </span>
-                    <button className="btn btn-primary" onClick={handleDownload} style={{ fontSize: 12 }}>
-                      <Download size={14} />
-                      JSONダウンロード
-                    </button>
-                  </div>
-                </div>
-                <div className="table-container">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Role (EN)</th>
-                        <th>Role (CN)</th>
-                        <th>日本語（漢字）</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredEntries
-                        .filter(([_, entry]) => entry.ja_kanji_source !== "pending_llm")
-                        .map(([key, entry]) => {
-                          const edit = editableDict[key] || { kanji: entry.role.japanese_kanji, reading: entry.role.japanese_reading };
-                          return (
-                            <tr key={key}>
-                              <td>{entry.role.english ?? "—"}</td>
-                              <td>{entry.role.chinese ?? "—"}</td>
-                              <td>
-                                <input
-                                  className="form-input"
-                                  value={edit.kanji}
-                                  onChange={(e) => setEditableDict(prev => ({
-                                    ...prev,
-                                    [key]: { ...prev[key] || { kanji: "", reading: "" }, kanji: e.target.value }
-                                  }))}
-                                  placeholder="日本語漢字"
-                                  style={{ width: "100%", fontSize: 12 }}
-                                />
-                              </td>
-                            </tr>
-                          );
-                        })}
-                    </tbody>
-                  </table>
+          {dict && (
+            <div className="card" style={{ marginBottom: 16 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 0 }}>翻訳プロンプト</h3>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="btn btn-primary" onClick={handleCopyPrompt} style={{ fontSize: 12 }}>
+                    <Copy size={14} />
+                    プロンプトをコピー
+                  </button>
+                  <button className="btn btn-primary" onClick={handleSavePrompt} style={{ fontSize: 12 }}>
+                    <Save size={14} />
+                    プロンプトを保存
+                  </button>
                 </div>
               </div>
-            </>
+              <pre style={{
+                background: "var(--bg-secondary)",
+                border: "1px solid var(--border)",
+                borderRadius: 6,
+                padding: "16px 20px",
+                fontSize: 13,
+                lineHeight: 1.8,
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                maxHeight: 500,
+                overflowY: "auto",
+                margin: 0,
+              }}>
+                {buildPromptText({ synopsisSummary, dict, editablePnKanji })}
+              </pre>
+            </div>
           )}
         </>
       )}
