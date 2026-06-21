@@ -1,0 +1,29 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui/tauri-v2/main/tauri.conf.schema.json",
+  "productName": "Contextual Subtitle Studio",
+  "version": "0.1.0",
+  "identifier": "com.css.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Contextual Subtitle Studio",
+        "width": 1200,
+        "height": 800
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {
+    "fs": {
+      "requireLiteralLeadingDot": false
+    }
+  }
+}
