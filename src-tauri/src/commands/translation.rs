@@ -17,6 +17,7 @@ pub struct TranslationResult {
 
 #[tauri::command]
 pub async fn start_translation(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     env_store: State<'_, EnvStoreState>,
     translation_config: TranslationConfig,
@@ -36,7 +37,7 @@ pub async fn start_translation(
         stored.clone()
     };
 
-    let provider = resolve_provider(&state, &env_store)?;
+    let provider = resolve_provider(&state, &env_store, &app)?;
     let client = LlmClient::new(provider);
 
     let (translated, issues) = run_translation_pipeline(

@@ -31,6 +31,7 @@ export interface ProviderConfig {
   base_url: string;
   api_key: string;
   model: string;
+  thinking?: string;
 }
 
 export interface EnvVarInfo {
@@ -142,6 +143,9 @@ export interface DramaMetadata {
   douban_url: string | null;
   tmdb_url: string | null;
   imdb_url?: string | null; // 旧互換
+  search_title_zh?: string | null;
+  search_title_en?: string | null;
+  search_year?: string | null;
   updated_at: string | null;
 }
 
@@ -153,7 +157,10 @@ export interface DramaInfoBundle {
   cast_douban: PastedEntry[] | null;
   cast_tmdb: PastedEntry[] | null;
   cast_imdb?: PastedEntry[] | null; // 旧互換
+  cast_mdl: PastedEntry[] | null;
   character_dict: CharacterDict | null;
+  synopsis_summary: SynopsisSummary | null;
+  merged_cast: MergedCastEntry[] | null;
 }
 
 export interface ScrapeResult {
@@ -225,7 +232,7 @@ export interface PastedEntry {
   actor_name: string;
   character_name: string;
   role_type: string | null;
-  source: "MyDramaList" | "Douban" | "Unknown" | "Tmdb";
+  source: "MyDramaList" | "Douban" | "Unknown" | "Tmdb" | "MdlHtml";
 }
 
 export interface ActorNames {
@@ -257,6 +264,7 @@ export interface CharacterDictEntry {
   source_flags: SourceFlags;
   confidence: number;
   match_detail: MatchDetail;
+  ja_kanji_source?: string; // "llm" | "manual" | "pending_llm"
 }
 
 /** Keyed by actor English name (snake_case). */
@@ -286,6 +294,93 @@ export interface QualityReport {
 }
 
 // ---------------------------------------------------------------------------
+// Synopsis summary
+// ---------------------------------------------------------------------------
+
+export interface ProperNoun {
+  chinese: string;
+  english: string;
+  japanese_kanji: string;
+  ja_kanji_source?: string;        // "llm" | "manual" | "pending_llm"
+  ja_kanji_confidence?: number | null;
+  ja_kanji_reason?: string | null;
+}
+
+export interface SynopsisFaction {
+  name: string;
+  description: string;
+}
+
+export interface SynopsisCharacter {
+  name: string;
+  name_zh: string;
+  description: string;
+}
+
+export interface SynopsisRelationship {
+  source: string;
+  target: string;
+  description: string;
+}
+
+export interface SynopsisSummary {
+  human_summary_ja: string;
+  /** Short translation context memo (300-800 chars) for subtitle translation API */
+  llm_context_short_ja: string;
+  /** Longer Markdown context (optional, for reference) */
+  llm_context_markdown?: string | null;
+  proper_nouns: ProperNoun[];
+  work_type?: string | null;
+  setting?: string | null;
+  factions?: SynopsisFaction[];
+  characters?: SynopsisCharacter[];
+  relationships?: SynopsisRelationship[];
+  central_conflict?: string | null;
+  translation_guidelines?: string[];
+}
+
+export interface MergedCastEntry {
+  actor_zh: string;
+  actor_en_douban: string | null;
+  actor_en_matched: string;
+  character_zh: string;
+  character_en: string | null;
+  source_en: string;
+  role_jp?: string; // deprecated — use character_ja_kanji
+  character_ja_kanji: string;
+  character_ja_kanji_source?: string; // "rule" | "llm" | "manual" | ""
+  character_ja_kanji_confidence?: number | null;
+  character_ja_kanji_note?: string | null;
+  confidence: number;
+  match_reason: string;
+  alt_character_en: string;
+}
+
+// ---------------------------------------------------------------------------
+// Character name aliases (for subtitle replacement dictionary)
+// ---------------------------------------------------------------------------
+
+export type AliasType =
+  | "full_zh"
+  | "full_en"
+  | "surname_zh"
+  | "surname_en"
+  | "given_zh"
+  | "given_en";
+
+export interface CharacterAlias {
+  source_text: string;
+  target_text: string;
+  type: AliasType;
+  character_zh: string;
+  character_en: string;
+  character_ja_kanji: string;
+  enabled: boolean;
+  ambiguous: boolean;
+  note: string | null;
+}
+
+// ---------------------------------------------------------------------------
 // MDL WebView DOM extraction
 // ---------------------------------------------------------------------------
 
@@ -293,6 +388,36 @@ export interface MdlExtractResult {
   title: string | null;
   synopsis: string | null;
   entries: PastedEntry[];
+}
+
+export interface ServiceSettings {
+  tmdb_env_var_name: string;
+  tmdb_base_url: string;
+}
+
+// ---------------------------------------------------------------------------
+// Drama search types
+// ---------------------------------------------------------------------------
+
+export interface SearchCandidate {
+  url: string;
+  title: string;
+  year: string | null;
+  confidence: number;
+  reason: string;
+}
+
+export interface DramaSearchQuery {
+  title_zh: string;
+  title_en: string;
+  aliases: string[];
+  year: string | null;
+}
+
+export interface ResolvedProviderSettings {
+  base_url: string;
+  model: string;
+  thinking: string;
 }
 
 export interface MdlPageInfo {

@@ -233,6 +233,12 @@ button, input, select, textarea {
   cursor: not-allowed;
 }
 
+.btn-sm {
+  padding: 3px 10px;
+  font-size: 11px;
+  min-height: 22px;
+}
+
 /* Form controls */
 .form-group {
   margin-bottom: 14px;
@@ -457,6 +463,11 @@ code {
 .badge-tvmao { background-color: #f59e0b; }
 .badge-daddicts { background-color: #8b5cf6; }
 
+/* JaKanji source badges */
+.badge-pending { background: #fff8e1; color: #f57f17; padding: 0 4px; border-radius: 3px; font-size: 9px; }
+.badge-llm { background: #e8f4fd; color: #1a73e8; padding: 0 4px; border-radius: 3px; font-size: 9px; }
+.badge-manual { background: #e6f4ea; color: #137333; padding: 0 4px; border-radius: 3px; font-size: 9px; }
+
 /* Error/success background utilities */
 :root {
   --error-bg: rgba(239, 68, 68, 0.1);
@@ -637,3 +648,165 @@ code {
   word-break: break-all;
   white-space: pre-wrap;
 }
+
+/* DramaSearchPanel */
+.drama-search-panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 16px;
+  overflow: hidden;
+}
+
+.drama-search-panel .panel-header {
+  background: var(--bg-elevated);
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.search-field-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  flex-wrap: wrap;
+}
+
+.search-field-row label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.search-field-row input {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 12px;
+  background: var(--bg-input);
+  color: var(--text-primary);
+  min-width: 140px;
+}
+
+.search-field-row input:focus {
+  border-color: var(--border-focus);
+  outline: none;
+}
+
+.search-field-row button {
+  padding: 5px 14px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.search-results {
+  padding: 8px 14px;
+}
+
+.search-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+}
+
+.search-status.auto-selected {
+  border-color: #22c55e;
+  background: rgba(34, 197, 94, 0.08);
+}
+
+.search-status.manual-select {
+  border-color: #f59e0b;
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.search-status .badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.search-status .result-title {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.search-status .result-year {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.search-status .result-type {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.search-status .result-url {
+  color: var(--text-link);
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.search-status .result-reason {
+  color: var(--text-muted);
+  font-size: 10px;
+  margin-left: auto;
+}
+
+.search-status .no-result {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.confidence-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.tmdb-candidates {
+  padding: 4px 0 4px 14px;
+  margin-bottom: 6px;
+}
+
+.candidate-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  font-size: 11px;
+  border-radius: 3px;
+}
+
+.candidate-item:hover {
+  background: var(--bg-hover);
+}
+
+.candidate-rank {
+  color: var(--text-muted);
+  font-size: 10px;
+  min-width: 16px;
+}
+
+.search-error {
+  padding: 6px 14px;
+  font-size: 12px;
+  color: #dc2626;
+  background: rgba(239, 68, 68, 0.06);
+  border-top: 1px solid var(--border);
+}
+

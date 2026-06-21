@@ -8,6 +8,7 @@ pub mod project;
 pub mod scraper;
 pub mod srt;
 pub mod translation;
+pub mod web_search;
 
 use commands::project::AppState;
 use envstore::EnvStoreState;
@@ -90,12 +91,17 @@ pub fn run() {
             commands::scraper::merged_to_dictionary,
             commands::scraper::save_raw_html,
             commands::scraper::parse_mdl_paste,
+            commands::scraper::parse_mdl_html_paste,
             commands::scraper::parse_douban_paste,
             commands::scraper::parse_tmdb_paste,
             commands::scraper::search_tmdb,
             commands::scraper::scrape_tmdb_credits,
             commands::scraper::build_character_dict,
+            commands::scraper::enrich_dict_kanji,
+            commands::scraper::merge_cast_entries,
             commands::scraper::verify_character_dict,
+            commands::scraper::generate_character_aliases,
+            commands::scraper::search_database_url,
             commands::scraper::open_mdl_window,
             commands::scraper::receive_mdl_extract,
             commands::scraper::get_mdl_extract,
@@ -106,6 +112,14 @@ pub fn run() {
             commands::scraper::close_mdl_window,
             commands::drama_info::save_drama_info,
             commands::drama_info::load_drama_info,
+            commands::service_settings::get_service_settings,
+            commands::service_settings::save_service_settings,
+            commands::service_settings::test_tmdb_connection,
+            commands::service_settings::get_provider_settings,
+            commands::service_settings::save_provider_settings,
+            commands::util::open_url,
+            commands::synopsis::summarize_synopsis,
+            commands::ja_kanji::correct_ja_kanji,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

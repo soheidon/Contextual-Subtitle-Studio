@@ -21,6 +21,13 @@ import type {
   DramaInfoBundle,
   MdlExtractResult,
   MdlPageInfo,
+  ServiceSettings,
+  ResolvedProviderSettings,
+  SearchCandidate,
+  DramaSearchQuery,
+  SynopsisSummary,
+  MergedCastEntry,
+  CharacterAlias,
 } from "../types";
 
 // Project
@@ -156,6 +163,9 @@ export const saveRawHtml = (dir: string, source: string, html: string) =>
 export const parseMdlPaste = (text: string) =>
   invoke<PastedEntry[]>("parse_mdl_paste", { text });
 
+export const parseMdlHtmlPaste = (html: string) =>
+  invoke<PastedEntry[]>("parse_mdl_html_paste", { html });
+
 export const parseDoubanPaste = (text: string) =>
   invoke<PastedEntry[]>("parse_douban_paste", { text });
 
@@ -204,3 +214,71 @@ export const getMdlPageInfo = () =>
 
 export const closeMdlWindow = () =>
   invoke<void>("close_mdl_window");
+
+// Service settings
+export const getServiceSettings = () =>
+  invoke<ServiceSettings>("get_service_settings");
+
+export const saveServiceSettings = (settings: ServiceSettings) =>
+  invoke<void>("save_service_settings", { settings });
+
+export const testTmdbConnection = (apiKey: string, baseUrl: string) =>
+  invoke<boolean>("test_tmdb_connection", { apiKey, baseUrl });
+
+// Per-provider LLM settings
+export const getProviderSettings = (prefix: string) =>
+  invoke<ResolvedProviderSettings>("get_provider_settings", { prefix });
+
+export const saveProviderSettings = (prefix: string, settings: {
+  base_url?: string | null;
+  model?: string | null;
+  thinking?: string | null;
+}) =>
+  invoke<void>("save_provider_settings", { prefix, settings });
+
+// Drama search
+export const searchDatabaseUrl = (database: string, query: DramaSearchQuery) =>
+  invoke<[SearchCandidate | null, SearchCandidate[]]>("search_database_url", { database, query });
+
+// Utility
+export const openUrl = (url: string) =>
+  invoke<void>("open_url", { url });
+
+// Synopsis summary
+export const summarizeSynopsis = (
+  synopsisCn: string,
+  synopsisEn: string,
+  titleZh?: string | null,
+  titleEn?: string | null,
+  year?: string | null,
+  mergedCast?: MergedCastEntry[] | null,
+) =>
+  invoke<SynopsisSummary>("summarize_synopsis", {
+    synopsisCn,
+    synopsisEn,
+    titleZh,
+    titleEn,
+    year,
+    mergedCast,
+  });
+
+// Merged cast list
+export const mergeCastEntries = (
+  imdbEntries: PastedEntry[],
+  doubanEntries: PastedEntry[],
+  mdlEntries: PastedEntry[],
+) => invoke<MergedCastEntry[]>("merge_cast_entries", { imdbEntries, doubanEntries, mdlEntries });
+
+// LLM-based Japanese kanji correction for character names
+export const correctJaKanji = (
+  entries: MergedCastEntry[],
+  dramaTitle?: string,
+) => invoke<MergedCastEntry[]>("correct_ja_kanji", { entries, dramaTitle });
+
+// Apply LLM-generated Japanese kanji from merged cast into dictionary entries.
+export const enrichDictKanji = (dict: CharacterDict, mergedCast: MergedCastEntry[]) =>
+  invoke<CharacterDict>("enrich_dict_kanji", { dict, mergedCast });
+
+// Generate character name aliases for subtitle replacement dictionary
+export const generateCharacterAliases = (entries: MergedCastEntry[]) =>
+  invoke<CharacterAlias[]>("generate_character_aliases", { entries });

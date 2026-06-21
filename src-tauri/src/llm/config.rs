@@ -8,6 +8,10 @@ pub struct ProviderConfig {
     #[serde(rename = "api_key")]
     pub api_key: String,
     pub model: String,
+    /// Thinking mode: "enabled", "disabled", or "auto".
+    /// Only used by DeepSeek V4 models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,9 +56,17 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
     #[serde(rename = "response_format")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormat>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ThinkingConfig {
+    #[serde(rename = "type")]
+    pub thinking_type: String,
 }
 
 #[derive(Debug, Serialize)]

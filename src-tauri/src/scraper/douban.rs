@@ -1,10 +1,33 @@
 use scraper::{Html, Selector};
 use sha2::{Sha512, Digest};
+use regex::Regex;
 
-use super::{ScrapedCharacter, ScrapeResult, ScrapeSource};
+use super::{ScrapedCharacter, ScrapeResult, ScrapeSource, SearchCandidate, score_search_candidate};
 
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+
+/// Normalize any Douban subject URL to the /celebrities page.
+///
+/// Accepts:
+/// - https://movie.douban.com/subject/36809858/
+/// - https://movie.douban.com/subject/36809858
+/// - https://movie.douban.com/subject/36809858/celebrities
+///
+/// Returns: https://movie.douban.com/subject/{id}/celebrities
+pub fn normalize_douban_celebrities_url(url: &str) -> Result<String, String> {
+    let re = Regex::new(r"douban\.com/subject/(\d+)")
+        .map_err(|e| format!("regex error: {}", e))?;
+    let caps = re
+        .captures(url)
+        .ok_or_else(|| format!(
+            "Douban subject IDを取得できません。movie.douban.com/subject/... URLを入力してください: {}",
+            url
+        ))?;
+    let subject_id = &caps[1];
+    let normalized = format!("https://movie.douban.com/subject/{}/celebrities", subject_id);
+    Ok(normalized)
+}
 
 /// Scrape 豆瓣 movie/drama page via celebrities page.
 /// URL pattern: https://movie.douban.com/subject/XXXXX/celebrities
@@ -13,7 +36,11 @@ const USER_AGENT: &str =
 /// This scraper solves the challenge in Rust to obtain a session cookie,
 /// then fetches the actual page content.
 pub async fn scrape_douban(url: &str) -> Result<ScrapeResult, String> {
-    let html = fetch_douban_with_challenge_solve(url).await?;
+    let url = normalize_douban_celebrities_url(url)?;
+    eprintln!("[Douban] celebrities URL: {}", url);
+
+    eprintln!("[Douban] ページ取得開始");
+    let html = fetch_douban_with_challenge_solve(&url).await?;
     let document = Html::parse_document(&html);
 
     if is_login_page(&document) {
@@ -33,23 +60,29 @@ pub async fn scrape_douban(url: &str) -> Result<ScrapeResult, String> {
     let synopsis = extract_synopsis(&document);
 
     let mut characters = extract_cast_primary(&document);
+    eprintln!("[Douban] cast_primary検出: {}件", characters.len());
+
     if characters.is_empty() {
         characters = extract_cast_celebrities(&document);
+        eprintln!("[Douban] cast_celebrities検出: {}件", characters.len());
     }
     if characters.is_empty() {
         characters = extract_cast_generic(&document);
+        eprintln!("[Douban] cast_generic検出: {}件", characters.len());
     }
+
+    eprintln!("[Douban] actor/character抽出成功: {}件", characters.len());
 
     if characters.is_empty() {
         return Err(format!(
-            "豆瓣: キャスト情報が見つかりませんでした。\nURL: {}\nページタイトル: {:?}",
+            "豆瓣: キャスト情報が見つかりませんでした。\nURL: {}\nページタイトル: {:?}\n\n/celebrities ページを直接開いて、手動貼り付けを試してください。",
             url, page_title
         ));
     }
 
     Ok(ScrapeResult {
         source: ScrapeSource::Douban,
-        url: url.to_string(),
+        url,
         page_title,
         drama_title,
         synopsis,
@@ -433,6 +466,214 @@ fn extract_cast_generic(document: &Html) -> Vec<ScrapedCharacter> {
     chars
 }
 
+// ---------------------------------------------------------------------------
+// Douban search URL resolution
+// ---------------------------------------------------------------------------
+
+/// A raw search result parsed from the Douban search page.
+struct DoubanSearchItem {
+    url: String,
+    title: String,
+    year: Option<String>,
+}
+
+/// Search Douban for a drama/movie by title and return the best matching URL.
+///
+/// Returns (best_candidate, all_candidates) where best_candidate is the highest-scored item.
+pub async fn search_douban_url(
+    query_zh: &str,
+    query_en: &str,
+    aliases: &[String],
+    expected_year: &Option<String>,
+) -> Result<(Option<SearchCandidate>, Vec<SearchCandidate>), String> {
+    let q_zh = query_zh.trim();
+    let q_en = query_en.trim();
+
+    // Try Chinese query first, then English if results are sparse
+    let mut items = if !q_zh.is_empty() {
+        eprintln!("[Douban] search: query_zh={}", q_zh);
+        fetch_douban_search(q_zh).await?
+    } else {
+        Vec::new()
+    };
+
+    if items.len() < 3 && !q_en.is_empty() {
+        eprintln!("[Douban] search: query_en={}", q_en);
+        let en_items = fetch_douban_search(q_en).await?;
+        // Merge, deduplicating by URL
+        let existing_urls: std::collections::HashSet<String> =
+            items.iter().map(|i| i.url.clone()).collect();
+        for item in en_items {
+            if !existing_urls.contains(&item.url) {
+                items.push(item);
+            }
+        }
+    }
+
+    eprintln!("[Douban] search candidates: {}件", items.len());
+
+    if items.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+
+    // Score each candidate
+    let mut candidates: Vec<SearchCandidate> = items
+        .iter()
+        .map(|item| {
+            let (confidence, reason) = score_search_candidate(
+                query_zh,
+                query_en,
+                aliases,
+                &item.title,
+                &item.year,
+                expected_year,
+            );
+            SearchCandidate {
+                url: item.url.clone(),
+                title: item.title.clone(),
+                year: item.year.clone(),
+                confidence,
+                reason,
+            }
+        })
+        .collect();
+
+    // Sort by confidence descending
+    candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+
+    let best = candidates.first().cloned();
+
+    if let Some(ref b) = best {
+        eprintln!(
+            "[Douban] selected: {} confidence={:.2} reason={}",
+            b.title, b.confidence, b.reason
+        );
+    }
+
+    Ok((best, candidates))
+}
+
+/// Fetch and parse Douban search results page.
+async fn fetch_douban_search(query: &str) -> Result<Vec<DoubanSearchItem>, String> {
+    let encoded: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+    let search_url = format!(
+        "https://movie.douban.com/subject_search?search_text={}&cat=1002",
+        encoded
+    );
+    eprintln!("[Douban] search URL: {}", search_url);
+
+    let html = fetch_douban_with_challenge_solve(&search_url).await?;
+
+    if is_login_page(&Html::parse_document(&html)) {
+        eprintln!("[Douban] search: login page detected, skipping");
+        return Ok(Vec::new());
+    }
+
+    parse_douban_search_results(&html)
+}
+
+/// Parse Douban search results HTML into structured items.
+fn parse_douban_search_results(html: &str) -> Result<Vec<DoubanSearchItem>, String> {
+    let document = Html::parse_document(html);
+
+    let item_sel = Selector::parse(".item-root, .result, .search-result .item").unwrap();
+    let link_sel = Selector::parse("a[href*='/subject/']").unwrap();
+    let title_sel = Selector::parse(".title-text, .title a, h3 a, a.title").unwrap();
+    let subject_re = Regex::new(r"/subject/(\d+)").unwrap();
+
+    let mut items = Vec::new();
+
+    // Strategy 1: iterate item containers
+    for item_el in document.select(&item_sel) {
+        let mut url = None;
+        let mut title = None;
+
+        // Find subject link
+        for link in item_el.select(&link_sel) {
+            let href = link.value().attr("href").unwrap_or("");
+            if subject_re.is_match(href) && !href.contains("/celebrities") {
+                url = Some(href.to_string());
+                break;
+            }
+        }
+
+        // Find title text
+        for title_el in item_el.select(&title_sel) {
+            let text = title_el.text().collect::<String>().trim().to_string();
+            if !text.is_empty() {
+                title = Some(text);
+                break;
+            }
+        }
+
+        // Fallback: use link text as title
+        if title.is_none() {
+            if let Some(ref u) = url {
+                for link in item_el.select(&link_sel) {
+                    let href = link.value().attr("href").unwrap_or("");
+                    if href == u {
+                        let text = link.text().collect::<String>().trim().to_string();
+                        if !text.is_empty() {
+                            title = Some(text);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let (Some(u), Some(t)) = (url, title) {
+            // Extract year from nearby text (e.g., "(2025)")
+            let item_text = item_el.text().collect::<String>();
+            let year = extract_year_from_text(&item_text);
+            items.push(DoubanSearchItem {
+                url: ensure_absolute_url(&u),
+                title: t,
+                year,
+            });
+        }
+    }
+
+    // Strategy 2: if no items found, extract all /subject/ links directly
+    if items.is_empty() {
+        eprintln!("[Douban] search: fallback to direct /subject/ link extraction");
+        for link in document.select(&link_sel) {
+            let href = link.value().attr("href").unwrap_or("");
+            if !href.contains("/celebrities") && subject_re.is_match(href) {
+                let text = link.text().collect::<String>().trim().to_string();
+                if !text.is_empty() && text.len() > 1 {
+                    items.push(DoubanSearchItem {
+                        url: ensure_absolute_url(href),
+                        title: text,
+                        year: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // Deduplicate by URL
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|item| seen.insert(item.url.clone()));
+
+    Ok(items)
+}
+
+fn extract_year_from_text(text: &str) -> Option<String> {
+    let re = Regex::new(r"\((\d{4})\)").ok()?;
+    re.captures(text).map(|c| c[1].to_string())
+}
+
+fn ensure_absolute_url(url: &str) -> String {
+    if url.starts_with("http") {
+        url.to_string()
+    } else if url.starts_with("//") {
+        format!("https:{}", url)
+    } else {
+        format!("https://movie.douban.com{}", url)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +721,30 @@ mod tests {
         let nonce = solve_challenge("test_challenge");
         let hash = hex::encode(Sha512::digest(format!("test_challenge{}", nonce).as_bytes()));
         assert!(hash.starts_with("0000"), "hash should start with 0000, got {}", hash);
+    }
+
+    #[test]
+    fn test_normalize_douban_url_full_trailing_slash() {
+        let result = normalize_douban_celebrities_url("https://movie.douban.com/subject/36809858/").unwrap();
+        assert_eq!(result, "https://movie.douban.com/subject/36809858/celebrities");
+    }
+
+    #[test]
+    fn test_normalize_douban_url_no_trailing_slash() {
+        let result = normalize_douban_celebrities_url("https://movie.douban.com/subject/36809858").unwrap();
+        assert_eq!(result, "https://movie.douban.com/subject/36809858/celebrities");
+    }
+
+    #[test]
+    fn test_normalize_douban_url_already_celebrities() {
+        let result = normalize_douban_celebrities_url("https://movie.douban.com/subject/36809858/celebrities").unwrap();
+        assert_eq!(result, "https://movie.douban.com/subject/36809858/celebrities");
+    }
+
+    #[test]
+    fn test_normalize_douban_url_invalid() {
+        let result = normalize_douban_celebrities_url("https://example.com/subject/123");
+        assert!(result.is_err());
     }
 
     /// Diagnostic: fetch actual Douban page with challenge solving.

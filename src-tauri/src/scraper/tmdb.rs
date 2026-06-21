@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{ScrapedCharacter, ScrapeResult, ScrapeSource};
+use super::{ScrapedCharacter, ScrapeResult, ScrapeSource, score_search_candidate};
 
 const API_BASE: &str = "https://api.themoviedb.org/3";
 const USER_AGENT: &str =
@@ -85,6 +85,24 @@ struct TmdbCastMember {
     character: String,
     #[allow(dead_code)]
     order: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmdbAggregateCreditsResponse {
+    cast: Vec<TmdbAggregateCastMember>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmdbAggregateCastMember {
+    name: String,
+    roles: Vec<TmdbAggregateRole>,
+    #[allow(dead_code)]
+    order: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmdbAggregateRole {
+    character: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +210,107 @@ pub async fn search_tmdb(query: &str) -> Result<Vec<TmdbSearchResult>, String> {
     Ok(results)
 }
 
+/// A TMDb search result with a confidence score.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoredSearchResult {
+    pub result: TmdbSearchResult,
+    pub confidence: f64,
+    pub reason: String,
+}
+
+/// Search TMDb with both Chinese and English titles, deduplicate, and score.
+///
+/// Returns results sorted by confidence descending.
+pub async fn search_tmdb_scored(
+    query_zh: &str,
+    query_en: &str,
+    aliases: &[String],
+    expected_year: &Option<String>,
+) -> Result<Vec<ScoredSearchResult>, String> {
+    let mut all_results: Vec<TmdbSearchResult> = Vec::new();
+
+    // Search with Chinese title
+    if !query_zh.trim().is_empty() {
+        match search_tmdb(query_zh).await {
+            Ok(r) => all_results.extend(r),
+            Err(e) => eprintln!("[TMDb] search_zh failed: {}", e),
+        }
+    }
+
+    // Search with English title
+    if !query_en.trim().is_empty() {
+        match search_tmdb(query_en).await {
+            Ok(r) => {
+                let existing_ids: std::collections::HashSet<u32> =
+                    all_results.iter().map(|r| r.tmdb_id).collect();
+                for item in r {
+                    if !existing_ids.contains(&item.tmdb_id) {
+                        all_results.push(item);
+                    }
+                }
+            }
+            Err(e) => eprintln!("[TMDb] search_en failed: {}", e),
+        }
+    }
+
+    // Also try aliases
+    for alias in aliases {
+        let a = alias.trim();
+        if !a.is_empty() {
+            match search_tmdb(a).await {
+                Ok(r) => {
+                    let existing_ids: std::collections::HashSet<u32> =
+                        all_results.iter().map(|r| r.tmdb_id).collect();
+                    for item in r {
+                        if !existing_ids.contains(&item.tmdb_id) {
+                            all_results.push(item);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("[TMDb] search_alias '{}' failed: {}", a, e),
+            }
+        }
+    }
+
+    eprintln!("[TMDb] total candidates after dedup: {}", all_results.len());
+
+    // Score each result
+    let mut scored: Vec<ScoredSearchResult> = all_results
+        .into_iter()
+        .map(|r| {
+            // Combine title and original_title for matching
+            let combined_title = match &r.original_title {
+                Some(orig) if orig != &r.title => format!("{} / {}", r.title, orig),
+                _ => r.title.clone(),
+            };
+            let (confidence, reason) = score_search_candidate(
+                query_zh,
+                query_en,
+                aliases,
+                &combined_title,
+                &r.year,
+                expected_year,
+            );
+            ScoredSearchResult {
+                result: r,
+                confidence,
+                reason,
+            }
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+
+    if let Some(best) = scored.first() {
+        eprintln!(
+            "[TMDb] selected: {} (ID:{}) confidence={:.2} reason={}",
+            best.result.title, best.result.tmdb_id, best.confidence, best.reason
+        );
+    }
+
+    Ok(scored)
+}
+
 // ---------------------------------------------------------------------------
 // URL parsing (for IMDb/TMDb URL fallback input)
 // ---------------------------------------------------------------------------
@@ -265,14 +384,121 @@ async fn fetch_credits_for_tmdb_id(
     let synopsis = details.overview;
     eprintln!("[TMDb] Title: {:?}", drama_title);
 
-    // Fetch credits
-    let credits_json = tmdb_get(&format!("/{}/{}/credits", media_type, tmdb_id)).await?;
-    let credits: TmdbCreditsResponse = serde_json::from_str(&credits_json)
+    // Fetch credits — for TV try aggregate_credits first, then fallback and merge
+    let characters: Vec<ScrapedCharacter> = if media_type == "tv" {
+        let aggregate = try_fetch_aggregate_credits(tmdb_id).await;
+        let regular = try_fetch_regular_credits(media_type, tmdb_id).await;
+
+        match (aggregate, regular) {
+            (Ok(mut agg), Ok(reg)) => {
+                // Merge, dedup by (actor_name, character_name)
+                let mut seen = std::collections::HashSet::new();
+                for c in &agg {
+                    seen.insert((c.actor_name.clone(), c.character_name.clone()));
+                }
+                for c in reg {
+                    let key = (c.actor_name.clone(), c.character_name.clone());
+                    if seen.insert(key) {
+                        agg.push(c);
+                    }
+                }
+                eprintln!(
+                    "[TMDb] aggregate_credits + credits 統合後: {}件",
+                    agg.len()
+                );
+                agg
+            }
+            (Ok(agg), Err(_)) => {
+                eprintln!("[TMDb] credits 取得失敗、aggregate_credits {}件を使用", agg.len());
+                agg
+            }
+            (Err(_), Ok(reg)) => {
+                eprintln!("[TMDb] aggregate_credits 失敗、credits {}件を使用", reg.len());
+                reg
+            }
+            (Err(e), Err(_)) => {
+                // Return the aggregate error as it's the primary path
+                return Err(e);
+            }
+        }
+    } else {
+        // Movie: just regular credits
+        try_fetch_regular_credits(media_type, tmdb_id).await?
+    };
+
+    let page_title = drama_title.clone();
+
+    Ok(ScrapeResult {
+        source: ScrapeSource::Tmdb,
+        url: format!("https://www.themoviedb.org/{}/{}", media_type, tmdb_id),
+        page_title,
+        drama_title,
+        synopsis,
+        characters,
+        saved_html_path: None,
+    })
+}
+
+/// Fetch /tv/{id}/aggregate_credits and parse into ScrapedCharacter vec.
+async fn try_fetch_aggregate_credits(tmdb_id: u32) -> Result<Vec<ScrapedCharacter>, String> {
+    eprintln!("[TMDb] aggregate_credits取得開始: /tv/{}/aggregate_credits", tmdb_id);
+    let json = tmdb_get(&format!("/tv/{}/aggregate_credits", tmdb_id)).await?;
+    let resp: TmdbAggregateCreditsResponse = serde_json::from_str(&json)
+        .map_err(|e| format!("TMDb aggregate_credits パース失敗: {}", e))?;
+
+    eprintln!("[TMDb] aggregate_credits: {}件", resp.cast.len());
+
+    let characters: Vec<ScrapedCharacter> = resp
+        .cast
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, c)| {
+            let actor = if c.name.is_empty() {
+                "".to_string()
+            } else {
+                c.name.clone()
+            };
+            if c.roles.is_empty() {
+                vec![ScrapedCharacter {
+                    source_id: format!("tmdb_agg_{:03}", i),
+                    character_name: String::new(),
+                    actor_name: if actor.is_empty() { None } else { Some(actor) },
+                    role_type: Some("main".to_string()),
+                    aliases: Vec::new(),
+                }]
+            } else {
+                c.roles
+                    .into_iter()
+                    .map(move |r| {
+                        let an = if actor.is_empty() { None } else { Some(actor.clone()) };
+                        ScrapedCharacter {
+                            source_id: format!("tmdb_agg_{:03}", i),
+                            character_name: r.character,
+                            actor_name: an,
+                            role_type: Some("main".to_string()),
+                            aliases: Vec::new(),
+                        }
+                    })
+                    .collect()
+            }
+        })
+        .collect();
+
+    Ok(characters)
+}
+
+/// Fetch /{media_type}/{id}/credits and parse into ScrapedCharacter vec.
+async fn try_fetch_regular_credits(
+    media_type: &str,
+    tmdb_id: u32,
+) -> Result<Vec<ScrapedCharacter>, String> {
+    let json = tmdb_get(&format!("/{}/{}/credits", media_type, tmdb_id)).await?;
+    let resp: TmdbCreditsResponse = serde_json::from_str(&json)
         .map_err(|e| format!("TMDb credits パース失敗: {}", e))?;
 
-    eprintln!("[TMDb] credits cast count: {}", credits.cast.len());
+    eprintln!("[TMDb] credits: {}件", resp.cast.len());
 
-    let characters: Vec<ScrapedCharacter> = credits
+    let characters: Vec<ScrapedCharacter> = resp
         .cast
         .into_iter()
         .enumerate()
@@ -289,17 +515,7 @@ async fn fetch_credits_for_tmdb_id(
         })
         .collect();
 
-    let page_title = drama_title.clone();
-
-    Ok(ScrapeResult {
-        source: ScrapeSource::Tmdb,
-        url: format!("https://www.themoviedb.org/{}/{}", media_type, tmdb_id),
-        page_title,
-        drama_title,
-        synopsis,
-        characters,
-        saved_html_path: None,
-    })
+    Ok(characters)
 }
 
 // ---------------------------------------------------------------------------

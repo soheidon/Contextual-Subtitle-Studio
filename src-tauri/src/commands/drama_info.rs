@@ -1,4 +1,5 @@
-use crate::character_dict::{CharacterDict, PastedEntry};
+use crate::character_dict::{CharacterDict, MergedCastEntry, PastedEntry};
+use super::synopsis::SynopsisSummary;
 use serde::{Deserialize, Serialize};
 
 /// Metadata about the drama being processed.
@@ -7,6 +8,9 @@ pub struct DramaMetadata {
     pub drama_title: Option<String>,
     pub douban_url: Option<String>,
     pub tmdb_url: Option<String>,
+    pub search_title_zh: Option<String>,
+    pub search_title_en: Option<String>,
+    pub search_year: Option<String>,
     pub updated_at: Option<String>,
 }
 
@@ -15,10 +19,15 @@ pub struct DramaMetadata {
 pub struct DramaInfoBundle {
     pub metadata: Option<DramaMetadata>,
     pub synopsis_douban: Option<String>,
-    pub synopsis_imdb: Option<String>,
+    #[serde(alias = "synopsis_imdb")]
+    pub synopsis_tmdb: Option<String>,
     pub cast_douban: Option<Vec<PastedEntry>>,
-    pub cast_imdb: Option<Vec<PastedEntry>>,
+    #[serde(alias = "cast_imdb")]
+    pub cast_tmdb: Option<Vec<PastedEntry>>,
+    pub cast_mdl: Option<Vec<PastedEntry>>,
     pub character_dict: Option<CharacterDict>,
+    pub synopsis_summary: Option<SynopsisSummary>,
+    pub merged_cast: Option<Vec<MergedCastEntry>>,
 }
 
 /// Save all drama info to `<dir>/drama_info/`.
@@ -35,17 +44,28 @@ pub fn save_drama_info(dir: String, bundle: DramaInfoBundle) -> Result<(), Strin
     if let Some(ref text) = bundle.synopsis_douban {
         write_text(&base.join("synopsis_douban.txt"), text)?;
     }
-    if let Some(ref text) = bundle.synopsis_imdb {
-        write_text(&base.join("synopsis_imdb.txt"), text)?;
+    if let Some(ref text) = bundle.synopsis_tmdb {
+        write_text(&base.join("synopsis_tmdb.txt"), text)?;
+        let _ = std::fs::remove_file(&base.join("synopsis_imdb.txt")); // 旧ファイル削除
     }
     if let Some(ref entries) = bundle.cast_douban {
         write_json(&base.join("cast_douban.json"), entries)?;
     }
-    if let Some(ref entries) = bundle.cast_imdb {
-        write_json(&base.join("cast_imdb.json"), entries)?;
+    if let Some(ref entries) = bundle.cast_tmdb {
+        write_json(&base.join("cast_tmdb.json"), entries)?;
+        let _ = std::fs::remove_file(&base.join("cast_imdb.json")); // 旧ファイル削除
+    }
+    if let Some(ref entries) = bundle.cast_mdl {
+        write_json(&base.join("cast_mdl.json"), entries)?;
     }
     if let Some(ref dict) = bundle.character_dict {
         write_json(&base.join("character_dict.json"), dict)?;
+    }
+    if let Some(ref summary) = bundle.synopsis_summary {
+        write_json(&base.join("synopsis_summary.json"), summary)?;
+    }
+    if let Some(ref cast) = bundle.merged_cast {
+        write_json(&base.join("merged_cast.json"), cast)?;
     }
 
     Ok(())
@@ -63,10 +83,15 @@ pub fn load_drama_info(dir: String) -> Result<DramaInfoBundle, String> {
     Ok(DramaInfoBundle {
         metadata: read_json(&base.join("metadata.json")),
         synopsis_douban: read_text(&base.join("synopsis_douban.txt")),
-        synopsis_imdb: read_text(&base.join("synopsis_imdb.txt")),
+        synopsis_tmdb: read_text(&base.join("synopsis_tmdb.txt"))
+            .or_else(|| read_text(&base.join("synopsis_imdb.txt"))), // 旧ファイル名互換
         cast_douban: read_json(&base.join("cast_douban.json")),
-        cast_imdb: read_json(&base.join("cast_imdb.json")),
+        cast_tmdb: read_json(&base.join("cast_tmdb.json"))
+            .or_else(|| read_json(&base.join("cast_imdb.json"))), // 旧ファイル名互換
+        cast_mdl: read_json(&base.join("cast_mdl.json")),
         character_dict: read_json(&base.join("character_dict.json")),
+        synopsis_summary: read_json(&base.join("synopsis_summary.json")),
+        merged_cast: read_json(&base.join("merged_cast.json")),
     })
 }
 

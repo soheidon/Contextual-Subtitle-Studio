@@ -1,13 +1,27 @@
 use crate::commands::project::AppState;
+use crate::commands::service_settings;
 use crate::envstore::EnvStoreState;
 use crate::llm::{provider_preset, all_presets, LlmClient, ProviderConfig, ProviderPreset};
 use tauri::{Manager, State};
 
+fn prefix_from_env(name: &str) -> String {
+    let name = name.trim().to_uppercase();
+    if let Some(p) = name.strip_suffix("_API_KEY") {
+        p.to_string()
+    } else if let Some(p) = name.strip_suffix("_KEY") {
+        p.to_string()
+    } else {
+        name
+    }
+}
+
 /// Build a ProviderConfig for a given env var name.
 /// Looks up the key from process env first, then from the persistent store.
+/// Reads per-provider overrides (base_url, model, thinking) from settings.json for ALL providers.
 pub fn build_provider_for(
     name: &str,
     env_store: &EnvStoreState,
+    app: &tauri::AppHandle,
 ) -> Result<ProviderConfig, String> {
     let name = name.trim();
     if name.is_empty() {
@@ -24,17 +38,25 @@ pub fn build_provider_for(
                 .and_then(|s| s.0.get(name).cloned())
         })
         .ok_or_else(|| format!("環境変数 {} の値が見つかりません。", name))?;
-    let preset = provider_preset(name).ok_or_else(|| {
+    // Verify the env var name maps to a known preset (but we don't use preset defaults).
+    let _ = provider_preset(name).ok_or_else(|| {
         format!(
             "環境変数名 {} に対応するプロバイダが見つかりません。対応プレフィックス: DEEPSEEK, OPENAI, ANTHROPIC, MINIMAX, GROQ 等",
             name
         )
     })?;
+
+    let prefix = prefix_from_env(name);
+    let overrides = service_settings::read_provider_settings(app, &prefix);
+
+    let thinking = (prefix == "DEEPSEEK").then_some(overrides.thinking);
+
     Ok(ProviderConfig {
         provider: "openai_compatible".to_string(),
-        base_url: preset.base_url,
+        base_url: overrides.base_url,
         api_key,
-        model: preset.model,
+        model: overrides.model,
+        thinking,
     })
 }
 
@@ -42,13 +64,14 @@ pub fn build_provider_for(
 pub fn resolve_provider(
     state: &AppState,
     env_store: &EnvStoreState,
+    app: &tauri::AppHandle,
 ) -> Result<ProviderConfig, String> {
     let active = state.active_env_var.lock().map_err(|e| e.to_string())?;
     let name = active
         .clone()
         .ok_or("LLMが未設定です。設定画面で環境変数名を保存してください。")?;
     drop(active);
-    build_provider_for(&name, env_store)
+    build_provider_for(&name, env_store, app)
 }
 
 #[tauri::command]
@@ -79,6 +102,7 @@ pub async fn test_llm_connection(config: ProviderConfig) -> Result<bool, String>
 /// `name` is optional - if provided, it is used directly (no need to save first).
 #[tauri::command]
 pub async fn check_active_connection(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     env_store: State<'_, EnvStoreState>,
     name: Option<String>,
@@ -92,7 +116,7 @@ pub async fn check_active_connection(
             .clone()
             .ok_or("環境変数名を入力してください。")?,
     };
-    let provider = build_provider_for(&chosen, &env_store)?;
+    let provider = build_provider_for(&chosen, &env_store, &app)?;
     let client = LlmClient::new(provider);
     client.test_connection().await
 }
@@ -139,6 +163,7 @@ pub struct ActiveEnvVarInfo {
 
 #[tauri::command]
 pub fn get_active_env_var(
+    app: tauri::AppHandle,
     state: State<AppState>,
     env_store: State<EnvStoreState>,
 ) -> Result<ActiveEnvVarInfo, String> {
@@ -163,12 +188,17 @@ pub fn get_active_env_var(
         .filter(|v| !v.is_empty())
         .is_some()
         || store.0.contains_key(&name_str);
+
+    // Use generic per-provider overrides from settings.json
+    let prefix = prefix_from_env(&name_str);
+    let overrides = service_settings::read_provider_settings(&app, &prefix);
+
     Ok(ActiveEnvVarInfo {
         name,
         has_key,
         provider: preset.as_ref().map(|p| p.provider.clone()),
-        base_url: preset.as_ref().map(|p| p.base_url.clone()),
-        model: preset.as_ref().map(|p| p.model.clone()),
+        base_url: Some(overrides.base_url),
+        model: Some(overrides.model),
     })
 }
 

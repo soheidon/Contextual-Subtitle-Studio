@@ -1,10 +1,19 @@
-use crate::character_dict::{self, CharacterDict, PastedEntry, QualityReport};
+use crate::character_dict::{self, CharacterDict, MergedCastEntry, PastedEntry, QualityReport};
 use crate::dictionary::characters::Character;
 use crate::merge::{self, MergedCharacter};
-use crate::scraper::{self, ScrapeResult, ScrapeSource};
+use crate::scraper::{self, ScrapeResult, ScrapeSource, SearchCandidate};
 use tauri::State;
 
 use crate::commands::project::AppState;
+
+/// Query parameters for database URL search.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DramaSearchQuery {
+    pub title_zh: String,
+    pub title_en: String,
+    pub aliases: Vec<String>,
+    pub year: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // scrape_url
@@ -276,6 +285,21 @@ pub fn parse_mdl_paste(text: String) -> Vec<PastedEntry> {
     character_dict::parse_mdl_paste(&text)
 }
 
+/// Parse MDL Cast HTML pasted from browser DevTools.
+#[tauri::command]
+pub fn parse_mdl_html_paste(html: String) -> Vec<PastedEntry> {
+    eprintln!("[MDL HTML] 貼り付けHTML受信: {}文字", html.len());
+    let list_item_count = html.matches("list-item").count();
+    eprintln!("[MDL HTML] list-item検出: {}件", list_item_count);
+    let entries = character_dict::parse_mdl_html_paste(&html);
+    let with_char = entries.iter().filter(|e| !e.character_name.is_empty()).count();
+    let without_char = entries.len() - with_char;
+    eprintln!("[MDL HTML] actor/character抽出成功: {}件", with_char);
+    eprintln!("[MDL HTML] characterなし: {}件", without_char);
+    eprintln!("[Merge] MDL HTML由来の英語役名を統合に追加: {}件", with_char);
+    entries
+}
+
 /// Parse text pasted from Douban celebrities page.
 #[tauri::command]
 pub fn parse_douban_paste(text: String) -> Vec<PastedEntry> {
@@ -313,10 +337,79 @@ pub fn build_character_dict(
     character_dict::build_character_dict(&imdb_entries, &douban_entries)
 }
 
+/// Apply LLM-generated Japanese kanji from merged cast into dictionary entries.
+#[tauri::command]
+pub fn enrich_dict_kanji(
+    dict: CharacterDict,
+    merged_cast: Vec<MergedCastEntry>,
+) -> Result<CharacterDict, String> {
+    let mut dict = dict;
+    let updated = character_dict::enrich_dict_kanji_from_cast(&mut dict, &merged_cast);
+    eprintln!("[Dictionary] enriched kanji for {} entries from merged cast", updated);
+    Ok(dict)
+}
+
+/// Merge TMDb, Douban, and MDL cast entries into a flat actor list.
+#[tauri::command]
+pub fn merge_cast_entries(
+    imdb_entries: Vec<PastedEntry>,
+    douban_entries: Vec<PastedEntry>,
+    mdl_entries: Vec<PastedEntry>,
+) -> Vec<MergedCastEntry> {
+    character_dict::merge_cast_list(&imdb_entries, &douban_entries, &mdl_entries)
+}
+
 /// Verify a character dictionary and return a quality report.
 #[tauri::command]
 pub fn verify_character_dict(dict: CharacterDict) -> QualityReport {
     character_dict::verify_character_dict(&dict)
+}
+
+/// Generate character name aliases from merged cast entries.
+#[tauri::command]
+pub fn generate_character_aliases(
+    entries: Vec<MergedCastEntry>,
+) -> Vec<crate::character_dict::alias::CharacterAlias> {
+    crate::character_dict::alias::generate_aliases_batch(&entries)
+}
+
+// ---------------------------------------------------------------------------
+// Database URL search (Douban, future: MDL)
+// ---------------------------------------------------------------------------
+
+/// Search for a drama/movie URL in the specified database.
+///
+/// Returns (best_candidate, all_candidates).
+/// Currently supports "douban". Returns error for unknown databases.
+#[tauri::command]
+pub async fn search_database_url(
+    database: String,
+    query: DramaSearchQuery,
+) -> Result<(Option<SearchCandidate>, Vec<SearchCandidate>), String> {
+    eprintln!(
+        "[Search] database={}, title_zh=\"{}\", title_en=\"{}\", year={:?}",
+        database, query.title_zh, query.title_en, query.year
+    );
+
+    match database.as_str() {
+        "douban" => {
+            scraper::douban::search_douban_url(
+                &query.title_zh,
+                &query.title_en,
+                &query.aliases,
+                &query.year,
+            )
+            .await
+        }
+        "mdl" => Err(
+            "MDLはCloudflareにより自動検索に対応していません。検索クエリ生成とCast HTML貼り付けを使用してください。"
+                .to_string()
+        ),
+        _ => Err(format!(
+            "未対応のデータベース: {}。現在は 'douban' のみ対応しています。",
+            database
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------

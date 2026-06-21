@@ -26,10 +26,21 @@ impl LlmClient {
             self.config.base_url.trim_end_matches('/')
         );
 
+        let thinking = self.config.thinking.as_deref().and_then(|t| match t {
+            "enabled" => Some(ThinkingConfig {
+                thinking_type: "enabled".to_string(),
+            }),
+            "auto" => Some(ThinkingConfig {
+                thinking_type: "auto".to_string(),
+            }),
+            _ => None, // "disabled" or unknown → omit
+        });
+
         let request_body = ChatCompletionRequest {
             model: self.config.model.clone(),
             messages: messages.to_vec(),
             temperature: Some(0.3),
+            thinking,
             response_format: if use_json_mode {
                 Some(ResponseFormat {
                     format_type: "json_object".to_string(),

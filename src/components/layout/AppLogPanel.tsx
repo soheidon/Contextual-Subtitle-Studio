@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
-import { Trash2, ChevronDown, ChevronUp } from "lucide-react";
+import { Trash2, ChevronDown, ChevronUp, ClipboardCopy } from "lucide-react";
 import { useAppLogStore, type LogLevel } from "../../stores/useAppLogStore";
 
 const LEVEL_COLORS: Record<LogLevel, { bg: string; text: string; label: string }> = {
@@ -33,6 +33,17 @@ export default function AppLogPanel() {
     if (sourceFilter === "all") return logs;
     return logs.filter((e) => e.source === sourceFilter);
   }, [logs, sourceFilter]);
+
+  const copyLogs = useCallback(() => {
+    const text = filteredLogs
+      .map((e) => {
+        const time = new Date(e.timestamp).toLocaleTimeString();
+        const level = LEVEL_COLORS[e.level].label;
+        return `[${time}] [${level}] [${e.source}] ${e.message}`;
+      })
+      .join("\n");
+    navigator.clipboard.writeText(text).catch(console.error);
+  }, [filteredLogs]);
 
   const uniqueSources = useMemo(() => {
     return [...new Set(logs.map((e) => e.source))].sort();
@@ -100,6 +111,15 @@ export default function AppLogPanel() {
             <option key={s} value={s}>{s}</option>
           ))}
         </select>
+        <button
+          className="btn btn-secondary"
+          onClick={copyLogs}
+          style={{ fontSize: 11, padding: "1px 8px" }}
+          title="ログをクリップボードにコピー"
+        >
+          <ClipboardCopy size={12} style={{ marginRight: 3, verticalAlign: -2 }} />
+          コピー
+        </button>
         <button
           className="btn btn-secondary"
           onClick={clearLogs}
