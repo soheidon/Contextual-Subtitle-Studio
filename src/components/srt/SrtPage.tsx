@@ -1062,26 +1062,31 @@ export default function SrtPage() {
         dictState.glossary,
       );
 
-      // Phase 5: Save regenerated state
-      setFileSynopsis(activeFile.path, result, katakanaMap, termVariants, newUnresolvedTerms);
+      // Phase 5: Clear adoptedTerms (saved to dict, no longer needed)
+      useSrtStore.getState().setFileAdoptedTerms(activeFile.path, []);
+      log("success", "SRT", `採用済み語をクリアしました (${adoptedTerms.length}件)`);
 
-      const state = useSrtStore.getState();
-      const f = state.files.find((x) => x.path === activeFile.path);
-      if (f && folderPath) {
-        await saveSrtAnalysis({
-          srt_path: f.path,
-          srt_name: f.name,
-          synopsis: result,
-          scene_detection: f.sceneDetection,
-          scene_contexts: Object.values(f.sceneContexts),
-          katakana_map: katakanaMap,
-          term_variants: termVariants,
-          unresolved_terms: newUnresolvedTerms,
-          adopted_terms: f.adoptedTerms,
-        });
+      // Phase 6: Save regenerated state (adopted_terms cleared)
+      setFileSynopsis(activeFile.path, result, katakanaMap, termVariants, newUnresolvedTerms);
+      {
+        const state = useSrtStore.getState();
+        const f = state.files.find((x) => x.path === activeFile.path);
+        if (f && folderPath) {
+          await saveSrtAnalysis({
+            srt_path: f.path,
+            srt_name: f.name,
+            synopsis: result,
+            scene_detection: f.sceneDetection,
+            scene_contexts: Object.values(f.sceneContexts),
+            katakana_map: katakanaMap,
+            term_variants: termVariants,
+            unresolved_terms: newUnresolvedTerms,
+            adopted_terms: [],
+          });
+        }
       }
 
-      // Phase 6: Log regeneration stats
+      // Phase 7: Log regeneration stats
       const afterCount = newUnresolvedTerms.length;
       const reduction = beforeCount - afterCount;
       if (reduction > 0) {
