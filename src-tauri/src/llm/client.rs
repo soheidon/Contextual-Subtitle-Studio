@@ -104,7 +104,7 @@ impl LlmClient {
         let response = self.chat(&messages, true).await?;
         let cleaned = extract_json(&response);
         serde_json::from_str(&cleaned)
-            .map_err(|e| format!("Failed to parse JSON response: {} (raw: {})", e, &response[..response.len().min(200)]))
+            .map_err(|e| format!("Failed to parse JSON response: {} (raw: {})", e, crate::log::preview_chars(&response, 200)))
     }
 
     /// Test the connection by sending a minimal request.

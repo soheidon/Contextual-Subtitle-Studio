@@ -6,7 +6,7 @@ use crate::dictionary::characters::Character;
 use crate::envstore::EnvStoreState;
 use crate::llm::client::extract_json;
 use crate::llm::LlmClient;
-use crate::log::emit_log;
+use crate::log::{emit_log, preview_chars};
 use crate::srt::SubtitleEntry;
 use crate::srt::parser::parse_srt;
 use crate::srt::writer::write_srt;
@@ -1869,7 +1869,7 @@ pub async fn resolve_unresolved_term_ai_openai(
 
     emit_log(&app, "debug", "SRT", &format!(
         "OpenAI prompt preview: {}",
-        &input[..input.len().min(500)]
+        preview_chars(&input, 500)
     ));
 
     let request_body = serde_json::json!({
@@ -1913,7 +1913,7 @@ pub async fn resolve_unresolved_term_ai_openai(
     // Parse the JSON response
     let cleaned = extract_json(text);
     let parsed: BatchTermResult = serde_json::from_str(cleaned)
-        .map_err(|e| format!("Failed to parse OpenAI term result: {} (raw: {})", e, &text[..text.len().min(300)]))?;
+        .map_err(|e| format!("Failed to parse OpenAI term result: {} (raw: {})", e, preview_chars(&text, 300)))?;
 
     // Map status: "found" stays, "uncertain" stays, "not_found" stays
     let status = if parsed.status.is_empty() { "not_found".to_string() } else { parsed.status.clone() };
@@ -2061,7 +2061,7 @@ pub async fn resolve_unresolved_terms_batch_openai(
     // Debug: emit prompt preview (first 800 chars) for manual inspection
     emit_log(&app, "debug", "SRT", &format!(
         "OpenAI prompt preview: {}",
-        &input[..input.len().min(800)]
+        preview_chars(&input, 800)
     ));
 
     let request_body = serde_json::json!({
@@ -2105,7 +2105,7 @@ pub async fn resolve_unresolved_terms_batch_openai(
     // Parse batch response
     let cleaned = extract_json(text);
     let batch: BatchTermsResponse = serde_json::from_str(cleaned)
-        .map_err(|e| format!("Failed to parse batch response: {} (raw: {})", e, &text[..text.len().min(300)]))?;
+        .map_err(|e| format!("Failed to parse batch response: {} (raw: {})", e, preview_chars(&text, 300)))?;
 
     // Map results back to input terms by source_text match
     let results: Vec<WebTermResolution> = terms

@@ -330,7 +330,7 @@ mod tests {
         let html = fetch_mdl(url).await.expect("fetch failed");
         // Print first 8000 chars to see structure
         println!("=== RAW HTML (first 8000 chars) ===");
-        println!("{}", &html[..html.len().min(8000)]);
+        println!("{}", crate::log::preview_chars(&html, 8000));
 
         let document = Html::parse_document(&html);
         let page_title = document
@@ -347,7 +347,7 @@ mod tests {
             let id = el.value().id().unwrap_or("");
             let classes: Vec<_> = el.value().classes().collect();
             let text = el.text().collect::<String>();
-            let short = if text.len() > 200 { &text[..200] } else { &text };
+            let short = if text.len() > 200 { crate::log::preview_chars(&text, 200) } else { text };
             println!("  <{} id={:?} classes={:?}> text={:?}", tag, id, classes, short);
         }
 
