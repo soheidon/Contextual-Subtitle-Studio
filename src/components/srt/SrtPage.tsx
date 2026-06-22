@@ -143,6 +143,46 @@ function mergeUnresolvedTerms(
   });
 }
 
+/** Export unresolved terms as CSV. Includes all terms (not just pending). */
+function exportUnresolvedTermsCsv(terms: UnresolvedTerm[], filename: string) {
+  const BOM = "﻿";
+  const headers = [
+    "source_text", "surface_ja", "term_type", "status", "source", "occurrence_count",
+    "reason", "web_candidate_zh", "web_status", "web_confidence",
+    "web_evidence_summary", "web_evidence_urls", "adopted",
+  ];
+  const rows = terms.map((t) => [
+    t.source_text,
+    t.surface_ja,
+    t.term_type,
+    t.status,
+    t.source ?? "",
+    t.occurrence_count ?? 0,
+    t.reason,
+    t.webResult?.candidate_zh ?? "",
+    t.webResult?.status ?? "",
+    t.webResult?.confidence ?? "",
+    t.webResult?.evidence_summary ?? "",
+    (t.webResult?.evidence_urls ?? []).join(" | "),
+    t.adopted ?? false,
+  ]);
+  const escape = (v: string | number | boolean) => {
+    const s = String(v);
+    if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+      return `"${s.replace(/"/g, '""')}"`;
+    }
+    return s;
+  };
+  const csv = BOM + [headers, ...rows].map((r) => r.map(escape).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename.replace(/\.srt$/i, "") + "_unresolved.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 /** Split a path into segments, handling both / and \ separators.
  *  For UNC paths (\\server\share\...) preserves the leading empty segments
  *  so the reconstruction produces a valid UNC path. */
@@ -399,6 +439,8 @@ function buildSceneTranslationPrompt(
   lines.push("* 字幕として短く自然な日本語にする。");
   lines.push("* 直訳しすぎず、ただし意味を変えない。");
   lines.push("* 人名・地名・勢力名・役名は用語表の日本語表記を使う。");
+  lines.push("* 用語表に漢字表記がある語は、必ず漢字のみで出力する。「カタカナ（漢字）」のような併記は禁止。");
+  lines.push("* 例：楚喬（チュウ・チャオとは書かない）、諸葛玥（ヅーグー・ユエとは書かない）");
   lines.push("* 同じ人物・地名・勢力名の表記を途中で変えない。");
   lines.push("* 身分語・役職語は現代語に寄せすぎず、時代劇調の自然な日本語にする。");
   lines.push(
@@ -847,7 +889,8 @@ export default function SrtPage() {
       // Extract proper noun candidates from the full SRT body text
       let bodyTerms: UnresolvedTerm[] = [];
       try {
-        bodyTerms = await extractSrtBodyCandidates(activeFile.entries);
+        const dictForBody = useDictionaryStore.getState();
+        bodyTerms = await extractSrtBodyCandidates(activeFile.entries, dictForBody.characters, dictForBody.glossary);
         console.log(`[SRT] body candidates extracted: ${bodyTerms.length}`);
       } catch (_) {
         // Body extraction is best-effort
@@ -1192,9 +1235,9 @@ export default function SrtPage() {
                             </span>
                           )}
                         </h4>
-                        {/* Batch AI確認 button */}
-                        {pending.filter((t) => !t.adopted && !t.webResult).length > 0 && (
-                          <div style={{ marginBottom: 8 }}>
+                        {/* Batch AI確認 button + CSV export */}
+                        <div style={{ marginBottom: 8, display: "flex", gap: 8, alignItems: "center" }}>
+                          {pending.filter((t) => !t.adopted && !t.webResult).length > 0 && (
                             <button
                               className="btn btn-primary"
                               onClick={handleBatchAiConfirm}
@@ -1205,8 +1248,15 @@ export default function SrtPage() {
                                 ? "一括AI確認中…"
                                 : `未確認語をまとめてAI確認 (${pending.filter((t) => !t.adopted && !t.webResult).length}件)`}
                             </button>
-                          </div>
-                        )}
+                          )}
+                          <button
+                            className="btn btn-sm"
+                            style={{ fontSize: 12, background: "#6b7280", color: "#fff" }}
+                            onClick={() => exportUnresolvedTermsCsv(activeFile.unresolvedTerms, activeFile.name)}
+                          >
+                            CSV出力 ({activeFile.unresolvedTerms.length}件)
+                          </button>
+                        </div>
                         <div className="table-container" style={{ maxHeight: 300, overflowY: "auto" }}>
                           <table>
                             <thead>
@@ -1262,9 +1312,11 @@ export default function SrtPage() {
                                         </span>
                                       )}
                                     </td>
-                                    <td style={{ fontFamily: "monospace", fontSize: 12 }}>{t.surface_ja || "—"}</td>
                                     <td style={{ fontFamily: "monospace", fontSize: 12 }}>
-                                      {t.webResult?.candidate_zh ?? "—"}
+                                      {t.webResult ? (t.surface_ja || "—") : "—"}
+                                    </td>
+                                    <td style={{ fontFamily: "monospace", fontSize: 12 }}>
+                                      {t.webResult ? (t.webResult?.candidate_zh ?? "—") : "—"}
                                     </td>
                                     <td style={{ fontFamily: "monospace", fontSize: 12 }}>—</td>
                                     <td style={{ textAlign: "center" }}>

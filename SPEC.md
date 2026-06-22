@@ -508,6 +508,42 @@ SRTを以下の構造に分解する。
 }
 ```
 
+#### 11.1.1 あらすじ生成 (2.1)
+
+LLMを用いて全字幕からドラマの日本語あらすじを生成する。
+
+プロンプトのルール:
+- 辞書に日本語漢字表記がある固有名詞は、必ず漢字のみで書く。「カタカナ（漢字）」形式は禁止。
+- 辞書にない未確認の固有名詞は、漢字を推測せず、英語字幕の表記（カタカナまたはローマ字）のまま書く。
+- `unresolved_terms` の `source_text` は英語のみ、`surface_ja` は常に空文字。
+- 後処理で `source_text` 末尾の括弧付き漢字（例: `Huotu Water (火屠水)` → `Huotu Water`）を除去する。
+
+#### 11.1.2 SRT本文からの固有名詞候補抽出 (ノイズ除去パイプライン)
+
+`extract_srt_body_candidates` により、SRT全字幕から固有名詞候補をヒューリスティック抽出する。
+
+処理パイプライン:
+1. 大文字始まりの連続単語列を候補として切り出す
+2. 末尾句読点除去、所有格 `'s` 除去、先頭 `The` 除去、末尾 `and`/`of` 断片除去
+3. ストップワードのみの候補を除外
+4. セリフ断片除外 (`!` `?` を含む)
+5. カンマ分割（`General Huan, Ka Tuo` → `General Huan` + `Ka Tuo`）
+6. `in` 分割（`Yong Army in Ximin Mountains` → `Yong Army` + `Ximin Mountains`）
+7. ストップフレーズ除外（`Your Highness`, `His Majesty` 等）
+8. 称号+既知名除外（`King Yan Xun`, `Crown Prince of Biantang`）
+9. 既知地名+汎用接尾語除外（`Yanbei City`, `Biantang Palace`）
+10. 動詞+既知名除外（`Defend Yanbei`, `Kill Yan Xun`）
+11. 既知名完全カバー除外
+12. 正規化重複除去 + 出現回数ソート
+
+既知名の照合には dedup 正規化キー（英数字のみ、lowercase）を用い、以下を同一扱いする:
+- `Bian Tang` / `Biantang`
+- `Yan Bei` / `Yanbei`
+
+汎用接尾語リスト: City, Palace, House, Gate, Pass, Lake, River, Mountain, Mountains, Region, Tribe, Army
+
+未確認語が既知名+接尾語のパターンに該当する場合は除外するが、前半が未知語の場合は残す（`Luo River`, `Qianzhang Lake`, `Qingshan House` 等）。
+
 ### 11.2 チャンク分割
 
 字幕は一定数ごとにチャンク分割する。

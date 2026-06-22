@@ -445,6 +445,7 @@ export interface UnresolvedTerm {
   adopted?: boolean;
   source?: string;           // "synopsis" | "srt_body" | "srt_body+synopsis"
   occurrence_count?: number;
+  alias_candidate?: boolean; // true when the term looks like a character alias (e.g. "Qiao Qiao")
 }
 
 export interface SrtSynopsisResult {
