@@ -264,8 +264,12 @@ fn resolve_openai_api_key(env_store: &EnvStoreState) -> Result<String, String> {
 
 /// Build the synopsis generation prompt.
 fn build_synopsis_prompt(entries: &[SubtitleEntry], prompt_context: &str) -> (String, String) {
-    let system = "あなたは中国ドラマの字幕分析アシスタントです。\
-        英語字幕からドラマのあらすじを推測し、登場人物名や固有名詞を検出してください。\n\n\
+    let system = "あなたは日本語字幕制作支援用の分析アシスタントです。\
+        出力は必ず自然な日本語で書いてください。\n\n\
+        【最重要：日本語出力の厳守】\n\
+        ・synopsis_ja は必ず自然な日本語で書く。\n\
+        ・中国語の文をそのまま書かない。簡体字中国語の文体は禁止。\n\
+        ・detected_characters の各項目も日本語表記を優先する。\n\n\
         【固有名詞の表記ルール】\n\
         ・参考情報に日本語漢字表記がある固有名詞は、必ず漢字のみで書く。\
         「カタカナ（漢字）」や「漢字（カタカナ）」形式は禁止。\n\
@@ -291,7 +295,13 @@ fn build_synopsis_prompt(entries: &[SubtitleEntry], prompt_context: &str) -> (St
     }
 
     user.push_str(
-        "\n【あらすじ執筆ルール】\n\
+        "\n【最重要：日本語出力の厳守】\n\
+         ・あなたの出力は日本語字幕制作支援用です。\n\
+         ・synopsis_ja は必ず自然な日本語で書いてください。\n\
+         ・中国語の文をそのまま書かないでください。\n\
+         ・簡体字中国語の文体は禁止です。\n\
+         ・固有名詞は、辞書に日本語漢字表記がある場合は日本語漢字表記だけを使ってください。\n\n\
+         【あらすじ執筆ルール】\n\
          ・参考情報の「登場人物名対応表」「用語表」「カタカナ→漢字補正表」に掲載されている固有名詞は、\
          必ず日本語欄の漢字表記だけを使ってください。「カタカナ（漢字）」のような併記は禁止です。\n\
          ・参考情報にない未確認の固有名詞は、漢字を一切推測せず、英語字幕に出てきた表記のまま書いてください。\n\
@@ -872,6 +882,61 @@ fn starts_with_verb_and_known_names(
     known_names.contains(&dedup) || known_names.contains(&combined.to_lowercase())
 }
 
+/// Filter unresolved terms from synopsis using the same known-name heuristics
+/// as the SRT body candidate extraction pipeline.
+/// Terms matching title-phrase, place-suffix, verb+known-name, or full-coverage
+/// patterns are removed; their reason field is prefixed with the filter tag.
+fn filter_synopsis_terms_by_known_names(
+    terms: &mut Vec<UnresolvedTerm>,
+    known_names: &std::collections::HashSet<String>,
+) {
+    let before = terms.len();
+    terms.retain(|t| {
+        let phrase = t.source_text.trim();
+        if phrase.is_empty() { return false; }
+
+        if is_title_phrase_with_known_name(phrase, known_names) {
+            return false; // e.g. "Crown Prince of Biantang"
+        }
+        if is_known_place_with_generic_suffix(phrase, known_names) {
+            return false; // e.g. "Yanbei City"
+        }
+        if starts_with_verb_and_known_names(phrase, known_names) {
+            return false; // e.g. "Defend Yanbei"
+        }
+        if is_covered_by_known_names(phrase, known_names) {
+            return false; // all content words are known names
+        }
+        true
+    });
+    let removed = before - terms.len();
+    if removed > 0 {
+        // We can't easily log here without app handle, so caller should log
+    }
+}
+
+/// Validate term_variant groups: remove groups where variants don't share
+/// a common dedup-normalized key. "Great Yong" vs "Yong Army" are different
+/// concepts — they share the word "Yong" but the full dedup keys differ.
+fn validate_term_variants(variants: &mut Vec<TermVariantEntry>) {
+    let before = variants.len();
+    variants.retain(|v| {
+        if v.variants.len() < 2 {
+            return true; // single-variant groups are fine
+        }
+        // All variants must normalize to the same dedup key
+        let first_key = normalize_en_for_dedup(&v.variants[0]);
+        if first_key.is_empty() {
+            return false;
+        }
+        v.variants.iter().all(|var| normalize_en_for_dedup(var) == first_key)
+    });
+    let removed = before - variants.len();
+    if removed > 0 {
+        // Caller should log
+    }
+}
+
 /// Intermediate accumulator for body candidate extraction.
 #[derive(Debug, Clone)]
 struct SrtBodyCandidate {
@@ -883,6 +948,24 @@ struct SrtBodyCandidate {
 /// Strip trailing CJK parenthetical from source_text.
 /// "Huotu Water (火屠水)" → "Huotu Water"
 /// "Black Eagle Army (黒鷹軍)" → "Black Eagle Army"
+
+/// Detect if a text is likely Chinese rather than Japanese.
+/// Heuristic: if the text has 20+ CJK characters but kana is <8% of CJK count,
+/// it's almost certainly Chinese (natural Japanese always has hiragana particles/endings).
+fn is_likely_chinese(text: &str) -> bool {
+    let cjk_count = text.chars().filter(|c| {
+        ('\u{4e00}'..='\u{9fff}').contains(c) || ('\u{3400}'..='\u{4dbf}').contains(c)
+    }).count();
+    if cjk_count < 20 {
+        return false; // too short to tell reliably
+    }
+    let kana_count = text.chars().filter(|c| {
+        ('\u{3040}'..='\u{309f}').contains(c) || ('\u{30a0}'..='\u{30ff}').contains(c)
+    }).count();
+    let ratio = kana_count as f64 / cjk_count as f64;
+    ratio < 0.08
+}
+
 fn strip_trailing_cjk_parenthetical(text: &str) -> &str {
     if let Some(open) = text.rfind(" (") {
         let after = &text[open + 2..];
@@ -1162,6 +1245,56 @@ pub async fn generate_srt_synopsis(
 
     let mut result: SrtSynopsisResult = serde_json::from_value(value)
         .map_err(|e| format!("Failed to parse synopsis JSON: {}", e))?;
+
+    // Detect Chinese-output and retry once with explicit Japanese instruction
+    if is_likely_chinese(&result.synopsis_ja) {
+        emit_log(&app, "warn", "SRT",
+            "synopsis_ja が日本語ではない可能性があるため再生成します");
+        let retry_user = format!(
+            "{}\n\n【重要：再出力指示】\n\
+             あなたの前回の出力は日本語ではありませんでした。\n\
+             synopsis_ja は必ず自然な日本語で書き直してください。\n\
+             中国語の文をそのまま出力しないでください。簡体字中国語文体は禁止です。\n\
+             日本語の助詞・助動詞を含む自然な文章で書き直してください。\n\
+             例: 「楚喬は目を負傷し、李策が持ってきたHuotu Waterで治療を受けている。」",
+            user
+        );
+        let retry_value = client.chat_json(&system, &retry_user).await?;
+        result = serde_json::from_value(retry_value)
+            .map_err(|e| format!("Failed to parse retry synopsis JSON: {}", e))?;
+        if is_likely_chinese(&result.synopsis_ja) {
+            emit_log(&app, "warn", "SRT",
+                "再生成後も日本語判定に失敗しましたが、そのまま処理を続行します");
+        } else {
+            emit_log(&app, "success", "SRT", "再生成で日本語あらすじを取得しました");
+        }
+    }
+
+    // Filter synopsis unresolved_terms against known names (same pipeline as body extraction)
+    {
+        let characters = state.characters.lock().map_err(|e| e.to_string())?;
+        let glossary = state.glossary.lock().map_err(|e| e.to_string())?;
+        let known_names = build_known_names_set(&characters, &glossary);
+        let before_filter = result.unresolved_terms.len();
+        filter_synopsis_terms_by_known_names(&mut result.unresolved_terms, &known_names);
+        let after_filter = result.unresolved_terms.len();
+        if before_filter != after_filter {
+            emit_log(&app, "info", "SRT", &format!(
+                "synopsis known-name filter: {} → {} terms ({} removed)",
+                before_filter, after_filter, before_filter - after_filter
+            ));
+        }
+        // Validate term_variants: remove false variant groups
+        let before_variants = result.term_variants.len();
+        validate_term_variants(&mut result.term_variants);
+        let after_variants = result.term_variants.len();
+        if before_variants != after_variants {
+            emit_log(&app, "info", "SRT", &format!(
+                "term_variants validation: {} → {} groups ({} removed)",
+                before_variants, after_variants, before_variants - after_variants
+            ));
+        }
+    }
 
     // Normalize synopsis-produced terms:
     // - surface_ja is always cleared (kanji resolution happens later via AI確認)
@@ -2436,5 +2569,156 @@ mod tests {
         assert!(huan.is_some(), "General Huan should be kept: {:?}", texts);
         let chun = result.iter().find(|r| r.source_text == "Chun Er");
         assert!(chun.is_some(), "Chun Er should be kept: {:?}", texts);
+    }
+
+    #[test]
+    fn test_is_likely_chinese() {
+        // Japanese text with kana
+        assert!(!is_likely_chinese("これは日本語の文章です。このドラマは古代中国を舞台に、主人公の成長を描いた物語である。"));
+        // Chinese text (no kana, many CJK)
+        assert!(is_likely_chinese("这是一部关于古代中国宫廷斗争的电视剧。主角从小成长，最终成为了一代女将军。"));
+        // Short text (too few CJK to determine)
+        assert!(!is_likely_chinese("楚喬"));
+        // English text (no CJK)
+        assert!(!is_likely_chinese("This is a story about a young girl."));
+    }
+
+    // -----------------------------------------------------------------------
+    // filter_synopsis_terms_by_known_names tests
+    // -----------------------------------------------------------------------
+
+    fn make_unresolved(text: &str) -> UnresolvedTerm {
+        UnresolvedTerm {
+            source_text: text.to_string(),
+            surface_ja: String::new(),
+            term_type: "proper_noun".to_string(),
+            status: "unresolved".to_string(),
+            reason: "test".to_string(),
+            source: Some("synopsis".to_string()),
+            occurrence_count: 0,
+            alias_candidate: None,
+        }
+    }
+
+    fn make_glossary(source: &str) -> GlossaryEntry {
+        GlossaryEntry {
+            source: source.to_string(),
+            target: String::new(),
+            entry_type: "place".to_string(),
+            notes: None,
+            aliases: vec![],
+            status: None,
+            confidence: None,
+            evidence_urls: None,
+        }
+    }
+
+    #[test]
+    fn test_filter_synopsis_crown_prince_of_known() {
+        let glossary = vec![make_glossary("Biantang")];
+        let known = build_known_names_set(&[], &glossary);
+        let mut terms = vec![make_unresolved("Crown Prince of Biantang")];
+        filter_synopsis_terms_by_known_names(&mut terms, &known);
+        assert!(terms.is_empty(), "Crown Prince of Biantang should be filtered (title+known)");
+    }
+
+    #[test]
+    fn test_filter_synopsis_known_city() {
+        let glossary = vec![make_glossary("Yanbei")];
+        let known = build_known_names_set(&[], &glossary);
+        let mut terms = vec![make_unresolved("Yanbei City")];
+        filter_synopsis_terms_by_known_names(&mut terms, &known);
+        assert!(terms.is_empty(), "Yanbei City should be filtered (known place+suffix)");
+    }
+
+    #[test]
+    fn test_filter_synopsis_verb_known() {
+        let glossary = vec![make_glossary("Yanbei")];
+        let known = build_known_names_set(&[], &glossary);
+        let mut terms = vec![make_unresolved("Defend Yanbei")];
+        filter_synopsis_terms_by_known_names(&mut terms, &known);
+        assert!(terms.is_empty(), "Defend Yanbei should be filtered (verb+known)");
+    }
+
+    #[test]
+    fn test_filter_synopsis_keep_unknown_place() {
+        let glossary = vec![make_glossary("Yanbei")];
+        let known = build_known_names_set(&[], &glossary);
+        let mut terms = vec![make_unresolved("Luo River")];
+        filter_synopsis_terms_by_known_names(&mut terms, &known);
+        assert_eq!(terms.len(), 1, "Luo River should be kept (unknown prefix)");
+    }
+
+    #[test]
+    fn test_filter_synopsis_keep_unknown_title() {
+        let glossary = vec![make_glossary("Biantang")];
+        let known = build_known_names_set(&[], &glossary);
+        let mut terms = vec![make_unresolved("Lady Helian")];
+        filter_synopsis_terms_by_known_names(&mut terms, &known);
+        assert_eq!(terms.len(), 1, "Lady Helian should be kept (unknown name under title)");
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_term_variants tests
+    // -----------------------------------------------------------------------
+
+    fn make_variant_group(variants: Vec<&str>) -> TermVariantEntry {
+        TermVariantEntry {
+            variants: variants.iter().map(|s| s.to_string()).collect(),
+            canonical: None,
+            status: "needs_review".to_string(),
+            reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_validate_variants_keeps_true_variants() {
+        // "Black Eagle" → "blackeagle", "Black Eagle Army" → "blackeaglearmy" — DIFFERENT dedup keys,
+        // so both groups should be removed (since each has only 1 variant, they're kept).
+        // Actually test with genuinely same-dedup variants:
+        let mut groups = vec![
+            make_variant_group(vec!["Black Eagle", "BlackEagle"]), // same dedup → kept
+            make_variant_group(vec!["Bian Tang", "Biantang"]),     // same dedup → kept
+        ];
+        validate_term_variants(&mut groups);
+        assert_eq!(groups.len(), 2, "True variants should be kept");
+    }
+
+    #[test]
+    fn test_validate_variants_removes_different_concepts() {
+        // "Great Yong" (greatyong) vs "Yong Army" (yongarmy) — different dedup keys
+        let mut groups = vec![
+            make_variant_group(vec!["Great Yong", "Yong Army"]),
+        ];
+        validate_term_variants(&mut groups);
+        assert!(groups.is_empty(), "Great Yong vs Yong Army should be removed as variant group (different dedup keys)");
+    }
+
+    #[test]
+    fn test_validate_variants_removes_different_armies() {
+        // "Black Eagle Army" (blackeaglearmy) vs "Yan Army" (yanarmy) — different dedup keys
+        let mut groups = vec![
+            make_variant_group(vec!["Black Eagle Army", "Yan Army"]),
+        ];
+        validate_term_variants(&mut groups);
+        assert!(groups.is_empty(), "Black Eagle Army vs Yan Army should be removed (independent forces)");
+    }
+
+    #[test]
+    fn test_validate_variants_keeps_single_variant() {
+        let mut groups = vec![
+            make_variant_group(vec!["Some Solo Term"]),
+        ];
+        validate_term_variants(&mut groups);
+        assert_eq!(groups.len(), 1, "Single-variant groups should be kept");
+    }
+
+    #[test]
+    fn test_validate_variants_removes_empty_group() {
+        let mut groups = vec![
+            make_variant_group(vec!["", ""]),
+        ];
+        validate_term_variants(&mut groups);
+        assert!(groups.is_empty(), "Empty variant keys should be removed");
     }
 }

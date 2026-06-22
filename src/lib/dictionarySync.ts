@@ -1,4 +1,4 @@
-import type { CharacterDict, Character, GlossaryEntry, ProperNoun } from "../types";
+import type { CharacterDict, Character, GlossaryEntry, ProperNoun, UnresolvedTerm } from "../types";
 import { saveCharacterDictionary, saveGlossaryDictionary } from "./tauri";
 import { useDictionaryStore } from "../stores/useDictionaryStore";
 import { useAppLogStore } from "../stores/useAppLogStore";
@@ -87,7 +87,7 @@ export async function persistCharacters(
 export async function appendToGlossary(
   baseDir: string,
   newEntries: GlossaryEntry[],
-): Promise<void> {
+): Promise<{ added: number; aliasMerged: number }> {
   const current = useDictionaryStore.getState().glossary;
   // Build lookup: normalized source → index in current array
   const sourceIndex = new Map<string, number>();
@@ -130,7 +130,7 @@ export async function appendToGlossary(
       "辞書",
       "glossary.json: 追加項目なし (全件既存と重複)",
     );
-    return;
+    return { added: 0, aliasMerged: 0 };
   }
 
   const path = buildDictFilePath(baseDir, "glossary.json");
@@ -142,8 +142,10 @@ export async function appendToGlossary(
     if (added > 0) parts.push(`${added}件追加`);
     if (aliasMerged > 0) parts.push(`${aliasMerged}件エイリアス統合`);
     log("success", "辞書", `glossary.json 保存: ${parts.join(", ")} → ${path}`);
+    return { added, aliasMerged };
   } catch (e) {
     log("error", "辞書", `glossary.json 保存失敗: ${e}`);
+    return { added: 0, aliasMerged: 0 };
   }
 }
 
@@ -169,4 +171,71 @@ export function properNounsToGlossaryEntries(nouns: ProperNoun[]): GlossaryEntry
           }`
         : undefined,
     }));
+}
+
+/**
+ * Batch-save adopted terms to glossary.json and (for alias candidates) to characters.json.
+ * Returns counts for AppLogPanel logging.
+ */
+export async function batchSaveAdoptedTerms(
+  baseDir: string,
+  adoptedTerms: GlossaryEntry[],
+  aliasCandidateTerms: UnresolvedTerm[],
+  characters: Character[],
+): Promise<{ glossaryAdded: number; charactersAliasAdded: number }> {
+  // Phase 1: Append to glossary
+  const { added: glossaryAdded } = await appendToGlossary(baseDir, adoptedTerms);
+
+  // Phase 2: For alias candidate terms, add the resolved kanji as aliases on matched characters
+  let charactersAliasAdded = 0;
+  if (aliasCandidateTerms.length > 0 && characters.length > 0) {
+    const charMap = new Map<string, Character>();
+    for (const c of characters) {
+      const key = normalizeSource(c.english_name);
+      charMap.set(key, c);
+      for (const alias of c.aliases) {
+        const aliasKey = normalizeSource(alias);
+        if (!charMap.has(aliasKey)) charMap.set(aliasKey, c);
+      }
+    }
+
+    const updatedChars = characters.map((c) => ({ ...c, aliases: [...c.aliases] }));
+    let changed = false;
+
+    for (const t of aliasCandidateTerms) {
+      const termKey = normalizeSource(t.source_text);
+      const matched = charMap.get(termKey);
+      if (!matched) continue;
+
+      const resolvedKanji = t.webResult?.candidate_zh ?? t.webResult?.candidate_ja ?? t.surface_ja;
+      if (!resolvedKanji) continue;
+
+      const idx = updatedChars.findIndex((c) => normalizeSource(c.english_name) === normalizeSource(matched.english_name));
+      if (idx === -1) continue;
+
+      const char = updatedChars[idx];
+      if (!char.aliases.includes(resolvedKanji)) {
+        char.aliases.push(resolvedKanji);
+        changed = true;
+        charactersAliasAdded++;
+      }
+    }
+
+    if (changed) {
+      const charPath = buildDictFilePath(baseDir, "characters.json");
+      try {
+        await saveCharacterDictionary(charPath, updatedChars);
+        useDictionaryStore.getState().setCharacters(updatedChars, charPath);
+        useAppLogStore.getState().addLog(
+          "success",
+          "辞書",
+          `characters.json 更新: ${charactersAliasAdded}件の別名追加 → ${charPath}`,
+        );
+      } catch (e) {
+        useAppLogStore.getState().addLog("error", "辞書", `characters.json 更新失敗: ${e}`);
+      }
+    }
+  }
+
+  return { glossaryAdded, charactersAliasAdded };
 }

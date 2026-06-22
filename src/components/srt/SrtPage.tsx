@@ -13,7 +13,7 @@ import { useSrtStore } from "../../stores/useSrtStore";
 import { useDictionaryStore } from "../../stores/useDictionaryStore";
 import { useAppLogStore } from "../../stores/useAppLogStore";
 import { useProjectStore } from "../../stores/useProjectStore";
-import { appendToGlossary } from "../../lib/dictionarySync";
+import { appendToGlossary, batchSaveAdoptedTerms } from "../../lib/dictionarySync";
 import {
   listSrtInDir,
   parseSrtFile,
@@ -940,6 +940,166 @@ export default function SrtPage() {
     }
   };
 
+  const handleRegenerateWithDict = async () => {
+    if (!activeFile || !projectBaseDir || !hasLoaded) return;
+    setLoadingSynop(true);
+    setError(null);
+    const log = useAppLogStore.getState().addLog;
+
+    try {
+      const adoptedTerms = activeFile.adoptedTerms;
+      if (adoptedTerms.length === 0) {
+        log("warn", "SRT", "採用済み用語がありません。辞書保存をスキップします。");
+        return;
+      }
+
+      // Filter alias_candidate terms from the active file's unresolved terms
+      const aliasCandidateTerms = activeFile.unresolvedTerms.filter(
+        (t) => t.adopted && t.term_type === "alias_candidate",
+      );
+      const dictChars = useDictionaryStore.getState().characters;
+
+      // Phase 1: Save adopted terms to glossary.json + characters.json
+      const { glossaryAdded, charactersAliasAdded } = await batchSaveAdoptedTerms(
+        projectBaseDir,
+        adoptedTerms,
+        aliasCandidateTerms,
+        dictChars,
+      );
+      const saveParts: string[] = [];
+      if (glossaryAdded > 0) saveParts.push(`用語集 ${glossaryAdded}件`);
+      if (charactersAliasAdded > 0) saveParts.push(`人物別名 ${charactersAliasAdded}件`);
+      if (saveParts.length > 0) {
+        log("success", "SRT", `辞書保存: ${saveParts.join(", ")}`);
+      } else {
+        log("info", "SRT", "辞書保存: 全件既存のため追加なし");
+      }
+
+      // Phase 2: Reload dictionaries from disk (updates frontend store + Rust in-memory state)
+      const { chars, gloss } = await loadDictionariesFromDir(
+        projectBaseDir,
+        setCharacters,
+        setGlossary,
+        setProject,
+        setDictStatus,
+      );
+      log("success", "SRT", `辞書再読み込み: characters ${chars}件, glossary ${gloss}件`);
+
+      // Phase 3: Snapshot pre-regeneration unresolved count
+      const beforeCount = activeFile.unresolvedTerms.length;
+      log("info", "SRT", `再生成前 unresolved_terms: ${beforeCount}件`);
+
+      // Phase 4: Re-run synopsis generation with updated dictionaries
+      const updatedPromptContext = buildPromptContext(
+        useDictionaryStore.getState().characters,
+        useDictionaryStore.getState().glossary,
+        activeFile.katakanaMap,
+        activeFile.termVariants,
+        activeFile.unresolvedTerms,
+        activeFile.adoptedTerms,
+      );
+
+      let result = await generateSrtSynopsis(activeFile.entries, updatedPromptContext);
+
+      // Katakana resolution (same as handleSynopsis)
+      let katakanaMap: KatakanaKanjiMap[] = [];
+      try {
+        katakanaMap = await resolveSynopsisKatakana(
+          result.synopsis_ja,
+          result.unresolved_terms ?? [],
+        );
+        for (const m of katakanaMap) {
+          if (m.status === "resolved" && m.kanji) {
+            result = {
+              ...result,
+              synopsis_ja: result.synopsis_ja.split(m.katakana).join(m.kanji),
+            };
+          }
+        }
+        const correctedChars = result.detected_characters.map((ch) => {
+          let c = ch;
+          for (const m of katakanaMap) {
+            if (m.status === "resolved" && m.kanji) {
+              c = c.split(m.katakana).join(m.kanji);
+            }
+          }
+          return c;
+        });
+        result = { ...result, detected_characters: correctedChars };
+      } catch (_) { /* proceed with raw text */ }
+
+      const termVariants = result.term_variants ?? [];
+
+      // Extract body candidates with updated dictionaries
+      let bodyTerms: UnresolvedTerm[] = [];
+      try {
+        const dictForBody = useDictionaryStore.getState();
+        bodyTerms = await extractSrtBodyCandidates(
+          activeFile.entries,
+          dictForBody.characters,
+          dictForBody.glossary,
+        );
+      } catch (_) { /* best-effort */ }
+
+      // Merge synopsis + body terms
+      const synopsisTerms = (result.unresolved_terms ?? []).map((t) => ({
+        ...t,
+        source: t.source || "synopsis",
+        occurrence_count: t.occurrence_count || 0,
+      }));
+      const merged = mergeUnresolvedTerms(synopsisTerms, bodyTerms);
+
+      const rawUnresolved = merged.map((t) => ({
+        ...t,
+        surface_ja: /[々〆〡-〩぀-ゟ゠-ヿ一-鿿㐀-䶿]/.test(t.surface_ja) ? t.surface_ja : "",
+      }));
+
+      // Filter against UPDATED dictionaries
+      const dictState = useDictionaryStore.getState();
+      const { filtered: newUnresolvedTerms, removedCount } = filterUnresolvedByDict(
+        rawUnresolved,
+        dictState.characters,
+        dictState.glossary,
+      );
+
+      // Phase 5: Save regenerated state
+      setFileSynopsis(activeFile.path, result, katakanaMap, termVariants, newUnresolvedTerms);
+
+      const state = useSrtStore.getState();
+      const f = state.files.find((x) => x.path === activeFile.path);
+      if (f && folderPath) {
+        await saveSrtAnalysis({
+          srt_path: f.path,
+          srt_name: f.name,
+          synopsis: result,
+          scene_detection: f.sceneDetection,
+          scene_contexts: Object.values(f.sceneContexts),
+          katakana_map: katakanaMap,
+          term_variants: termVariants,
+          unresolved_terms: newUnresolvedTerms,
+          adopted_terms: f.adoptedTerms,
+        });
+      }
+
+      // Phase 6: Log regeneration stats
+      const afterCount = newUnresolvedTerms.length;
+      const reduction = beforeCount - afterCount;
+      if (reduction > 0) {
+        log("success", "SRT", `再生成完了: unresolved_terms ${beforeCount}件 → ${afterCount}件 (${reduction}件削減)`);
+      } else {
+        log("success", "SRT", `再生成完了: unresolved_terms ${beforeCount}件 → ${afterCount}件 (変化なし)`);
+      }
+      if (removedCount > 0) {
+        log("success", "SRT", `辞書フィルタで ${removedCount}件の既知語を除外しました`);
+      }
+    } catch (e) {
+      log("error", "SRT", `辞書更新後再生成エラー: ${String(e)}`);
+      setError(String(e));
+    } finally {
+      setLoadingSynop(false);
+    }
+  };
+
   const handleDetectScenes = async () => {
     if (!activeFile) return;
     setLoadingScene(true);
@@ -1158,6 +1318,22 @@ export default function SrtPage() {
                   <BookOpen size={14} />
                   2.1 あらすじ生成
                 </button>
+                {activeFile?.adoptedTerms && activeFile.adoptedTerms.length > 0 && (
+                  <button
+                    className="btn"
+                    onClick={handleRegenerateWithDict}
+                    disabled={!hasLoaded || loadingSynop || !projectBaseDir}
+                    style={{
+                      fontSize: 12,
+                      background: "linear-gradient(135deg, #7c3aed, #a855f7)",
+                      color: "#fff",
+                      border: "none",
+                    }}
+                  >
+                    <RefreshCw size={14} />
+                    採用語を辞書保存して再生成 ({activeFile.adoptedTerms.length}件採用済)
+                  </button>
+                )}
                 <button
                   className="btn btn-primary"
                   onClick={handleDetectScenes}
