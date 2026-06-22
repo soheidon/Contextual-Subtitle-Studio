@@ -1,14 +1,11 @@
 import { NavLink, useNavigate } from "react-router-dom";
-import { FileText, Users, Cpu, Play, AlertCircle, Settings } from "lucide-react";
+import { FileText, Users, Play, Settings } from "lucide-react";
 import { useSrtStore } from "../../stores/useSrtStore";
 
 const navItems = [
   { to: "/", icon: Users, label: "ドラマ情報統合", exact: true },
-  { to: "/srt", icon: FileText, label: "SRT", exact: undefined },
-  { to: "/dictionaries", icon: Users, label: "辞書", exact: undefined },
-  { to: "/llm", icon: Cpu, label: "LLM設定", exact: undefined },
+  { to: "/srt", icon: FileText, label: "SRT読み込み", exact: undefined },
   { to: "/translate", icon: Play, label: "翻訳", exact: undefined },
-  { to: "/review", icon: AlertCircle, label: "レビュー", exact: undefined },
 ];
 
 export default function Sidebar() {
@@ -24,7 +21,7 @@ export default function Sidebar() {
             to={item.to}
             end={item.exact}
             className={({ isActive }) =>
-              `sidebar-link${isActive ? " active" : ""}${!isLoaded && item.to !== "/" ? " disabled" : ""}`
+              `sidebar-link${isActive ? " active" : ""}${!isLoaded && item.to === "/translate" ? " disabled" : ""}`
             }
           >
             <item.icon size={18} />

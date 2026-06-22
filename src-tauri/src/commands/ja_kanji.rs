@@ -3,6 +3,7 @@ use crate::commands::llm::resolve_provider;
 use crate::commands::project::AppState;
 use crate::envstore::EnvStoreState;
 use crate::llm::LlmClient;
+use crate::log::emit_log;
 use tauri::State;
 
 use super::ja_kanji_batch::{self, KanjiRequestItem};
@@ -21,7 +22,7 @@ pub async fn correct_ja_kanji(
     let provider = match resolve_provider(&state, &env_store, &app) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[JaKanji] LLM not configured, skipping batch conversion: {}", e);
+            emit_log(&app, "warn", "JaKanji", &format!("LLM未設定のためスキップ: {}", e));
             return Ok(results);
         }
     };
@@ -47,11 +48,11 @@ pub async fn correct_ja_kanji(
     }
 
     if items.is_empty() {
-        eprintln!("[JaKanji] no rows to convert (all manual or empty)");
+        emit_log(&app, "debug", "JaKanji", "変換対象なし (manualまたは空)");
         return Ok(results);
     }
 
-    eprintln!("[JaKanji] batch LLM conversion: {} rows", items.len());
+    emit_log(&app, "info", "JaKanji", &format!("一括漢字変換開始: {}件", items.len()));
 
     let title = drama_title.as_deref().unwrap_or("");
     match ja_kanji_batch::batch_convert_kanji(&client, &items, title).await {
@@ -68,10 +69,10 @@ pub async fn correct_ja_kanji(
                     }
                 }
             }
-            eprintln!("[JaKanji] batch conversion completed: {} results", responses.len());
+            emit_log(&app, "info", "JaKanji", &format!("一括漢字変換完了: {}件", responses.len()));
         }
         Err(e) => {
-            eprintln!("[JaKanji] batch conversion failed: {}", e);
+            emit_log(&app, "error", "JaKanji", &format!("一括漢字変換失敗: {}", e));
             // Entries stay in pending_llm state
         }
     }

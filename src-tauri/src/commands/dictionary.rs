@@ -37,6 +37,9 @@ pub fn save_character_dictionary(
     characters: Vec<Character>,
 ) -> Result<(), String> {
     let json = save_characters_json(&characters)?;
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("IO error: {}", e))?;
+    }
     std::fs::write(&path, json).map_err(|e| format!("IO error: {}", e))?;
     Ok(())
 }
@@ -75,6 +78,9 @@ pub fn save_glossary_dictionary(
     entries: Vec<GlossaryEntry>,
 ) -> Result<(), String> {
     let json = save_glossary_json(&entries)?;
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("IO error: {}", e))?;
+    }
     std::fs::write(&path, json).map_err(|e| format!("IO error: {}", e))?;
     Ok(())
 }

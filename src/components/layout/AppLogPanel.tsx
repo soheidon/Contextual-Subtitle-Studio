@@ -1,13 +1,25 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
-import { Trash2, ChevronDown, ChevronUp, ClipboardCopy } from "lucide-react";
+import { Trash2, ChevronDown, ChevronUp, ClipboardCopy, Download } from "lucide-react";
 import { useAppLogStore, type LogLevel } from "../../stores/useAppLogStore";
 
 const LEVEL_COLORS: Record<LogLevel, { bg: string; text: string; label: string }> = {
   success: { bg: "rgba(16,124,16,0.12)", text: "var(--success)", label: "OK" },
-  error: { bg: "var(--error-bg)", text: "var(--error)", label: "ERR" },
+  error:   { bg: "var(--error-bg)", text: "var(--error)", label: "ERR" },
   warning: { bg: "rgba(178,107,0,0.1)", text: "var(--warning)", label: "WARN" },
-  info: { bg: "rgba(0,120,212,0.1)", text: "var(--accent)", label: "INFO" },
-  debug: { bg: "var(--bg-table-head)", text: "var(--text-muted)", label: "DBG" },
+  warn:    { bg: "rgba(178,107,0,0.1)", text: "var(--warning)", label: "WARN" },
+  info:    { bg: "rgba(0,120,212,0.1)", text: "var(--accent)", label: "INFO" },
+  debug:   { bg: "var(--bg-table-head)", text: "var(--text-muted)", label: "DBG" },
+};
+
+const ALL_LEVELS: (LogLevel | "all")[] = ["all", "error", "warn", "warning", "info", "debug", "success"];
+const LEVEL_LABELS: Record<string, string> = {
+  all: "すべて",
+  error: "エラー",
+  warn: "警告",
+  warning: "警告",
+  info: "情報",
+  debug: "デバッグ",
+  success: "成功",
 };
 
 const MIN_HEIGHT = 100;
@@ -17,6 +29,7 @@ const DEFAULT_HEIGHT = 200;
 export default function AppLogPanel() {
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [sourceFilter, setSourceFilter] = useState<string>("all");
+  const [levelFilter, setLevelFilter] = useState<string>("all");
   const [panelHeight, setPanelHeight] = useState(DEFAULT_HEIGHT);
   const [isResizing, setIsResizing] = useState(false);
 
@@ -30,19 +43,46 @@ export default function AppLogPanel() {
   const clearLogs = useAppLogStore((s) => s.clearLogs);
 
   const filteredLogs = useMemo(() => {
-    if (sourceFilter === "all") return logs;
-    return logs.filter((e) => e.source === sourceFilter);
-  }, [logs, sourceFilter]);
+    let result = logs;
+    if (sourceFilter !== "all") {
+      result = result.filter((e) => e.source === sourceFilter);
+    }
+    if (levelFilter !== "all") {
+      if (levelFilter === "warn") {
+        result = result.filter((e) => e.level === "warn" || e.level === "warning");
+      } else {
+        result = result.filter((e) => e.level === levelFilter);
+      }
+    }
+    return result;
+  }, [logs, sourceFilter, levelFilter]);
 
   const copyLogs = useCallback(() => {
     const text = filteredLogs
       .map((e) => {
         const time = new Date(e.timestamp).toLocaleTimeString();
-        const level = LEVEL_COLORS[e.level].label;
+        const level = LEVEL_COLORS[e.level]?.label ?? e.level.toUpperCase();
         return `[${time}] [${level}] [${e.source}] ${e.message}`;
       })
       .join("\n");
     navigator.clipboard.writeText(text).catch(console.error);
+  }, [filteredLogs]);
+
+  const saveLogs = useCallback(() => {
+    const text = filteredLogs
+      .map((e) => {
+        const time = new Date(e.timestamp).toLocaleTimeString();
+        const level = LEVEL_COLORS[e.level]?.label ?? e.level.toUpperCase();
+        return `[${time}] [${level}] [${e.source}] ${e.message}`;
+      })
+      .join("\n");
+    const blob = new Blob([text], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `app-log-${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
   }, [filteredLogs]);
 
   const uniqueSources = useMemo(() => {
@@ -100,7 +140,7 @@ export default function AppLogPanel() {
 
       <div className="app-log-panel-toolbar">
         <span className="app-log-panel-title">
-          ログ{logs.length > 0 ? ` (${logs.length}件)` : ""}
+          ログ{logs.length > 0 ? ` (${filteredLogs.length}/${logs.length}件)` : ""}
         </span>
         <select
           value={sourceFilter}
@@ -111,6 +151,14 @@ export default function AppLogPanel() {
             <option key={s} value={s}>{s}</option>
           ))}
         </select>
+        <select
+          value={levelFilter}
+          onChange={(e) => setLevelFilter(e.target.value)}
+        >
+          {ALL_LEVELS.map((l) => (
+            <option key={l} value={l}>{LEVEL_LABELS[l]}</option>
+          ))}
+        </select>
         <button
           className="btn btn-secondary"
           onClick={copyLogs}
@@ -119,6 +167,15 @@ export default function AppLogPanel() {
         >
           <ClipboardCopy size={12} style={{ marginRight: 3, verticalAlign: -2 }} />
           コピー
+        </button>
+        <button
+          className="btn btn-secondary"
+          onClick={saveLogs}
+          style={{ fontSize: 11, padding: "1px 8px" }}
+          title="ログをテキストファイルに保存"
+        >
+          <Download size={12} style={{ marginRight: 3, verticalAlign: -2 }} />
+          保存
         </button>
         <button
           className="btn btn-secondary"
@@ -143,7 +200,7 @@ export default function AppLogPanel() {
             <div className="app-log-panel-empty">ログはまだありません</div>
           ) : (
             filteredLogs.map((entry) => {
-              const c = LEVEL_COLORS[entry.level];
+              const c = LEVEL_COLORS[entry.level] ?? LEVEL_COLORS.info;
               return (
                 <div key={entry.id} className="app-log-panel-entry">
                   <span className="app-log-panel-timestamp">

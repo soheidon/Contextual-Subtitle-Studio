@@ -29,7 +29,7 @@ pub fn load_into_process(app: &tauri::AppHandle) -> EnvStore {
         Ok(p) => p,
         Err(_) => return EnvStore::default(),
     };
-    let store: EnvStore = if path.exists() {
+    let mut store: EnvStore = if path.exists() {
         std::fs::read_to_string(&path)
             .ok()
             .and_then(|d| serde_json::from_str(&d).ok())
@@ -37,6 +37,19 @@ pub fn load_into_process(app: &tauri::AppHandle) -> EnvStore {
     } else {
         EnvStore::default()
     };
+
+    // Migration: "GEMINI API KEY" (with spaces) → "GEMINI_API_KEY"
+    if let Some(value) = store.0.remove("GEMINI API KEY") {
+        if !store.0.contains_key("GEMINI_API_KEY") {
+            store.0.insert("GEMINI_API_KEY".to_string(), value);
+            eprintln!("[EnvStore] GEMINI API KEY → GEMINI_API_KEY を移行しました");
+            // Persist immediately
+            if let Ok(json) = serde_json::to_string_pretty(&store) {
+                let _ = std::fs::write(&path, json);
+            }
+        }
+    }
+
     for (k, v) in &store.0 {
         // Best-effort: setting a process env var in a multi-threaded context is
         // safe on Windows; on Unix some libc functions read envp only at startup,

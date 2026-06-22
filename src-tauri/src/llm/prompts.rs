@@ -166,7 +166,11 @@ mod tests {
             source: "His Majesty".into(),
             target: "陛下".into(),
             entry_type: "title".into(),
+            aliases: Vec::new(),
             notes: None,
+            status: None,
+            confidence: None,
+            evidence_urls: None,
         }];
         let prompt = build_system_prompt(&[], &glossary, &config);
         assert!(prompt.contains("His Majesty → 陛下"));

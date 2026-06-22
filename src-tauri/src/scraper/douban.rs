@@ -579,7 +579,8 @@ fn parse_douban_search_results(html: &str) -> Result<Vec<DoubanSearchItem>, Stri
     let item_sel = Selector::parse(".item-root, .result, .search-result .item").unwrap();
     let link_sel = Selector::parse("a[href*='/subject/']").unwrap();
     let title_sel = Selector::parse(".title-text, .title a, h3 a, a.title").unwrap();
-    let subject_re = Regex::new(r"/subject/(\d+)").unwrap();
+    let subject_re = Regex::new(r"/subject/(\d+)")
+        .map_err(|e| format!("regex error: {}", e))?;
 
     let mut items = Vec::new();
 

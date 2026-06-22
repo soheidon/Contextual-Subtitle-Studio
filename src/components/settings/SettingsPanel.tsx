@@ -9,6 +9,9 @@ import {
   listProviderPresets,
   getProviderSettings,
   saveProviderSettings,
+  getServiceSettings,
+  saveServiceSettings,
+  testOpenaiAiConfirm,
 } from "../../lib/tauri";
 import type { ProviderPreset } from "../../types";
 import ServiceSettingsPanel from "./ServiceSettings";
@@ -44,9 +47,17 @@ const DESC: Record<string, string> = {
 
 // ---- Component ----
 
+const SETTINGS_TABS = [
+  { id: "api-keys" as const, label: "APIキー" },
+  { id: "srt" as const, label: "SRT" },
+];
+
+type TabId = (typeof SETTINGS_TABS)[number]["id"];
+
 export default function SettingsPanel() {
   const { active, refresh } = useLlmStore();
   const addLog = useAppLogStore((s) => s.addLog);
+  const [activeTab, setActiveTab] = useState<TabId>("api-keys");
 
   const [presets, setPresets] = useState<[string, ProviderPreset][]>([]);
   const [hasKey, setHasKey] = useState<Record<string, boolean>>({});
@@ -208,20 +219,81 @@ export default function SettingsPanel() {
     }
   };
 
+  const handleTestAiConfirm = async (prefix: string) => {
+    const d = getDraft(prefix);
+    const tag = providerLabelStatic(prefix);
+    updateDraft(prefix, { testing: true, message: null });
+
+    // Persist settings first so overrides apply
+    try {
+      await saveProviderSettings(prefix, {
+        base_url: d.baseUrl || null,
+        model: d.model || null,
+        thinking: d.thinking || null,
+      });
+    } catch {
+      // save is best-effort for the test
+    }
+
+    addLog("info", tag, `AI確認テスト開始: model=${d.model}`);
+
+    try {
+      const has = await checkEnvVarKeyExists(d.envVarName);
+      if (!has) {
+        updateDraft(prefix, { testing: false, connState: "unset" });
+        setMsg(prefix, "err", "APIキーが未設定です。");
+        addLog("warning", tag, "AI確認テスト: APIキーが未設定です");
+        return;
+      }
+      await testOpenaiAiConfirm();
+      updateDraft(prefix, { testing: false, connState: "ok" });
+      setMsg(prefix, "ok", "AI確認テストOK (Responses API)");
+      addLog("success", tag, "AI確認テストOK (Responses API)");
+    } catch (e) {
+      updateDraft(prefix, { testing: false, connState: "fail" });
+      setMsg(prefix, "err", `AI確認テスト失敗: ${e}`);
+      addLog("error", tag, `AI確認テスト失敗: ${e}`);
+    }
+  };
+
   const handleResetDefaults = (prefix: string) => {
     // Reset to preset defaults — save empty overrides so defaults apply
     saveProviderSettings(prefix, { base_url: null, model: null, thinking: null }).catch(() => {});
+    // Show preset defaults immediately in the UI
+    const preset = presets.find(([p]) => p === prefix)?.[1];
+    const defaults = preset
+      ? { baseUrl: preset.base_url, model: preset.model, thinking: "disabled" }
+      : { baseUrl: "", model: "", thinking: "disabled" };
     updateDraft(prefix, {
       envVarName: `${prefix}_API_KEY`,
-      baseUrl: "",
-      model: "",
-      thinking: "disabled",
+      ...defaults,
     });
     addLog("info", providerLabelStatic(prefix), "デフォルト設定に戻しました");
   };
 
   return (
     <div style={{ maxWidth: 900 }}>
+      {/* ---- Tab bar ---- */}
+      <div style={{ display: "flex", gap: 4, marginBottom: 16, borderBottom: "1px solid var(--border)" }}>
+        {SETTINGS_TABS.map((tab) => (
+          <button
+            key={tab.id}
+            className={`btn ${activeTab === tab.id ? "btn-primary" : "btn-secondary"}`}
+            onClick={() => setActiveTab(tab.id)}
+            style={{
+              fontSize: 13,
+              padding: "6px 16px",
+              borderRadius: "6px 6px 0 0",
+              borderBottom: activeTab === tab.id ? "2px solid var(--accent)" : undefined,
+            }}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {/* ---- API keys tab ---- */}
+      {activeTab === "api-keys" && <>
       {/* ---- LLM providers ---- */}
       <div className="card" style={{ padding: 0 }}>
         <h2 className="card-title" style={{ padding: "18px 18px 12px 18px" }}>
@@ -315,7 +387,7 @@ export default function SettingsPanel() {
                               className="form-input"
                               value={d.envVarName}
                               onChange={(e) => updateDraft(prefix, { envVarName: e.target.value })}
-                              style={{ fontFamily: "monospace" }}
+                              style={{ fontFamily: "monospace", fontSize: 13, padding: "8px 10px", lineHeight: 1.4, overflow: "visible" }}
                             />
                             <div />
                           </FieldGrid>
@@ -328,7 +400,7 @@ export default function SettingsPanel() {
                               type="password"
                               value={d.apiKey}
                               onChange={(e) => updateDraft(prefix, { apiKey: e.target.value })}
-                              placeholder="sk-..."
+                              placeholder={prefix === "GEMINI" ? "AIza..." : "sk-..."}
                             />
                             <button
                               className="btn btn-primary"
@@ -432,20 +504,81 @@ export default function SettingsPanel() {
 
                           {/* Action buttons */}
                           <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 16 }}>
-                            <button
-                              className="btn btn-primary"
-                              onClick={() => handleTestConnection(prefix)}
-                              disabled={d.testing}
-                            >
-                              {d.testing ? "テスト中..." : "接続テスト"}
-                            </button>
-                            <button
-                              className="btn btn-secondary"
-                              onClick={() => handleResetDefaults(prefix)}
-                            >
-                              Defaultに設定
-                            </button>
+                            {prefix === "OPENAI" ? (
+                              <>
+                                <button
+                                  className="btn btn-primary"
+                                  onClick={() => handleTestConnection(prefix)}
+                                  disabled={d.testing}
+                                >
+                                  {d.testing ? "テスト中..." : "Chat接続テスト"}
+                                </button>
+                                <button
+                                  className="btn btn-primary"
+                                  onClick={() => handleTestAiConfirm(prefix)}
+                                  disabled={d.testing}
+                                >
+                                  {d.testing ? "テスト中..." : "AI確認テスト"}
+                                </button>
+                                <button
+                                  className="btn btn-secondary"
+                                  onClick={() => handleResetDefaults(prefix)}
+                                >
+                                  Defaultに設定
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                <button
+                                  className="btn btn-primary"
+                                  onClick={() => handleTestConnection(prefix)}
+                                  disabled={d.testing}
+                                >
+                                  {d.testing ? "テスト中..." : "接続テスト"}
+                                </button>
+                                <button
+                                  className="btn btn-secondary"
+                                  onClick={() => handleResetDefaults(prefix)}
+                                >
+                                  Defaultに設定
+                                </button>
+                              </>
+                            )}
                           </div>
+
+                          {/* OpenAI AI確認 info */}
+                          {prefix === "OPENAI" && (
+                            <p
+                              style={{
+                                fontSize: 11,
+                                color: "var(--text-muted)",
+                                marginTop: 12,
+                                lineHeight: 1.5,
+                              }}
+                            >
+                              AI確認では OpenAI Responses API + web_search tool を使用します。
+                              <code style={{ fontSize: 11 }}>POST https://api.openai.com/v1/responses</code>{" "}
+                              を呼び出し、モデルは上記の「使用モデル」設定が使われます。
+                              Chat互換APIとは異なるエンドポイントです。
+                            </p>
+                          )}
+
+                          {/* Gemini AI確認 info */}
+                          {prefix === "GEMINI" && (
+                            <p
+                              style={{
+                                fontSize: 11,
+                                color: "var(--text-muted)",
+                                marginTop: 12,
+                                lineHeight: 1.5,
+                              }}
+                            >
+                              AI確認では Gemini native API + Google Search grounding を使用します。
+                              Chat互換Base URLとは別に{" "}
+                              <code style={{ fontSize: 11 }}>https://generativelanguage.googleapis.com/v1beta/models/&#123;model&#125;:generateContent</code>{" "}
+                              を呼び出します。
+                            </p>
+                          )}
 
                           {/* Message */}
                           {msg && (
@@ -486,9 +619,13 @@ export default function SettingsPanel() {
         >
           Contextual Subtitle Studio — ドラマ特化の英語→日本語字幕翻訳ツール
           <br />
-          バージョン 0.1.0 MVP
+          バージョン 0.2.1
         </p>
       </div>
+      </>}
+
+      {/* ---- SRT tab ---- */}
+      {activeTab === "srt" && <SrtSettingsTab />}
     </div>
   );
 }
@@ -566,4 +703,110 @@ function emptyDraft(prefix: string, configured: boolean): ProviderDraft {
     testing: false,
     message: null,
   };
+}
+
+// ---- SRT settings tab ----
+
+const DEFAULT_SRT_EN_PATTERN = "_en\\.srt$";
+
+function SrtSettingsTab() {
+  const [pattern, setPattern] = useState(DEFAULT_SRT_EN_PATTERN);
+  const [message, setMessage] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const settings = await getServiceSettings();
+        if (cancelled) return;
+        setPattern(settings.srt_en_pattern || DEFAULT_SRT_EN_PATTERN);
+        setLoaded(true);
+      } catch {
+        setLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleSave = async () => {
+    try {
+      const current = await getServiceSettings();
+      await saveServiceSettings({ ...current, srt_en_pattern: pattern });
+      setMessage({ type: "ok", "text": "保存しました。" });
+    } catch (e) {
+      setMessage({ type: "err", text: `保存に失敗しました: ${e}` });
+    }
+    setTimeout(() => setMessage(null), 4000);
+  };
+
+  const handleReset = () => {
+    setPattern(DEFAULT_SRT_EN_PATTERN);
+  };
+
+  return (
+    <div className="card">
+      <h2 className="card-title">字幕読み込み</h2>
+      <p
+        style={{
+          fontSize: 13,
+          color: "var(--text-secondary)",
+          marginBottom: 16,
+          lineHeight: 1.6,
+        }}
+      >
+        SRT読み込み画面でフォルダを選択したとき、どのファイルを英語字幕として検出するかを正規表現で設定します。
+      </p>
+
+      <FieldGrid>
+        <FieldLabel>検出パターン</FieldLabel>
+        <input
+          className="form-input"
+          value={pattern}
+          onChange={(e) => setPattern(e.target.value)}
+          placeholder={DEFAULT_SRT_EN_PATTERN}
+          style={{ fontFamily: "monospace", fontSize: 13 }}
+        />
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn btn-primary" onClick={handleSave}>
+            保存
+          </button>
+          <button className="btn btn-secondary" onClick={handleReset}>
+            デフォルト
+          </button>
+        </div>
+      </FieldGrid>
+
+      <p
+        style={{
+          fontSize: 12,
+          color: "var(--text-muted)",
+          lineHeight: 1.6,
+          marginTop: -4,
+          marginBottom: 12,
+        }}
+      >
+        ファイル名がこの正規表現に一致する <code>.srt</code> ファイルが英語字幕として検出されます。
+        <br />
+        例: <code>_en\.srt$</code> → ファイル名に <code>_en</code> を含み <code>.srt</code> で終わるファイル
+        <br />
+        例: <code>English\.srt$</code> → ファイル名に <code>English</code> を含むファイル
+      </p>
+
+      {message && (
+        <p
+          style={{
+            fontSize: 12,
+            color: message.type === "ok" ? "var(--success)" : "var(--error)",
+          }}
+        >
+          {message.text}
+        </p>
+      )}
+
+      {!loaded && (
+        <p style={{ fontSize: 12, color: "var(--text-muted)" }}>読み込み中...</p>
+      )}
+    </div>
+  );
 }

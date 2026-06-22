@@ -28,6 +28,15 @@ import type {
   SynopsisSummary,
   MergedCastEntry,
   CharacterAlias,
+  SrtFileEntry,
+  SrtSynopsisResult,
+  SceneDetectionResult,
+  SceneContextResult,
+  SrtAnalysisFile,
+  KatakanaKanjiMap,
+  UnresolvedTerm,
+  WebTermResolution,
+  BatchTermRequest,
 } from "../types";
 
 // Project
@@ -49,6 +58,9 @@ export const parseSrtFile = (path: string) =>
 
 export const getSrtEntries = () =>
   invoke<SubtitleEntry[]>("get_srt_entries");
+
+export const listSrtInDir = (dirPath: string) =>
+  invoke<SrtFileEntry[]>("list_srt_in_dir", { dirPath });
 
 export const saveSrtFile = (path: string, entries: SubtitleEntry[]) =>
   invoke<void>("save_srt_file", { path, entries });
@@ -282,3 +294,81 @@ export const enrichDictKanji = (dict: CharacterDict, mergedCast: MergedCastEntry
 // Generate character name aliases for subtitle replacement dictionary
 export const generateCharacterAliases = (entries: MergedCastEntry[]) =>
   invoke<CharacterAlias[]>("generate_character_aliases", { entries });
+
+// SRT Analysis (LLM-powered: 2.1, 2.2, 2.3)
+export const generateSrtSynopsis = (entries: SubtitleEntry[], promptContext?: string) =>
+  invoke<SrtSynopsisResult>("generate_srt_synopsis", {
+    entries,
+    promptContext: promptContext ?? null,
+  });
+
+export const detectSrtScenes = (entries: SubtitleEntry[], promptContext?: string) =>
+  invoke<SceneDetectionResult>("detect_srt_scenes", {
+    entries,
+    promptContext: promptContext ?? null,
+  });
+
+export const analyzeSceneContext = (
+  entries: SubtitleEntry[],
+  characterNames?: string[],
+  promptContext?: string,
+) =>
+  invoke<SceneContextResult>("analyze_scene_context", {
+    entries,
+    characterNames: characterNames ?? null,
+    promptContext: promptContext ?? null,
+  });
+
+export const saveSrtAnalysis = (analysis: SrtAnalysisFile) =>
+  invoke<void>("save_srt_analysis", { analysis });
+
+export const loadSrtAnalyses = (srtPaths: string[]) =>
+  invoke<SrtAnalysisFile[]>("load_srt_analyses", { srtPaths });
+
+export const resolveSynopsisKatakana = (synopsisJa: string, unresolvedTerms: UnresolvedTerm[]) =>
+  invoke<KatakanaKanjiMap[]>("resolve_synopsis_katakana", { synopsisJa, unresolvedTerms });
+
+export const resolveUnresolvedTermAi = (params: {
+  source_text: string;
+  surface_ja: string;
+  drama_title?: string;
+  prompt_context?: string;
+}) => invoke<WebTermResolution>("resolve_unresolved_term_ai", {
+  sourceText: params.source_text,
+  surfaceJa: params.surface_ja,
+  dramaTitle: params.drama_title,
+  promptContext: params.prompt_context,
+});
+
+export const resolveUnresolvedTermAiOpenai = (params: {
+  source_text: string;
+  surface_ja: string;
+  drama_title?: string;
+  prompt_context?: string;
+  srt_filename?: string | null;
+}) => invoke<WebTermResolution>("resolve_unresolved_term_ai_openai", {
+  sourceText: params.source_text,
+  surfaceJa: params.surface_ja,
+  dramaTitle: params.drama_title,
+  promptContext: params.prompt_context,
+  srtFilename: params.srt_filename ?? null,
+});
+
+export const resolveUnresolvedTermsBatchOpenai = (params: {
+  terms: BatchTermRequest[];
+  drama_title_ja: string;
+  drama_title_zh?: string | null;
+  drama_title_en?: string | null;
+  short_context?: string | null;
+  srt_filename?: string | null;
+}) => invoke<WebTermResolution[]>("resolve_unresolved_terms_batch_openai", {
+  terms: params.terms,
+  dramaTitleJa: params.drama_title_ja,
+  dramaTitleZh: params.drama_title_zh ?? null,
+  dramaTitleEn: params.drama_title_en ?? null,
+  shortContext: params.short_context ?? null,
+  srtFilename: params.srt_filename ?? null,
+});
+
+export const testOpenaiAiConfirm = () =>
+  invoke<boolean>("test_openai_ai_confirm");

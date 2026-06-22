@@ -24,6 +24,10 @@ export interface GlossaryEntry {
   target: string;
   type: string;
   notes?: string;
+  aliases?: string[];
+  status?: string;
+  confidence?: string;
+  evidence_urls?: string[];
 }
 
 export interface ProviderConfig {
@@ -393,6 +397,107 @@ export interface MdlExtractResult {
 export interface ServiceSettings {
   tmdb_env_var_name: string;
   tmdb_base_url: string;
+  srt_en_pattern: string;
+}
+
+export interface SrtFileEntry {
+  path: string;
+  name: string;
+}
+
+// ---------------------------------------------------------------------------
+// SRT Analysis (LLM-powered: 2.1, 2.2, 2.3)
+// ---------------------------------------------------------------------------
+
+export interface WebTermResolution {
+  source_text: string;
+  surface_ja: string;
+  candidate_zh: string | null;
+  candidate_ja: string | null;
+  confidence: "high" | "medium" | "low" | "none";
+  evidence_summary: string;
+  evidence_urls: string[];
+  status: "candidate_found" | "not_found" | "error" | "found" | "uncertain";
+  source?: "web" | "gemini" | "openai";
+  alternatives?: string[];
+  evidence?: EvidenceItem[];
+  reason?: string;
+}
+
+export interface EvidenceItem {
+  title: string;
+  url: string;
+  quote: string;
+}
+
+export interface BatchTermRequest {
+  source_text: string;
+  surface_ja: string;
+}
+
+export interface UnresolvedTerm {
+  source_text: string;
+  surface_ja: string;
+  term_type: string;
+  status: string;
+  reason: string;
+  webResult?: WebTermResolution;
+  adopted?: boolean;
+}
+
+export interface SrtSynopsisResult {
+  synopsis_ja: string;
+  detected_characters: string[];
+  term_variants: TermVariantEntry[];
+  unresolved_terms: UnresolvedTerm[];
+}
+
+export interface TermVariantEntry {
+  variants: string[];
+  canonical: string | null;
+  status: "needs_review" | "resolved" | "";
+  reason: string;
+}
+
+export interface DetectedScene {
+  scene_index: number;
+  title: string;
+  start_entry_index: number;
+  end_entry_index: number;
+  entry_count: number;
+  reason: string;
+}
+
+export interface SceneDetectionResult {
+  scenes: DetectedScene[];
+}
+
+export interface SceneContextResult {
+  scene_index: number;
+  context_ja: string;
+  hierarchy: string | null;
+  gender_notes: string[];
+}
+
+export interface KatakanaKanjiMap {
+  katakana: string;
+  kanji: string | null;
+  status: "resolved" | "unresolved" | "";
+  confidence?: "high" | "medium" | "low" | null;
+  reason: string;
+  original_text: string;
+}
+
+export interface SrtAnalysisFile {
+  srt_path: string;
+  srt_name: string;
+  synopsis: SrtSynopsisResult | null;
+  scene_detection: SceneDetectionResult | null;
+  scene_contexts: SceneContextResult[];
+  katakana_map: KatakanaKanjiMap[];
+  term_variants: TermVariantEntry[];
+  unresolved_terms: UnresolvedTerm[];
+  adopted_terms?: GlossaryEntry[];
 }
 
 // ---------------------------------------------------------------------------

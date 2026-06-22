@@ -19,9 +19,9 @@ pub fn provider_preset(env_var_name: &str) -> Option<ProviderPreset> {
 
     let preset = match prefix {
         "DEEPSEEK" => ("DeepSeek", "https://api.deepseek.com", "deepseek-v4-flash"),
-        "OPENAI" => ("OpenAI", "https://api.openai.com", "gpt-4o-mini"),
+        "OPENAI" => ("OpenAI", "https://api.openai.com/v1", "gpt-5.5"),
         "ANTHROPIC" | "CLAUDE" => ("Anthropic", "https://api.anthropic.com", "claude-3-5-sonnet-latest"),
-        "GEMINI" | "GOOGLE" => ("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.0-flash"),
+        "GEMINI" | "GOOGLE" => ("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-3.5-flash"),
         "MINIMAX" => ("MiniMax", "https://api.MiniMax.chat", "MiniMax-chat"),
         "MOONSHOT" | "KIMI" => ("Kimi / Moonshot", "https://api.moonshot.cn", "moonshot-v1-8k"),
         _ => return None,

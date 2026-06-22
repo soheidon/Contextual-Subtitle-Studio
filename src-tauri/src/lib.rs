@@ -3,6 +3,7 @@ pub mod commands;
 pub mod dictionary;
 pub mod envstore;
 pub mod llm;
+pub mod log;
 pub mod merge;
 pub mod project;
 pub mod scraper;
@@ -61,6 +62,16 @@ pub fn run() {
             commands::srt::parse_srt_file,
             commands::srt::get_srt_entries,
             commands::srt::save_srt_file,
+            commands::srt::list_srt_in_dir,
+            commands::srt::generate_srt_synopsis,
+            commands::srt::detect_srt_scenes,
+            commands::srt::analyze_scene_context,
+            commands::srt::save_srt_analysis,
+            commands::srt::load_srt_analyses,
+            commands::srt::resolve_synopsis_katakana,
+            commands::srt::resolve_unresolved_term_ai,
+            commands::srt::resolve_unresolved_term_ai_openai,
+            commands::srt::resolve_unresolved_terms_batch_openai,
             commands::dictionary::load_character_dictionary,
             commands::dictionary::get_characters,
             commands::dictionary::save_character_dictionary,
@@ -115,6 +126,7 @@ pub fn run() {
             commands::service_settings::get_service_settings,
             commands::service_settings::save_service_settings,
             commands::service_settings::test_tmdb_connection,
+            commands::service_settings::test_openai_ai_confirm,
             commands::service_settings::get_provider_settings,
             commands::service_settings::save_provider_settings,
             commands::util::open_url,

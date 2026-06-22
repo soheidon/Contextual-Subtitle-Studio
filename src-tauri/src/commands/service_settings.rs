@@ -3,6 +3,7 @@ use tauri::Manager;
 
 const DEFAULT_TMDB_ENV_VAR: &str = "TMDB_API_KEY";
 const DEFAULT_TMDB_BASE_URL: &str = "https://api.themoviedb.org";
+const DEFAULT_SRT_EN_PATTERN: &str = r"_en\.srt$";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -32,6 +33,12 @@ pub struct ResolvedProviderSettings {
 pub struct ServiceSettings {
     pub tmdb_env_var_name: String,
     pub tmdb_base_url: String,
+    #[serde(default = "default_srt_en_pattern")]
+    pub srt_en_pattern: String,
+}
+
+fn default_srt_en_pattern() -> String {
+    DEFAULT_SRT_EN_PATTERN.to_string()
 }
 
 impl Default for ServiceSettings {
@@ -39,6 +46,7 @@ impl Default for ServiceSettings {
         Self {
             tmdb_env_var_name: DEFAULT_TMDB_ENV_VAR.to_string(),
             tmdb_base_url: DEFAULT_TMDB_BASE_URL.to_string(),
+            srt_en_pattern: DEFAULT_SRT_EN_PATTERN.to_string(),
         }
     }
 }
@@ -51,9 +59,9 @@ impl Default for ServiceSettings {
 fn provider_defaults(prefix: &str) -> (&str, &str, &str) {
     match prefix {
         "DEEPSEEK" => ("https://api.deepseek.com", "deepseek-v4-flash", "disabled"),
-        "OPENAI" => ("https://api.openai.com", "gpt-4o-mini", "disabled"),
+        "OPENAI" => ("https://api.openai.com/v1", "gpt-5.5", "disabled"),
         "ANTHROPIC" | "CLAUDE" => ("https://api.anthropic.com", "claude-sonnet-4-5", "disabled"),
-        "GEMINI" | "GOOGLE" => ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.0-flash", "disabled"),
+        "GEMINI" | "GOOGLE" => ("https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-3.5-flash", "disabled"),
         "MINIMAX" => ("https://api.minimax.chat", "MiniMax-chat", "disabled"),
         "MOONSHOT" | "KIMI" => ("https://api.moonshot.cn", "moonshot-v1-8k", "disabled"),
         _ => ("", "", "disabled"),
@@ -140,14 +148,26 @@ fn migrate_deepseek_model(model: &str, thinking: &str) -> (String, String) {
 }
 
 // ---------------------------------------------------------------------------
-// Public helpers (used by commands/llm.rs)
+// Public helpers (used by commands/llm.rs, commands/srt.rs)
 // ---------------------------------------------------------------------------
+
+/// Read the configured SRT English-filename regex from settings.
+pub fn read_srt_en_pattern(app: &tauri::AppHandle) -> String {
+    let settings = read_settings(app);
+    settings["srt_en_pattern"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| DEFAULT_SRT_EN_PATTERN.to_string())
+}
 
 /// Read the resolved per-provider settings from disk.
 /// Applies defaults, migration, and old-model-name migration for DeepSeek.
 pub fn read_provider_settings(app: &tauri::AppHandle, prefix: &str) -> ResolvedProviderSettings {
     let mut settings = read_settings(app);
     migrate_old_keys(app, &mut settings);
+    migrate_gemini_defaults(app, &mut settings);
+    migrate_openai_defaults(app, &mut settings);
 
     let providers = &settings["providers"];
     let ps = &providers[prefix];
@@ -185,6 +205,107 @@ pub fn read_provider_settings(app: &tauri::AppHandle, prefix: &str) -> ResolvedP
 }
 
 // ---------------------------------------------------------------------------
+// Gemini defaults migration (normalize old saved values)
+// ---------------------------------------------------------------------------
+
+/// If a saved Gemini provider setting matches a known old default,
+/// update it in-place to the current default and persist.
+fn migrate_gemini_defaults(app: &tauri::AppHandle, settings: &mut serde_json::Value) {
+    if settings["providers"].is_null() || !settings["providers"]["GEMINI"].is_object() {
+        return;
+    }
+
+    let gemini = &settings["providers"]["GEMINI"];
+    let mut changed = false;
+    let mut migrated = serde_json::json!({});
+
+    // Copy existing values
+    if let Some(v) = gemini.get("base_url").and_then(|v| v.as_str()) {
+        migrated["base_url"] = serde_json::Value::String(v.to_string());
+    }
+    if let Some(v) = gemini.get("model").and_then(|v| v.as_str()) {
+        migrated["model"] = serde_json::Value::String(v.to_string());
+    }
+    if let Some(v) = gemini.get("thinking").and_then(|v| v.as_str()) {
+        migrated["thinking"] = serde_json::Value::String(v.to_string());
+    }
+
+    // Normalize: base_url without trailing slash → with trailing slash
+    if let Some(url) = migrated["base_url"].as_str() {
+        if url == "https://generativelanguage.googleapis.com/v1beta/openai" {
+            migrated["base_url"] = serde_json::json!("https://generativelanguage.googleapis.com/v1beta/openai/");
+            eprintln!("[Gemini] base_url を正規化: 末尾 / を追加しました");
+            changed = true;
+        }
+    }
+
+    // Normalize: old default model gemini-2.0-flash → gemini-3.5-flash
+    // Only fix exact old default — don't touch user-set models like gemini-2.5-flash
+    if let Some(model) = migrated["model"].as_str() {
+        if model == "gemini-2.0-flash" {
+            migrated["model"] = serde_json::json!("gemini-3.5-flash");
+            eprintln!("[Gemini] model を gemini-2.0-flash → gemini-3.5-flash に移行しました");
+            changed = true;
+        }
+    }
+
+    if changed {
+        settings["providers"]["GEMINI"] = migrated;
+        let _ = write_settings(app, settings);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI defaults migration (normalize old saved values)
+// ---------------------------------------------------------------------------
+
+/// If a saved OpenAI provider setting matches a known old default,
+/// update it in-place to the current default and persist.
+fn migrate_openai_defaults(app: &tauri::AppHandle, settings: &mut serde_json::Value) {
+    if settings["providers"].is_null() || !settings["providers"]["OPENAI"].is_object() {
+        return;
+    }
+
+    let openai = &settings["providers"]["OPENAI"];
+    let mut changed = false;
+    let mut migrated = serde_json::json!({});
+
+    // Copy existing values
+    if let Some(v) = openai.get("base_url").and_then(|v| v.as_str()) {
+        migrated["base_url"] = serde_json::Value::String(v.to_string());
+    }
+    if let Some(v) = openai.get("model").and_then(|v| v.as_str()) {
+        migrated["model"] = serde_json::Value::String(v.to_string());
+    }
+    if let Some(v) = openai.get("thinking").and_then(|v| v.as_str()) {
+        migrated["thinking"] = serde_json::Value::String(v.to_string());
+    }
+
+    // Normalize old base_url without /v1 → with /v1
+    if let Some(url) = migrated["base_url"].as_str() {
+        if url == "https://api.openai.com" {
+            migrated["base_url"] = serde_json::json!("https://api.openai.com/v1");
+            eprintln!("[OpenAI] base_url を正規化: https://api.openai.com → https://api.openai.com/v1");
+            changed = true;
+        }
+    }
+
+    // Normalize old default model gpt-4o-mini → gpt-5.5
+    if let Some(model) = migrated["model"].as_str() {
+        if model == "gpt-4o-mini" {
+            migrated["model"] = serde_json::json!("gpt-5.5");
+            eprintln!("[OpenAI] model を gpt-4o-mini → gpt-5.5 に移行しました");
+            changed = true;
+        }
+    }
+
+    if changed {
+        settings["providers"]["OPENAI"] = migrated;
+        let _ = write_settings(app, settings);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -202,6 +323,11 @@ pub fn get_service_settings(app: tauri::AppHandle) -> ServiceSettings {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .unwrap_or_else(|| DEFAULT_TMDB_BASE_URL.to_string()),
+        srt_en_pattern: settings["srt_en_pattern"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| DEFAULT_SRT_EN_PATTERN.to_string()),
     }
 }
 
@@ -210,6 +336,7 @@ pub fn save_service_settings(app: tauri::AppHandle, settings: ServiceSettings) -
     let mut current = read_settings(&app);
     current["tmdb_env_var_name"] = serde_json::Value::String(settings.tmdb_env_var_name);
     current["tmdb_base_url"] = serde_json::Value::String(settings.tmdb_base_url);
+    current["srt_en_pattern"] = serde_json::Value::String(settings.srt_en_pattern);
     write_settings(&app, &current)
 }
 
@@ -268,4 +395,53 @@ pub async fn test_tmdb_connection(api_key: String, base_url: String) -> Result<b
         let body = resp.text().await.unwrap_or_default();
         Err(format!("TMDb API HTTP {} — {}", status.as_u16(), body))
     }
+}
+
+/// Test OpenAI Responses API connectivity with web_search tool for AI確認.
+#[tauri::command]
+pub async fn test_openai_ai_confirm(
+    app: tauri::AppHandle,
+    env_store: tauri::State<'_, crate::envstore::EnvStoreState>,
+) -> Result<bool, String> {
+    // Resolve OPENAI_API_KEY from env or persistent store
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            env_store.0.lock().ok().and_then(|s| s.0.get("OPENAI_API_KEY").cloned())
+        })
+        .ok_or("OPENAI_API_KEY が設定されていません。設定画面でAPIキーを保存してください。")?;
+
+    // Read the saved model from provider settings
+    let overrides = read_provider_settings(&app, "OPENAI");
+    let model = overrides.model;
+
+    let url = "https://api.openai.com/v1/responses";
+
+    let request_body = serde_json::json!({
+        "model": &model,
+        "input": "Hello",
+        "instructions": "Reply with single word OK in JSON: {\"status\":\"ok\"}",
+        "tools": [{"type": "web_search"}],
+        "temperature": 0.0,
+        "text": {"format": {"type": "json_object"}}
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("ネットワークエラー: {}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("OpenAI Responses API エラー ({}): {}", status.as_u16(), body));
+    }
+
+    Ok(true)
 }

@@ -19,6 +19,7 @@ export interface GlossaryEntry {
   target: string;
   type: string;
   notes?: string;
+  aliases?: string[];
 }
 
 interface DictionaryState {

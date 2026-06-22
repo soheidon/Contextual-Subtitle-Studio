@@ -1,10 +1,12 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { ClipboardPaste, GitMerge, Download, Globe, Loader2, FolderOpen, Search, FileText, Copy, Save } from "lucide-react";
 import { searchTmdb, scrapeTmdbCredits, buildCharacterDict, scrapeUrl, saveDramaInfo, loadDramaInfo, parseMdlHtmlPaste, openUrl, summarizeSynopsis, mergeCastEntries, correctJaKanji, enrichDictKanji } from "../../lib/tauri";
 import { buildPromptText } from "../../lib/prompt";
 import DramaSearchPanel from "./DramaSearchPanel";
 import type { PastedEntry, CharacterDict, DramaInfo, TmdbSearchResult, SynopsisSummary, MergedCastEntry } from "../../types";
 import { useAppLogStore } from "../../stores/useAppLogStore";
+import { useProjectStore } from "../../stores/useProjectStore";
+import { persistCharacters, appendToGlossary, properNounsToGlossaryEntries } from "../../lib/dictionarySync";
 
 function normalizeDoubanUrl(url: string): string | null {
   const m = url.match(/douban\.com\/subject\/(\d+)/);
@@ -37,7 +39,7 @@ export default function CharacterDictBuilder() {
   const [dict, setDict] = useState<CharacterDict | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [workDir, setWorkDir] = useState<string>("");
+  const { baseDir: workDir, setProject } = useProjectStore();
   const [synopsisSummary, setSynopsisSummary] = useState<SynopsisSummary | null>(null);
   const [summarizing, setSummarizing] = useState(false);
   const [summaryError, setSummaryError] = useState<string | null>(null);
@@ -65,18 +67,34 @@ export default function CharacterDictBuilder() {
     updated_at: new Date().toISOString(),
   });
 
+  // Restore from project store when component mounts (survives tab switches)
+  useEffect(() => {
+    if (workDir && !restoringRef.current) {
+      restoreFromWorkDir(workDir);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workDir]);
+
   const handleSelectWorkDir = async () => {
     try {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const selected = await open({ directory: true, multiple: false, title: "作業ディレクトリを選択" });
       if (selected && typeof selected === "string") {
-        setWorkDir(selected);
+        const name = selected.split(/[/\\]/).pop() || selected;
+        setProject(name, selected);
         await restoreFromWorkDir(selected);
       }
     } catch (e) {
       console.error("ディレクトリ選択エラー:", e);
     }
   };
+
+  // Restore from project store when component mounts (survives tab switches)
+  useEffect(() => {
+    if (workDir && !restoringRef.current) {
+      restoreFromWorkDir(workDir);
+    }
+  }, [workDir]);
 
   // DramaSearchPanel callbacks
   const handleSearchTmdbAutoSelect = (result: TmdbSearchResult) => {
@@ -382,6 +400,9 @@ export default function CharacterDictBuilder() {
       setEditablePnKanji({});
       addLog("success", "Synopsis", `要約完了: human_summary=${summary.human_summary_ja.length}文字, context=${summary.translation_context_short_ja.length}文字, 固有名詞=${summary.proper_nouns.length}件`);
       if (workDir) {
+        if (summary.proper_nouns.length > 0) {
+          appendToGlossary(workDir, properNounsToGlossaryEntries(summary.proper_nouns));
+        }
         saveDramaInfo(workDir, { metadata: null, synopsis_douban: doubanDrama?.synopsis || null, synopsis_tmdb: tmdbDrama?.synopsis || null, cast_douban: doubanEntries, cast_tmdb: tmdbEntries, cast_mdl: mdlHtmlEntries, character_dict: dict, synopsis_summary: summary, merged_cast: mergedCast })
           .catch((e) => console.error("保存エラー:", e));
       }
@@ -411,6 +432,7 @@ export default function CharacterDictBuilder() {
       setDict(result);
       setActiveTab("merge");
       if (workDir) {
+        persistCharacters(workDir, result);
         saveDramaInfo(workDir, { metadata: null, synopsis_douban: doubanDrama?.synopsis || null, synopsis_tmdb: tmdbDrama?.synopsis || null, cast_douban: doubanEntries, cast_tmdb: englishEntries, cast_mdl: mdlHtmlEntries, character_dict: result, synopsis_summary: synopsisSummary, merged_cast: mergedCast })
           .catch((e) => console.error("保存エラー:", e));
       }
@@ -612,8 +634,12 @@ export default function CharacterDictBuilder() {
           <span style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" }}>作業ディレクトリ</span>
           <input
             className="form-input"
-            value={workDir}
-            onChange={(e) => setWorkDir(e.target.value)}
+            value={workDir ?? ""}
+            onChange={(e) => {
+              const val = e.target.value;
+              const name = val.split(/[/\\]/).pop() || val;
+              setProject(name, val);
+            }}
             onBlur={() => { if (workDir) restoreFromWorkDir(workDir); }}
             placeholder="C:\Users\...\project"
             style={{ flex: 1, fontSize: 12 }}

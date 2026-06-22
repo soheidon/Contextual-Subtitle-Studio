@@ -110,16 +110,22 @@ export default function ServiceSettingsPanel() {
     }
   };
 
-  const handleResetDefaults = () => {
+  const handleResetDefaults = async () => {
     setTmdb((p) => ({
       ...p,
       envVarName: DEFAULT_TMDB_ENV,
       baseUrl: DEFAULT_TMDB_URL,
     }));
-    saveServiceSettings({
-      tmdb_env_var_name: DEFAULT_TMDB_ENV,
-      tmdb_base_url: DEFAULT_TMDB_URL,
-    }).catch(() => {});
+    try {
+      const current = await getServiceSettings();
+      await saveServiceSettings({
+        ...current,
+        tmdb_env_var_name: DEFAULT_TMDB_ENV,
+        tmdb_base_url: DEFAULT_TMDB_URL,
+      });
+    } catch {
+      // best effort
+    }
     addLog("info", "TMDb", "デフォルト設定に戻しました");
   };
 
@@ -273,6 +279,7 @@ export default function ServiceSettingsPanel() {
               {msg.text}
             </p>
           )}
+
         </div>
       )}
     </div>

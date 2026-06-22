@@ -1,5 +1,6 @@
 use crate::character_dict::{self, CharacterDict, MergedCastEntry, PastedEntry, QualityReport};
 use crate::dictionary::characters::Character;
+use crate::log::emit_log;
 use crate::merge::{self, MergedCharacter};
 use crate::scraper::{self, ScrapeResult, ScrapeSource, SearchCandidate};
 use tauri::State;
@@ -287,16 +288,14 @@ pub fn parse_mdl_paste(text: String) -> Vec<PastedEntry> {
 
 /// Parse MDL Cast HTML pasted from browser DevTools.
 #[tauri::command]
-pub fn parse_mdl_html_paste(html: String) -> Vec<PastedEntry> {
-    eprintln!("[MDL HTML] 貼り付けHTML受信: {}文字", html.len());
+pub fn parse_mdl_html_paste(app: tauri::AppHandle, html: String) -> Vec<PastedEntry> {
+    emit_log(&app, "debug", "MDL", &format!("貼り付けHTML受信: {}文字", html.len()));
     let list_item_count = html.matches("list-item").count();
-    eprintln!("[MDL HTML] list-item検出: {}件", list_item_count);
+    emit_log(&app, "debug", "MDL", &format!("list-item検出: {}件", list_item_count));
     let entries = character_dict::parse_mdl_html_paste(&html);
     let with_char = entries.iter().filter(|e| !e.character_name.is_empty()).count();
     let without_char = entries.len() - with_char;
-    eprintln!("[MDL HTML] actor/character抽出成功: {}件", with_char);
-    eprintln!("[MDL HTML] characterなし: {}件", without_char);
-    eprintln!("[Merge] MDL HTML由来の英語役名を統合に追加: {}件", with_char);
+    emit_log(&app, "info", "MDL", &format!("actor/character抽出成功: {}件, characterなし: {}件", with_char, without_char));
     entries
 }
 
@@ -340,12 +339,13 @@ pub fn build_character_dict(
 /// Apply LLM-generated Japanese kanji from merged cast into dictionary entries.
 #[tauri::command]
 pub fn enrich_dict_kanji(
+    app: tauri::AppHandle,
     dict: CharacterDict,
     merged_cast: Vec<MergedCastEntry>,
 ) -> Result<CharacterDict, String> {
     let mut dict = dict;
     let updated = character_dict::enrich_dict_kanji_from_cast(&mut dict, &merged_cast);
-    eprintln!("[Dictionary] enriched kanji for {} entries from merged cast", updated);
+    emit_log(&app, "info", "DICT", &format!("漢字情報enrich: {}件更新 (merged cast {}件中)", updated, merged_cast.len()));
     Ok(dict)
 }
 
@@ -383,13 +383,14 @@ pub fn generate_character_aliases(
 /// Currently supports "douban". Returns error for unknown databases.
 #[tauri::command]
 pub async fn search_database_url(
+    app: tauri::AppHandle,
     database: String,
     query: DramaSearchQuery,
 ) -> Result<(Option<SearchCandidate>, Vec<SearchCandidate>), String> {
-    eprintln!(
-        "[Search] database={}, title_zh=\"{}\", title_en=\"{}\", year={:?}",
+    emit_log(&app, "info", "SEARCH", &format!(
+        "database={}, title_zh=\"{}\", title_en=\"{}\", year={:?}",
         database, query.title_zh, query.title_en, query.year
-    );
+    ));
 
     match database.as_str() {
         "douban" => {

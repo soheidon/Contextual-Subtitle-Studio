@@ -21,10 +21,12 @@ impl LlmClient {
         messages: &[ChatMessage],
         use_json_mode: bool,
     ) -> Result<String, String> {
-        let url = format!(
-            "{}/v1/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
+        let trimmed = self.config.base_url.trim_end_matches('/');
+        let url = if trimmed.ends_with("/v1") {
+            format!("{}/chat/completions", trimmed)
+        } else {
+            format!("{}/v1/chat/completions", trimmed)
+        };
 
         let thinking = self.config.thinking.as_deref().and_then(|t| match t {
             "enabled" => Some(ThinkingConfig {
@@ -100,7 +102,8 @@ impl LlmClient {
             },
         ];
         let response = self.chat(&messages, true).await?;
-        serde_json::from_str(&response)
+        let cleaned = extract_json(&response);
+        serde_json::from_str(&cleaned)
             .map_err(|e| format!("Failed to parse JSON response: {} (raw: {})", e, &response[..response.len().min(200)]))
     }
 
@@ -158,23 +161,132 @@ impl LlmClient {
         ];
 
         let response = self.chat(&messages, true).await?;
-        serde_json::from_str(&response)
+        let cleaned = extract_json(&response);
+        serde_json::from_str(&cleaned)
             .map_err(|e| format!("Failed to parse JSON response: {}", e))
     }
 }
 
+use std::sync::LazyLock;
+
+// Pre-compiled patterns for thinking tag stripping (DeepSeek R1, MiniMax).
+// Static patterns — compile once, never panic at call site.
+static RE_THINK_ZH: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?s)<思考>.*?</思考>").expect("valid regex"));
+static RE_THINK_EN: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?s)<thinking>.*?</thinking>").expect("valid regex"));
+static RE_THOUGHT: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?s)<thought>.*?</thought>").expect("valid regex"));
+
 /// Remove thinking tags that some models (DeepSeek R1, MiniMax) include in their output.
 fn strip_thinking_tags(content: &str) -> String {
-    // Strip 思考 tags (DeepSeek R1)
-    let content = regex::Regex::new(r"(?s)<思考>.*?</思考>")
-        .unwrap()
-        .replace_all(content, "");
-    let content = regex::Regex::new(r"(?s)<thinking>.*?</thinking>")
-        .unwrap()
-        .replace_all(&content, "");
-    // Strip 思考 tags (MiniMax)
-    let content = regex::Regex::new(r"(?s)<thought>.*?</thought>")
-        .unwrap()
-        .replace_all(&content, "");
+    let content = RE_THINK_ZH.replace_all(content, "");
+    let content = RE_THINK_EN.replace_all(&content, "");
+    let content = RE_THOUGHT.replace_all(&content, "");
     content.trim().to_string()
+}
+
+/// Extract a JSON object or array from LLM output that may contain markdown code fences,
+/// preamble text, or trailing commentary.
+///
+/// Handles:
+///   - ` ```json\n{...}\n``` ` (at start, or after preamble)
+///   - ` ```\n{...}\n``` `
+///   - `{...}` (bare JSON)
+///   - Preamble like "Here is the JSON:\n{...}" — skips to first `{` or `[`
+pub fn extract_json(raw: &str) -> &str {
+    let trimmed = raw.trim();
+
+    // 1) Try to extract content inside a code fence (may appear anywhere, e.g. after preamble)
+    //    Pattern: optional-lang-tag \n content \n ```
+    if let Some(fence_start) = trimmed.find("```") {
+        let after_open = &trimmed[fence_start + 3..];
+        // Skip optional language tag on the same line as opening ```
+        let body_start = after_open
+            .find('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let body = &after_open[body_start..];
+        // Find the closing ```
+        if let Some(fence_end) = body.find("```") {
+            let inner = body[..fence_end].trim_end();
+            // Verify the inner content actually contains JSON before returning it
+            if inner.contains('{') || inner.contains('[') {
+                let json_start = inner.find(|c: char| c == '{' || c == '[');
+                if let Some(start) = json_start {
+                    return &inner[start..];
+                }
+            }
+        }
+    }
+
+    // 2) No code fence — skip any preamble before the first { or [
+    let json_start = trimmed.find(|c: char| c == '{' || c == '[');
+    let Some(start) = json_start else {
+        return trimmed; // no JSON bracket found — return as-is, let serde fail with clear message
+    };
+    &trimmed[start..]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_json_bare_object() {
+        let raw = r#"{"key": "value"}"#;
+        let result = extract_json(raw);
+        assert_eq!(result, raw);
+        assert!(serde_json::from_str::<serde_json::Value>(result).is_ok());
+    }
+
+    #[test]
+    fn extract_json_bare_array() {
+        let raw = r#"[1, 2, 3]"#;
+        assert_eq!(extract_json(raw), raw);
+    }
+
+    #[test]
+    fn extract_json_code_fence_json() {
+        let raw = "```json\n{\"key\": \"value\"}\n```";
+        let result = extract_json(raw);
+        assert_eq!(result, "{\"key\": \"value\"}");
+        assert!(serde_json::from_str::<serde_json::Value>(result).is_ok());
+    }
+
+    #[test]
+    fn extract_json_code_fence_no_lang() {
+        let raw = "```\n{\"key\": 42}\n```";
+        let result = extract_json(raw);
+        assert_eq!(result, "{\"key\": 42}");
+    }
+
+    #[test]
+    fn extract_json_preamble_text() {
+        let raw = "Here is the JSON you requested:\n{\"scenes\": []}";
+        let result = extract_json(raw);
+        assert_eq!(result, "{\"scenes\": []}");
+    }
+
+    #[test]
+    fn extract_json_code_fence_with_preamble() {
+        let raw = "Sure! Here it is:\n```json\n{\"ok\": true}\n```";
+        let result = extract_json(raw);
+        assert_eq!(result, "{\"ok\": true}");
+    }
+
+    #[test]
+    fn extract_json_nested_braces() {
+        let raw = "```json\n{\"a\": {\"b\": [1, 2]}, \"c\": \"d\"}\n```";
+        let result = extract_json(raw);
+        assert_eq!(result, "{\"a\": {\"b\": [1, 2]}, \"c\": \"d\"}");
+        let v: serde_json::Value = serde_json::from_str(result).unwrap();
+        assert_eq!(v["a"]["b"][0], 1);
+    }
+
+    #[test]
+    fn extract_json_no_bracket_returns_as_is() {
+        let raw = "no json here";
+        assert_eq!(extract_json(raw), raw);
+    }
 }

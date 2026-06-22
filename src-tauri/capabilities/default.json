@@ -11,6 +11,7 @@
     "fs:default",
     "fs:allow-read",
     "fs:allow-write",
+    "fs:allow-exists",
     "core:window:allow-create",
     "core:webview:allow-create-webview-window"
   ]

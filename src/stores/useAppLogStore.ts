@@ -1,6 +1,7 @@
 import { create } from "zustand";
+import { listen } from "@tauri-apps/api/event";
 
-export type LogLevel = "info" | "success" | "warning" | "error" | "debug";
+export type LogLevel = "info" | "success" | "warning" | "warn" | "error" | "debug";
 
 export interface AppLogEntry {
   id: string;
@@ -10,14 +11,21 @@ export interface AppLogEntry {
   message: string;
 }
 
+interface RustLogPayload {
+  level: string;
+  scope: string;
+  message: string;
+}
+
 interface AppLogState {
   logs: AppLogEntry[];
   addLog: (level: LogLevel, source: string, message: string) => void;
   clearLogs: () => void;
   removeLog: (id: string) => void;
+  startRustListener: () => Promise<() => void>;
 }
 
-export const useAppLogStore = create<AppLogState>((set) => ({
+export const useAppLogStore = create<AppLogState>((set, get) => ({
   logs: [],
 
   addLog: (level, source, message) =>
@@ -31,7 +39,7 @@ export const useAppLogStore = create<AppLogState>((set) => ({
           source,
           message,
         },
-      ].slice(-500),
+      ].slice(-5000),
     })),
 
   clearLogs: () => set({ logs: [] }),
@@ -40,4 +48,19 @@ export const useAppLogStore = create<AppLogState>((set) => ({
     set((state) => ({
       logs: state.logs.filter((e) => e.id !== id),
     })),
+
+  startRustListener: async () => {
+    const unlisten = await listen<RustLogPayload>("app-log", (event) => {
+      const { level, scope, message } = event.payload;
+      // Map Rust level to frontend LogLevel
+      const mappedLevel: LogLevel =
+        level === "warn" ? "warn" :
+        level === "warning" ? "warning" :
+        level === "error" ? "error" :
+        level === "debug" ? "debug" :
+        "info";
+      get().addLog(mappedLevel, scope, message);
+    });
+    return unlisten;
+  },
 }));

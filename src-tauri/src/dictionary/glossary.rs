@@ -8,6 +8,14 @@ pub struct GlossaryEntry {
     pub entry_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_urls: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,11 +51,15 @@ pub fn load_glossary_csv(csv_str: &str) -> Result<Vec<GlossaryEntry>, String> {
             source: row.source,
             target: row.target,
             entry_type: row.entry_type,
+            aliases: Vec::new(),
             notes: if row.notes.trim().is_empty() {
                 None
             } else {
                 Some(row.notes.trim().to_string())
             },
+            status: None,
+            confidence: None,
+            evidence_urls: None,
         });
     }
 

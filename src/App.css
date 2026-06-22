@@ -647,6 +647,10 @@ code {
   color: var(--text-primary);
   word-break: break-all;
   white-space: pre-wrap;
+  font-family: var(--font-mono, "Cascadia Code", Consolas, monospace);
+  overflow-x: auto;
+  max-height: 300px;
+  overflow-y: auto;
 }
 
 /* DramaSearchPanel */
