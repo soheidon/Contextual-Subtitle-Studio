@@ -274,8 +274,10 @@ fn build_synopsis_prompt(entries: &[SubtitleEntry], prompt_context: &str) -> (St
         ・参考情報に日本語漢字表記がある固有名詞は、必ず漢字のみで書く。\
         「カタカナ（漢字）」や「漢字（カタカナ）」形式は禁止。\n\
          例：楚喬（チュウ・チャオではない）、諸葛玥（ヅーグー・ユエではない）\n\
-        ・参考情報にない未確認の固有名詞は、漢字を推測せず、\
-        英語字幕の表記（カタカナまたはローマ字）のまま書く。";
+        ・参考情報にない未確認の固有名詞は、漢字・カタカナ読み・日本語訳を一切推測しない。\n\
+        ・未確認語は英語字幕の表記（ローマ字）のまま絶対に書く。\n\
+        ・「火屠水」「フオトゥ・ウォーター」「金輝部族」のような推測表記は禁止。\n\
+        ・必ず「Huotu Water」「Ka Tuo」「Jinhui Tribe」のように英語のまま出力する。";
 
     let srt_text: String = entries
         .iter()
@@ -304,10 +306,14 @@ fn build_synopsis_prompt(entries: &[SubtitleEntry], prompt_context: &str) -> (St
          【あらすじ執筆ルール】\n\
          ・参考情報の「登場人物名対応表」「用語表」「カタカナ→漢字補正表」に掲載されている固有名詞は、\
          必ず日本語欄の漢字表記だけを使ってください。「カタカナ（漢字）」のような併記は禁止です。\n\
-         ・参考情報にない未確認の固有名詞は、漢字を一切推測せず、英語字幕に出てきた表記のまま書いてください。\n\
+         ・参考情報にない未確認の固有名詞は、漢字・カタカナ読み・日本語訳を一切推測しないでください。\n\
+         ・未確認語は英語字幕に出てきた表記（ローマ字）のまま絶対に書いてください。\n\
          ・例：Chu Qiao → 楚喬（チュウ・チャオとは書かない）、\
          Zhuge Yue → 諸葛玥（ヅーグー・ユエとは書かない）\n\
-         ・未確認語の例：Huotu Water → フオトゥ・ウォーター（火屠水と推測しない）\n\n\
+         ・未確認語の禁止例：Huotu Water → 「火屠水」「フオトゥ・ウォーター」は禁止、\
+         必ず「Huotu Water」のまま書く。\n\
+         ・同じく：Ka Tuo → 「卡拓」「カ・トゥオ」は禁止、必ず「Ka Tuo」。\n\
+         ・同じく：Jinhui Tribe → 「金輝部族」は禁止、必ず「Jinhui Tribe」。\n\n\
          出力は以下のJSON形式で返してください：\n\
          {\"synopsis_ja\": \"あらすじ\", \"detected_characters\": [\"名前1\", \"名前2\"], \
          \"term_variants\": [{\"variants\": [\"英表記1\", \"英表記2\"], \
@@ -916,13 +922,18 @@ fn filter_synopsis_terms_by_known_names(
 }
 
 /// Validate term_variant groups: remove groups where variants don't share
-/// a common dedup-normalized key. "Great Yong" vs "Yong Army" are different
-/// concepts — they share the word "Yong" but the full dedup keys differ.
+/// a common dedup-normalized key, and groups where all display strings are
+/// identical (self-duplicates like "Huotu Water / Huotu Water").
 fn validate_term_variants(variants: &mut Vec<TermVariantEntry>) {
     let before = variants.len();
     variants.retain(|v| {
         if v.variants.len() < 2 {
             return true; // single-variant groups are fine
+        }
+        // Exclude self-duplicate groups where all display strings are identical
+        let first_display = &v.variants[0];
+        if v.variants.iter().skip(1).all(|var| var == first_display) {
+            return false;
         }
         // All variants must normalize to the same dedup key
         let first_key = normalize_en_for_dedup(&v.variants[0]);
@@ -964,6 +975,43 @@ fn is_likely_chinese(text: &str) -> bool {
     }).count();
     let ratio = kana_count as f64 / cjk_count as f64;
     ratio < 0.08
+}
+
+/// Replace guessed kanji/katakana renderings in synopsis_ja with the English source_text
+/// from unresolved_terms. Handles both "火屠水" → "Huotu Water" and the
+/// "火屠水（フオトゥ・ウォーター）" parenthetical pattern.
+fn replace_guessed_terms_in_synopsis(synopsis_ja: &mut String, terms: &[UnresolvedTerm]) {
+    for term in terms {
+        let surface = term.surface_ja.trim();
+        if surface.is_empty() {
+            continue;
+        }
+        // Only replace if surface contains CJK or katakana (indicating a guessed rendering)
+        let has_jp = surface.chars().any(|c| {
+            ('\u{4e00}'..='\u{9fff}').contains(&c)
+                || ('\u{3040}'..='\u{309f}').contains(&c)
+                || ('\u{30a0}'..='\u{30ff}').contains(&c)
+        });
+        if !has_jp {
+            continue;
+        }
+        // Pattern 1: "kanji（katakana）" → replace whole parenthetical with source_text
+        // e.g. "火屠水（フオトゥ・ウォーター）" → "Huotu Water"
+        let pattern = format!("{}（", surface);
+        if let Some(pos) = synopsis_ja.find(&pattern) {
+            if let Some(close) = synopsis_ja[pos..].find('）') {
+                let end = pos + close + '）'.len_utf8();
+                *synopsis_ja = format!("{}{}{}",
+                    &synopsis_ja[..pos],
+                    term.source_text,
+                    &synopsis_ja[end..]);
+                continue;
+            }
+        }
+        // Pattern 2: standalone surface_ja → source_text
+        // e.g. "火屠水" → "Huotu Water"
+        *synopsis_ja = synopsis_ja.replace(surface, &term.source_text);
+    }
 }
 
 fn strip_trailing_cjk_parenthetical(text: &str) -> &str {
@@ -1293,6 +1341,16 @@ pub async fn generate_srt_synopsis(
                 "term_variants validation: {} → {} groups ({} removed)",
                 before_variants, after_variants, before_variants - after_variants
             ));
+        }
+    }
+
+    // Replace guessed kanji/katakana in synopsis_ja with English source_text
+    // Must happen BEFORE normalization (which clears surface_ja)
+    {
+        let before = result.synopsis_ja.clone();
+        replace_guessed_terms_in_synopsis(&mut result.synopsis_ja, &result.unresolved_terms);
+        if before != result.synopsis_ja {
+            emit_log(&app, "info", "SRT", "synopsis_ja 内の推測表記を英語原文に置換しました");
         }
     }
 
@@ -2720,5 +2778,105 @@ mod tests {
         ];
         validate_term_variants(&mut groups);
         assert!(groups.is_empty(), "Empty variant keys should be removed");
+    }
+
+    // --- replace_guessed_terms_in_synopsis tests ---
+
+    fn make_term_with_surface(source_text: &str, surface_ja: &str) -> UnresolvedTerm {
+        UnresolvedTerm {
+            source_text: source_text.to_string(),
+            surface_ja: surface_ja.to_string(),
+            term_type: "proper_noun".to_string(),
+            status: "unresolved".to_string(),
+            reason: "test".to_string(),
+            source: Some("synopsis".to_string()),
+            occurrence_count: 0,
+            alias_candidate: None,
+        }
+    }
+
+    #[test]
+    fn test_replace_guessed_kanji_standalone() {
+        let mut syn = "楚喬は目を負傷し、火屠水で治療を受ける。".to_string();
+        let terms = vec![
+            make_term_with_surface("Huotu Water", "火屠水"),
+        ];
+        replace_guessed_terms_in_synopsis(&mut syn, &terms);
+        assert!(!syn.contains("火屠水"), "Guessed kanji should be replaced");
+        assert!(syn.contains("Huotu Water"), "English source_text should remain");
+    }
+
+    #[test]
+    fn test_replace_guessed_kanji_with_parenthetical() {
+        let mut syn = "火屠水（フオトゥ・ウォーター）で治療する。".to_string();
+        let terms = vec![
+            make_term_with_surface("Huotu Water", "火屠水"),
+        ];
+        replace_guessed_terms_in_synopsis(&mut syn, &terms);
+        assert!(!syn.contains("火屠水"), "Parenthetical kanji should be removed");
+        assert!(!syn.contains("フオトゥ"), "Parenthetical katakana should be removed");
+        assert!(syn.contains("Huotu Water"), "Should be replaced with English source");
+    }
+
+    #[test]
+    fn test_replace_guessed_katakana() {
+        let mut syn = "カ・トゥオが率いる部族が反乱を起こす。".to_string();
+        let terms = vec![
+            make_term_with_surface("Ka Tuo", "カ・トゥオ"),
+        ];
+        replace_guessed_terms_in_synopsis(&mut syn, &terms);
+        assert!(!syn.contains("カ・トゥオ"), "Guessed katakana should be removed");
+        assert!(syn.contains("Ka Tuo"), "English should remain");
+    }
+
+    #[test]
+    fn test_replace_guessed_does_not_touch_known_kanji() {
+        let mut syn = "楚喬は目を負傷し、李策が治療する。".to_string();
+        let terms = vec![
+            make_term_with_surface("Huotu Water", "火屠水"),
+        ];
+        replace_guessed_terms_in_synopsis(&mut syn, &terms);
+        assert!(syn.contains("楚喬"), "Known kanji in dictionary should not be touched");
+        assert!(syn.contains("李策"), "Known kanji in dictionary should not be touched");
+    }
+
+    #[test]
+    fn test_replace_guessed_empty_surface_skipped() {
+        let original = "楚喬はHuotu Waterで治療を受ける。".to_string();
+        let mut syn = original.clone();
+        let terms = vec![
+            make_term_with_surface("Huotu Water", ""),
+        ];
+        replace_guessed_terms_in_synopsis(&mut syn, &terms);
+        assert_eq!(syn, original, "Empty surface_ja should leave synopsis unchanged");
+    }
+
+    // --- validate_term_variants self-duplicate tests ---
+
+    #[test]
+    fn test_validate_variants_removes_self_duplicates() {
+        let mut groups = vec![
+            make_variant_group(vec!["Huotu Water", "Huotu Water"]),
+        ];
+        validate_term_variants(&mut groups);
+        assert!(groups.is_empty(), "Self-duplicate variants (identical strings) should be removed");
+    }
+
+    #[test]
+    fn test_validate_variants_removes_self_duplicates_three() {
+        let mut groups = vec![
+            make_variant_group(vec!["Yue Qi", "Yue Qi", "Yue Qi"]),
+        ];
+        validate_term_variants(&mut groups);
+        assert!(groups.is_empty(), "Three identical strings should be removed as self-duplicate");
+    }
+
+    #[test]
+    fn test_validate_variants_keeps_different_strings_same_dedup() {
+        let mut groups = vec![
+            make_variant_group(vec!["Yue Qi", "YueQi"]),
+        ];
+        validate_term_variants(&mut groups);
+        assert_eq!(groups.len(), 1, "Different display strings with same dedup key should be kept");
     }
 }
