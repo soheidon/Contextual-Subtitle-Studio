@@ -25,6 +25,7 @@ import {
   resolveSynopsisKatakana,
   resolveUnresolvedTermAiOpenai,
   resolveUnresolvedTermsBatchOpenai,
+  extractSrtBodyCandidates,
   loadCharacterDictionary,
   loadGlossaryDictionary,
   loadDramaInfo,
@@ -94,6 +95,52 @@ function filterUnresolvedByDict(
   }
 
   return { filtered, removedCount };
+}
+
+/** Normalize English text for dedup (same as normalizeEn, kept separate for semantics). */
+function normalizeForDedup(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** Merge unresolved terms from synopsis LLM and SRT body extraction.
+ *  Deduplicates by normalized key. Terms found in both sources get source="srt_body+synopsis".
+ *  Sorted: both-source first, then by occurrence_count desc. */
+function mergeUnresolvedTerms(
+  synopsisTerms: UnresolvedTerm[],
+  bodyTerms: UnresolvedTerm[],
+): UnresolvedTerm[] {
+  const map = new Map<string, UnresolvedTerm>();
+
+  // First pass: body terms (higher occurrence_count, lower priority for surface_ja)
+  for (const t of bodyTerms) {
+    const key = normalizeForDedup(t.source_text);
+    map.set(key, { ...t });
+  }
+
+  // Second pass: synopsis terms override body when both exist
+  for (const t of synopsisTerms) {
+    const key = normalizeForDedup(t.source_text);
+    if (map.has(key)) {
+      const existing = map.get(key)!;
+      map.set(key, {
+        ...existing,
+        source: "srt_body+synopsis",
+        surface_ja: t.surface_ja || existing.surface_ja,
+        reason: `${existing.reason}; あらすじでも検出`,
+        occurrence_count: existing.occurrence_count,
+      });
+    } else {
+      map.set(key, { ...t });
+    }
+  }
+
+  // Sort: "both" source first, then by occurrence_count desc
+  return Array.from(map.values()).sort((a, b) => {
+    const aBoth = a.source === "srt_body+synopsis" ? 0 : 1;
+    const bBoth = b.source === "srt_body+synopsis" ? 0 : 1;
+    if (aBoth !== bBoth) return aBoth - bBoth;
+    return (b.occurrence_count ?? 0) - (a.occurrence_count ?? 0);
+  });
 }
 
 /** Split a path into segments, handling both / and \ separators.
@@ -796,7 +843,26 @@ export default function SrtPage() {
       }
 
       const termVariants = result.term_variants ?? [];
-      const rawUnresolved = (result.unresolved_terms ?? []).map((t) => ({
+
+      // Extract proper noun candidates from the full SRT body text
+      let bodyTerms: UnresolvedTerm[] = [];
+      try {
+        bodyTerms = await extractSrtBodyCandidates(activeFile.entries);
+        console.log(`[SRT] body candidates extracted: ${bodyTerms.length}`);
+      } catch (_) {
+        // Body extraction is best-effort
+      }
+
+      // Merge synopsis LLM terms with body extraction terms
+      const synopsisTerms = (result.unresolved_terms ?? []).map((t) => ({
+        ...t,
+        source: t.source || "synopsis",
+        occurrence_count: t.occurrence_count || 0,
+      }));
+      const merged = mergeUnresolvedTerms(synopsisTerms, bodyTerms);
+      console.log(`[SRT] merged unresolved: synopsis=${synopsisTerms.length} body=${bodyTerms.length} → merged=${merged.length}`);
+
+      const rawUnresolved = merged.map((t) => ({
         ...t,
         // Client-side safety net: clear surface_ja if it's English-only
         surface_ja: /[々〆〡-〩぀-ゟ゠-ヿ一-鿿㐀-䶿]/.test(t.surface_ja) ? t.surface_ja : "",
@@ -1163,7 +1229,39 @@ export default function SrtPage() {
                                 const hasError = t.webResult?.status === "error";
                                 return (
                                   <tr key={t.source_text}>
-                                    <td style={{ fontFamily: "monospace", fontSize: 12 }}>{t.source_text}</td>
+                                    <td style={{ fontFamily: "monospace", fontSize: 12 }}>
+                                      {t.source_text}
+                                      {t.source && t.source !== "synopsis" && (
+                                        <span style={{
+                                          display: "inline-block",
+                                          marginLeft: 6,
+                                          padding: "1px 5px",
+                                          borderRadius: 3,
+                                          fontSize: 10,
+                                          fontWeight: 600,
+                                          background: t.source === "srt_body+synopsis" ? "#7c3aed" : "#3b82f6",
+                                          color: "#fff",
+                                          verticalAlign: "middle",
+                                        }}>
+                                          {t.source === "srt_body+synopsis" ? "本文+あらすじ" : "本文"}
+                                        </span>
+                                      )}
+                                      {t.source === "synopsis" && (
+                                        <span style={{
+                                          display: "inline-block",
+                                          marginLeft: 6,
+                                          padding: "1px 5px",
+                                          borderRadius: 3,
+                                          fontSize: 10,
+                                          fontWeight: 600,
+                                          background: "#22c55e",
+                                          color: "#fff",
+                                          verticalAlign: "middle",
+                                        }}>
+                                          あらすじ
+                                        </span>
+                                      )}
+                                    </td>
                                     <td style={{ fontFamily: "monospace", fontSize: 12 }}>{t.surface_ja || "—"}</td>
                                     <td style={{ fontFamily: "monospace", fontSize: 12 }}>
                                       {t.webResult?.candidate_zh ?? "—"}

@@ -64,6 +64,7 @@ pub fn run() {
             commands::srt::save_srt_file,
             commands::srt::list_srt_in_dir,
             commands::srt::generate_srt_synopsis,
+            commands::srt::extract_srt_body_candidates,
             commands::srt::detect_srt_scenes,
             commands::srt::analyze_scene_context,
             commands::srt::save_srt_analysis,

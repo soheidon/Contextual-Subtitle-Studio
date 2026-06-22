@@ -93,6 +93,10 @@ pub struct UnresolvedTerm {
     pub term_type: String,
     pub status: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,       // "synopsis" | "srt_body" | "srt_body+synopsis"
+    #[serde(default)]
+    pub occurrence_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -449,6 +453,179 @@ fn extract_response_text_and_annotations(
 }
 
 // ---------------------------------------------------------------------------
+// SRT body proper noun candidate extraction
+// ---------------------------------------------------------------------------
+
+/// Normalize English text for dedup: lowercase, strip non-alphanumeric characters.
+fn normalize_en_for_dedup(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+/// Check if a word is a stopword (pronouns, common words, greetings, etc.).
+fn is_stopword(word: &str) -> bool {
+    let lower = word.to_lowercase();
+    matches!(lower.as_str(),
+        "i" | "you" | "he" | "she" | "it" | "we" | "they" |
+        "me" | "him" | "her" | "us" | "them" |
+        "my" | "your" | "his" | "hers" | "its" | "our" | "their" |
+        "yes" | "no" | "okay" | "ok" | "thank" | "thanks" | "please" |
+        "sorry" | "hello" | "hi" | "hey" | "well" | "oh" | "ah" |
+        "what" | "who" | "where" | "when" | "why" | "how" |
+        "this" | "that" | "these" | "those" |
+        "is" | "are" | "was" | "were" | "be" | "been" | "will" |
+        "have" | "has" | "had" | "do" | "does" | "did" |
+        "a" | "an" | "the" | "and" | "or" | "but" | "if" | "so" |
+        "to" | "of" | "in" | "on" | "at" | "for" | "with" |
+        "can" | "could" | "would" | "should" | "may" | "might" |
+        "just" | "now" | "then" | "here" | "there" |
+        "all" | "some" | "any" | "very" | "too" | "also" |
+        "go" | "come" | "get" | "know" | "think" | "want" | "need" |
+        "let" | "say" | "see" | "look" | "take" | "make" |
+        "really" | "still" | "even" | "much" | "many" | "more" |
+        "up" | "down" | "out" | "back" | "way" | "right" | "left" |
+        "one" | "two" | "first" | "last" |
+        "sir" | "miss" | "mister" | "madam" | "maam" |
+        "dont" | "cant" | "wont" | "isnt" | "arent" | "thats" |
+        "dear" | "sure" | "maybe" | "perhaps" |
+        "nothing" | "something" | "everything" | "anything" |
+        "everyone" | "someone" | "anyone" | "nobody" |
+        "always" | "never" | "ever" | "again" | "already"
+    )
+}
+
+/// Return true if a phrase contains a keyword that strongly suggests it's a proper noun
+/// (titles, places, organizations, items common in Chinese drama subtitles).
+fn contains_proper_noun_keyword(phrase: &str) -> bool {
+    let keywords = [
+        "lady", "lord", "prince", "princess", "king", "queen", "emperor", "empress",
+        "master", "mistress", "grand", "young", "old", "elder",
+        "tribe", "house", "region", "water", "mountain", "river", "city",
+        "palace", "hall", "sect", "clan", "pavilion", "valley", "peak",
+        "island", "sea", "lake", "forest", "garden", "temple", "villa",
+        "castle", "kingdom", "empire", "army", "guard", "bureau", "office",
+        "courtyard", "residence", "manor", "abbey", "monastery",
+        "cave", "spring", "pond", "bridge", "gate", "tower", "wall",
+        "sword", "blade", "pill", "elixir", "poison", "powder", "jade",
+    ];
+    let lower = phrase.to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    words.iter().any(|w| keywords.contains(w))
+}
+
+/// Intermediate accumulator for body candidate extraction.
+#[derive(Debug, Clone)]
+struct SrtBodyCandidate {
+    original_text: String,
+    count: u32,
+}
+
+/// Extract proper noun candidates from all SRT subtitle text.
+/// Uses heuristics: capitalized word sequences, proper-noun keywords, and
+/// frequency analysis. Sorted by occurrence count (descending).
+#[tauri::command]
+pub fn extract_srt_body_candidates(
+    entries: Vec<SubtitleEntry>,
+) -> Result<Vec<UnresolvedTerm>, String> {
+    let mut raw_candidates: Vec<String> = Vec::new();
+
+    for entry in &entries {
+        let text = entry.text.trim();
+        if text.is_empty() { continue; }
+
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let mut i = 0;
+        while i < words.len() {
+            let word = words[i];
+            let starts_upper = word.chars().next()
+                .map(|c| c.is_uppercase()).unwrap_or(false);
+            // Skip all-caps words (likely emphasis/shouting, not proper nouns)
+            let all_caps = word.chars().all(|c| !c.is_alphabetic() || c.is_uppercase());
+            if !starts_upper || all_caps {
+                i += 1;
+                continue;
+            }
+
+            // Collect the sequence of capitalized words
+            let mut seq_end = i + 1;
+            while seq_end < words.len() {
+                let next = words[seq_end];
+                let next_upper = next.chars().next()
+                    .map(|c| c.is_uppercase()).unwrap_or(false);
+                let next_all_caps = next.chars().all(|c| !c.is_alphabetic() || c.is_uppercase());
+                if next_upper && !next_all_caps {
+                    seq_end += 1;
+                    // Absorb short connecting words (of, the, and, in, at)
+                    if seq_end < words.len() {
+                        let after = words[seq_end];
+                        if matches!(after.to_lowercase().as_str(), "of" | "the" | "and" | "in" | "at") {
+                            seq_end += 1;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            let phrase = words[i..seq_end].join(" ");
+            let word_count = seq_end - i;
+            let has_keyword = contains_proper_noun_keyword(&phrase);
+
+            if word_count >= 2 || has_keyword {
+                // Exclude stopword-only phrases
+                if !phrase.split_whitespace().all(|w| is_stopword(w)) {
+                    raw_candidates.push(phrase);
+                }
+            }
+
+            i = seq_end;
+        }
+    }
+
+    // Normalize and count occurrences
+    let mut candidate_map: std::collections::HashMap<String, SrtBodyCandidate> =
+        std::collections::HashMap::new();
+
+    for phrase in raw_candidates {
+        let key = normalize_en_for_dedup(&phrase);
+        candidate_map
+            .entry(key)
+            .and_modify(|c| {
+                c.count += 1;
+                // Keep shorter form as canonical
+                if phrase.len() < c.original_text.len() {
+                    c.original_text = phrase.clone();
+                }
+            })
+            .or_insert(SrtBodyCandidate {
+                original_text: phrase,
+                count: 1,
+            });
+    }
+
+    // Convert to UnresolvedTerm: keep if appears >= 2 times OR contains proper noun keyword
+    let mut results: Vec<UnresolvedTerm> = candidate_map
+        .into_values()
+        .filter(|c| c.count >= 2 || contains_proper_noun_keyword(&c.original_text))
+        .map(|c| UnresolvedTerm {
+            source_text: c.original_text,
+            surface_ja: String::new(),
+            term_type: "proper_noun".to_string(),
+            status: "unresolved".to_string(),
+            reason: format!("SRT本文から抽出 ({}回出現)", c.count),
+            source: Some("srt_body".to_string()),
+            occurrence_count: c.count,
+        })
+        .collect();
+
+    results.sort_by(|a, b| b.occurrence_count.cmp(&a.occurrence_count));
+
+    Ok(results)
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -505,8 +682,14 @@ pub async fn generate_srt_synopsis(
     let (system, user) = build_synopsis_prompt(&entries, &ctx);
     let value = client.chat_json(&system, &user).await?;
 
-    let result: SrtSynopsisResult = serde_json::from_value(value)
+    let mut result: SrtSynopsisResult = serde_json::from_value(value)
         .map_err(|e| format!("Failed to parse synopsis JSON: {}", e))?;
+
+    // Tag synopsis-produced terms
+    for term in &mut result.unresolved_terms {
+        term.source = Some("synopsis".to_string());
+        term.occurrence_count = 0;
+    }
 
     emit_log(&app, "success", "SRT", &format!(
         "あらすじ生成完了: chars={} unresolved={}",
@@ -1343,4 +1526,153 @@ pub async fn resolve_unresolved_terms_batch_openai(
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_en_for_dedup_basic() {
+        assert_eq!(normalize_en_for_dedup("Huotu Water"), "huotuwater");
+        assert_eq!(normalize_en_for_dedup("HUOTU WATER"), "huotuwater");
+        assert_eq!(normalize_en_for_dedup("Huotu-Water"), "huotuwater");
+        assert_eq!(normalize_en_for_dedup("HuotuWater"), "huotuwater");
+        assert_eq!(normalize_en_for_dedup("Huotu  Water"), "huotuwater");
+    }
+
+    #[test]
+    fn test_normalize_en_for_dedup_apostrophe() {
+        assert_eq!(normalize_en_for_dedup("King's Palace"), "kingspalace");
+    }
+
+    #[test]
+    fn test_is_stopword() {
+        assert!(is_stopword("I"));
+        assert!(is_stopword("you"));
+        assert!(is_stopword("the"));
+        assert!(is_stopword("is"));
+        assert!(is_stopword("yes"));
+        assert!(is_stopword("no"));
+        assert!(is_stopword("hello"));
+        assert!(is_stopword("thank"));
+        assert!(is_stopword("what"));
+        assert!(is_stopword("this"));
+        assert!(is_stopword("dont"));
+    }
+
+    #[test]
+    fn test_is_not_stopword() {
+        assert!(!is_stopword("Huotu"));
+        assert!(!is_stopword("Qingshan"));
+        assert!(!is_stopword("Helian"));
+        assert!(!is_stopword("Jinhui"));
+        assert!(!is_stopword("Hongchuan"));
+        assert!(!is_stopword("Water"));
+        assert!(!is_stopword("Lady"));
+        assert!(!is_stopword("Tribe"));
+        assert!(!is_stopword("Snow"));
+    }
+
+    #[test]
+    fn test_contains_proper_noun_keyword() {
+        assert!(contains_proper_noun_keyword("Lady Helian"));
+        assert!(contains_proper_noun_keyword("Snow Region Tribe"));
+        assert!(contains_proper_noun_keyword("Qingshan House"));
+        assert!(contains_proper_noun_keyword("Jade Pendant"));
+        assert!(contains_proper_noun_keyword("Hongchuan River"));
+        assert!(contains_proper_noun_keyword("Elixir"));
+        assert!(contains_proper_noun_keyword("Palace"));
+    }
+
+    #[test]
+    fn test_does_not_contain_keyword() {
+        assert!(!contains_proper_noun_keyword("Hello world"));
+        assert!(!contains_proper_noun_keyword("She walks"));
+        assert!(!contains_proper_noun_keyword("Quickly running"));
+    }
+
+    #[test]
+    fn test_extract_body_candidates_empty() {
+        let result = extract_srt_body_candidates(vec![]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_body_candidates_basic() {
+        let entries = vec![
+            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "Lady Helian arrives at the Palace.".into() },
+            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Lady Helian greets the elders.".into() },
+            SubtitleEntry { index: 3, start: "00:00:05,000".into(), end: "00:00:06,000".into(), text: "This is Qingshan House.".into() },
+            SubtitleEntry { index: 4, start: "00:00:07,000".into(), end: "00:00:08,000".into(), text: "This is Qingshan House again.".into() },
+        ];
+        let result = extract_srt_body_candidates(entries).unwrap();
+        let helian = result.iter().find(|r| r.source_text.contains("Helian"));
+        assert!(helian.is_some(), "Lady Helian should be extracted");
+        if let Some(h) = helian {
+            assert_eq!(h.source.as_deref(), Some("srt_body"));
+            assert!(h.occurrence_count >= 2);
+        }
+        let qing = result.iter().find(|r| r.source_text.contains("Qingshan"));
+        assert!(qing.is_some(), "Qingshan House should be extracted");
+    }
+
+    #[test]
+    fn test_extract_body_candidates_filters_stopwords() {
+        let entries = vec![
+            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "I am here.".into() },
+            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "You are there.".into() },
+            SubtitleEntry { index: 3, start: "00:00:05,000".into(), end: "00:00:06,000".into(), text: "She walks alone.".into() },
+        ];
+        let result = extract_srt_body_candidates(entries).unwrap();
+        for r in &result {
+            assert!(!is_stopword(&r.source_text), "Stopword phrase should not appear: {}", r.source_text);
+        }
+    }
+
+    #[test]
+    fn test_extract_body_candidates_keyword_single_occurrence() {
+        let entries = vec![
+            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "The Jade Pendant glowed brightly.".into() },
+        ];
+        let result = extract_srt_body_candidates(entries).unwrap();
+        let jade = result.iter().find(|r| r.source_text.contains("Jade"));
+        assert!(jade.is_some(), "Jade Pendant should be extracted (keyword match)");
+    }
+
+    #[test]
+    fn test_extract_body_candidates_dedup_variants() {
+        let entries = vec![
+            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "Huotu Water is dangerous.".into() },
+            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Bring the Huotu Water here.".into() },
+        ];
+        let result = extract_srt_body_candidates(entries).unwrap();
+        let huotu: Vec<_> = result.iter().filter(|r| normalize_en_for_dedup(&r.source_text) == "huotuwater").collect();
+        assert_eq!(huotu.len(), 1, "Huotu Water variants should be deduped, got {:?}", huotu);
+        if let Some(h) = huotu.first() {
+            assert_eq!(h.occurrence_count, 2);
+        }
+    }
+
+    #[test]
+    fn test_extract_body_candidates_sorted_by_count() {
+        let entries = vec![
+            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "Rare item.".into() },
+            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Common Thing but common Thing again.".into() },
+            SubtitleEntry { index: 3, start: "00:00:05,000".into(), end: "00:00:06,000".into(), text: "Common Thing appears Common Thing everywhere Common Thing.".into() },
+        ];
+        let result = extract_srt_body_candidates(entries).unwrap();
+        for i in 1..result.len() {
+            assert!(result[i - 1].occurrence_count >= result[i].occurrence_count,
+                "Results not sorted by count: {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_unresolved_term_source_default() {
+        let json = r#"{"source_text":"Test","surface_ja":"","term_type":"","status":"","reason":""}"#;
+        let t: UnresolvedTerm = serde_json::from_str(json).unwrap();
+        assert_eq!(t.source, None);
+        assert_eq!(t.occurrence_count, 0);
+    }
 }

@@ -302,6 +302,9 @@ export const generateSrtSynopsis = (entries: SubtitleEntry[], promptContext?: st
     promptContext: promptContext ?? null,
   });
 
+export const extractSrtBodyCandidates = (entries: SubtitleEntry[]) =>
+  invoke<UnresolvedTerm[]>("extract_srt_body_candidates", { entries });
+
 export const detectSrtScenes = (entries: SubtitleEntry[], promptContext?: string) =>
   invoke<SceneDetectionResult>("detect_srt_scenes", {
     entries,

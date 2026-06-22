@@ -443,6 +443,8 @@ export interface UnresolvedTerm {
   reason: string;
   webResult?: WebTermResolution;
   adopted?: boolean;
+  source?: string;           // "synopsis" | "srt_body" | "srt_body+synopsis"
+  occurrence_count?: number;
 }
 
 export interface SrtSynopsisResult {
