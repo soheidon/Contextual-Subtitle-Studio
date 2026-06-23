@@ -51,12 +51,20 @@ pub fn build_provider_for(
 
     let thinking = (prefix == "DEEPSEEK").then_some(overrides.thinking);
 
+    // gpt-5.5 rejects temperature; omit for OpenAI, keep 0.3 for others
+    let temperature = if prefix == "OPENAI" {
+        None
+    } else {
+        Some(0.3)
+    };
+
     Ok(ProviderConfig {
         provider: "openai_compatible".to_string(),
         base_url: overrides.base_url,
         api_key,
         model: overrides.model,
         thinking,
+        temperature,
     })
 }
 

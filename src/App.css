@@ -814,3 +814,98 @@ code {
   border-top: 1px solid var(--border);
 }
 
+/* ChatGPT paste panel — matches .card / .table-container light theme */
+.srt-chatgpt-paste-panel {
+  background-color: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+}
+
+.srt-chatgpt-paste-panel-heading {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: var(--text-primary);
+}
+
+.srt-chatgpt-paste-panel-desc {
+  font-size: 12px;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+  line-height: 1.5;
+}
+
+.srt-chatgpt-paste-btn-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.srt-chatgpt-paste-textarea {
+  width: 100%;
+  font-size: 12px;
+  font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  padding: 6px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  resize: vertical;
+  box-sizing: border-box;
+  min-height: 72px;
+}
+
+.srt-chatgpt-paste-textarea.has-error {
+  border-color: var(--error);
+}
+
+.srt-chatgpt-paste-error {
+  font-size: 11px;
+  color: var(--error);
+}
+
+.srt-evidence-toggle {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid #d0d7de;
+  background: #f6f8fa;
+  color: #24292f;
+  cursor: pointer;
+  line-height: 1.4;
+}
+
+.srt-evidence-toggle:hover {
+  background: #eef2f6;
+}
+
+.srt-evidence-list {
+  display: block;
+  margin-top: 4px;
+  max-width: 260px;
+}
+
+.srt-evidence-item {
+  display: block;
+  font-size: 10px;
+  line-height: 1.5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.srt-evidence-item-quote {
+  font-size: 9px;
+  color: #888;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 240px;
+  margin-left: 4px;
+}
+

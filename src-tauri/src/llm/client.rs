@@ -41,7 +41,7 @@ impl LlmClient {
         let request_body = ChatCompletionRequest {
             model: self.config.model.clone(),
             messages: messages.to_vec(),
-            temperature: Some(0.3),
+            temperature: self.config.temperature,
             thinking,
             response_format: if use_json_mode {
                 Some(ResponseFormat {
@@ -51,6 +51,13 @@ impl LlmClient {
                 None
             },
         };
+
+        let temp_status = match self.config.temperature {
+            Some(t) => format!("{}", t),
+            None => "omitted".to_string(),
+        };
+        eprintln!("[DEBUG] [LLM] Chat Completions API: model={} endpoint={} temperature={}",
+            self.config.model, url, temp_status);
 
         let response = self
             .client
@@ -65,7 +72,10 @@ impl LlmClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(format!("API error ({}): {}", status, body));
+            eprintln!("[ERROR] [LLM] Chat Completions API HTTP {}: {}",
+                status.as_u16(),
+                crate::log::preview_chars(&body, 500));
+            return Err(format!("API error ({}): {}", status, crate::log::preview_chars(&body, 500)));
         }
 
         let completion: ChatCompletionResponse = response

@@ -12,6 +12,10 @@ pub struct ProviderConfig {
     /// Only used by DeepSeek V4 models.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    /// Temperature for Chat Completions API. None = omit from JSON.
+    /// gpt-5.5 rejects temperature, so OpenAI leaves this unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

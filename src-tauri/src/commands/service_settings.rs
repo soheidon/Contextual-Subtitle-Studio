@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
+use crate::log::emit_log;
+
 const DEFAULT_TMDB_ENV_VAR: &str = "TMDB_API_KEY";
 const DEFAULT_TMDB_BASE_URL: &str = "https://api.themoviedb.org";
 const DEFAULT_SRT_EN_PATTERN: &str = r"_en\.srt$";
@@ -418,13 +420,16 @@ pub async fn test_openai_ai_confirm(
 
     let url = "https://api.openai.com/v1/responses";
 
+    emit_log(&app, "debug", "Service", &format!(
+        "OpenAI Responses API: model={} endpoint=https://api.openai.com/v1/responses temperature=omitted json_mode=omitted web_search=on",
+        &model
+    ));
+
     let request_body = serde_json::json!({
         "model": &model,
         "input": "Hello",
         "instructions": "Reply with single word OK in JSON: {\"status\":\"ok\"}",
-        "tools": [{"type": "web_search"}],
-        "temperature": 0.0,
-        "text": {"format": {"type": "json_object"}}
+        "tools": [{"type": "web_search"}]
     });
 
     let client = reqwest::Client::new();
@@ -440,7 +445,12 @@ pub async fn test_openai_ai_confirm(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("OpenAI Responses API エラー ({}): {}", status.as_u16(), body));
+        emit_log(&app, "error", "Service", &format!(
+            "OpenAI Responses API HTTP {}: {}",
+            status.as_u16(),
+            crate::log::preview_chars(&body, 500)
+        ));
+        return Err(format!("OpenAI Responses API エラー ({}): {}", status.as_u16(), crate::log::preview_chars(&body, 500)));
     }
 
     Ok(true)

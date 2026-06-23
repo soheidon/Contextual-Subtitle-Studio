@@ -3,6 +3,7 @@ use crate::commands::project::AppState;
 use crate::commands::service_settings;
 use crate::dictionary::GlossaryEntry;
 use crate::dictionary::characters::Character;
+use regex::Regex;
 use crate::envstore::EnvStoreState;
 use crate::llm::client::extract_json;
 use crate::llm::LlmClient;
@@ -100,6 +101,14 @@ pub struct UnresolvedTerm {
     pub occurrence_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias_candidate: Option<bool>, // true when the term looks like a character alias
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_text: Option<String>,  // source_text with generic suffix stripped for search
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generic_suffix: Option<String>, // detected generic English suffix (e.g. "City")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aliases: Option<Vec<String>>, // search aliases: [full, stripped, ...] deduplicated
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_surface: Option<String>, // confirmed kanji notation for glossary output
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +226,8 @@ pub struct SrtAnalysisFile {
 pub struct BatchTermRequest {
     pub source_text: String,
     pub surface_ja: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -347,6 +358,8 @@ fn build_scene_detection_prompt(entries: &[SubtitleEntry], prompt_context: &str)
     );
 
     if !prompt_context.is_empty() {
+        user.push_str("\n固有名詞は以下の辞書表記を最優先してください。\n");
+        user.push_str("英語字幕表記やカタカナ読みではなく、日本語字幕用の漢字表記を使ってください。\n");
         user.push_str(&format!("\n【参考情報】\n{}\n", prompt_context));
     }
 
@@ -1029,6 +1042,68 @@ fn strip_trailing_cjk_parenthetical(text: &str) -> &str {
     text
 }
 
+/// Single generic English words that are too vague to use as search terms alone.
+const GENERIC_ALIAS_WORDS: &[&str] = &[
+    "moon", "sun", "star", "wind", "fire", "water", "earth", "sky",
+    "ice", "snow", "iron", "gold", "silver", "jade", "sea", "storm",
+    "great", "black", "white", "red", "blue", "green", "dark",
+    "east", "west", "north", "south", "young", "old",
+];
+
+/// Filter out overly generic single-word aliases (e.g. "Moon" from "Moon Guards").
+/// Keeps multi-word aliases and non-generic single words like "Zhenhuang".
+/// After filtering, if only the source_text remains, returns empty — no search_aliases output.
+fn sanitize_search_aliases(aliases: &[String]) -> Vec<String> {
+    let filtered: Vec<String> = aliases.iter()
+        .filter(|a| {
+            let is_single_word = !a.contains(' ');
+            if is_single_word {
+                !GENERIC_ALIAS_WORDS.contains(&a.to_lowercase().as_str())
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
+    // If only source_text (first entry) remains, return empty — no extra search hints
+    if filtered.len() <= 1 { Vec::new() } else { filtered }
+}
+
+/// Detect generic English suffixes on proper nouns and generate search aliases.
+/// Example: "Zhenhuang City" → search_text="Zhenhuang", generic_suffix="City",
+/// aliases=["Zhenhuang City", "Zhenhuang"]
+fn generate_search_aliases(source_text: &str) -> (Option<String>, Option<String>, Option<Vec<String>>) {
+    let suffixes: &[&str] = &[
+        "Mountains", "Guards", "Prince", "Princess", "General",
+        "City", "River", "Lake", "Mountain", "Pass",
+        "Tribe", "Army", "House", "Lady", "Lord",
+        "Guard",
+    ];
+    // Sorted by length desc so "Mountains" matches before "Mountain", "Guards" before "Guard"
+
+    for suffix in suffixes {
+        let pat = format!(" {}", suffix);
+        if source_text.len() > pat.len()
+            && source_text[source_text.len() - pat.len()..].to_lowercase() == pat.to_lowercase()
+        {
+            let stripped = source_text[..source_text.len() - pat.len()].to_string();
+            if !stripped.is_empty() {
+                // Reject if stripped text is a single generic English word
+                let is_single_word = !stripped.contains(' ');
+                let is_generic = is_single_word
+                    && GENERIC_ALIAS_WORDS.contains(&stripped.to_lowercase().as_str());
+                if is_generic {
+                    return (None, None, None);
+                }
+                let mut aliases: Vec<String> = vec![source_text.to_string(), stripped.clone()];
+                aliases.dedup();
+                return (Some(stripped), Some(suffix.to_string()), Some(aliases));
+            }
+        }
+    }
+    (None, None, None)
+}
+
 /// Extract proper noun candidates from all SRT subtitle text.
 /// Uses heuristics: capitalized word sequences, proper-noun keywords, and
 /// frequency analysis. Sorted by occurrence count (descending).
@@ -1217,15 +1292,22 @@ pub fn extract_srt_body_candidates(
     let mut results: Vec<UnresolvedTerm> = candidate_map
         .into_values()
         .filter(|c| c.count >= 2 || contains_proper_noun_keyword(&c.original_text))
-        .map(|c| UnresolvedTerm {
-            source_text: c.original_text,
-            surface_ja: String::new(),
-            term_type: if c.is_alias { "alias_candidate".to_string() } else { "proper_noun".to_string() },
-            status: "unresolved".to_string(),
-            reason: format!("SRT本文から抽出 ({}回出現)", c.count),
-            source: Some("srt_body".to_string()),
-            occurrence_count: c.count,
-            alias_candidate: if c.is_alias { Some(true) } else { None },
+        .map(|c| {
+            let (search_text, generic_suffix, aliases) = generate_search_aliases(&c.original_text);
+            UnresolvedTerm {
+                source_text: c.original_text,
+                surface_ja: String::new(),
+                term_type: if c.is_alias { "alias_candidate".to_string() } else { "proper_noun".to_string() },
+                status: "unresolved".to_string(),
+                reason: format!("SRT本文から抽出 ({}回出現)", c.count),
+                source: Some("srt_body".to_string()),
+                occurrence_count: c.count,
+                alias_candidate: if c.is_alias { Some(true) } else { None },
+                search_text,
+                generic_suffix,
+                aliases,
+                confirmed_surface: None,
+            }
         })
         .collect();
 
@@ -1357,12 +1439,17 @@ pub async fn generate_srt_synopsis(
     // Normalize synopsis-produced terms:
     // - surface_ja is always cleared (kanji resolution happens later via AI確認)
     // - trailing parenthesized Chinese candidates like "Huotu Water (火屠水)" are stripped
+    // - generate search aliases for generic English suffixes
     for term in &mut result.unresolved_terms {
         term.source = Some("synopsis".to_string());
         term.occurrence_count = 0;
         term.surface_ja = String::new();
         // Strip trailing parenthesized Chinese: "Huotu Water (火屠水)" → "Huotu Water"
         term.source_text = strip_trailing_cjk_parenthetical(&term.source_text).to_string();
+        let (search_text, generic_suffix, aliases) = generate_search_aliases(&term.source_text);
+        term.search_text = search_text;
+        term.generic_suffix = generic_suffix;
+        term.aliases = aliases;
     }
 
     emit_log(&app, "success", "SRT", &format!(
@@ -1399,6 +1486,16 @@ pub async fn detect_srt_scenes(
         let computed = (scene.end_entry_index.saturating_sub(scene.start_entry_index)) as usize + 1;
         if scene.entry_count == 0 || scene.entry_count > entries.len() {
             scene.entry_count = computed;
+        }
+    }
+
+    // Apply dictionary-based katakana → kanji replacement to scene titles and reasons
+    {
+        let characters = state.characters.lock().map_err(|e| e.to_string())?;
+        let glossary = state.glossary.lock().map_err(|e| e.to_string())?;
+        for scene in &mut result.scenes {
+            scene.title = resolve_known_terms_in_text(&scene.title, &characters, &glossary);
+            scene.reason = resolve_known_terms_in_text(&scene.reason, &characters, &glossary);
         }
     }
 
@@ -1517,22 +1614,13 @@ pub fn resolve_synopsis_katakana(
 
     let mut results = Vec::new();
 
-    // Build lookup maps
-    let mut reading_to_kanji: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for c in characters.iter() {
-        let reading = hiragana_to_katakana(&c.japanese_name);
-        let kanji = &c.japanese_name;
-        // Only add if name contains kanji (not pure kana)
-        if reading != *kanji && !reading.is_empty() {
-            reading_to_kanji.insert(reading.clone(), kanji.clone());
-        }
-    }
-    for g in glossary.iter() {
-        let reading = hiragana_to_katakana(&g.target);
-        if reading != g.target && !reading.is_empty() {
-            reading_to_kanji.entry(reading).or_insert_with(|| g.target.clone());
-        }
-    }
+    // Build lookup map from the shared dictionary replacement helper.
+    // Only keep katakana→kanji pairs (filter out English/other key sources).
+    let replacement_pairs = build_dictionary_replacement_map(&characters, &glossary);
+    let reading_to_kanji: std::collections::HashMap<String, String> = replacement_pairs
+        .into_iter()
+        .filter(|(k, _)| k.chars().any(|c| ('\u{30A0}'..='\u{30FF}').contains(&c)))
+        .collect();
 
     // Extract katakana sequences from synopsis
     let katakana_re = regex::Regex::new(r"[\u{30A0}-\u{30FF}]{2,}").unwrap();
@@ -1609,6 +1697,218 @@ fn hiragana_to_katakana(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Generate 1-2 candidate katakana readings from an English/romanized source text.
+/// Pass A: concatenated form (strips spaces/hyphens, maps each character cluster).
+/// Pass B: space-preserving form with `・` between words.
+fn romanized_to_katakana_candidates(source: &str) -> Vec<String> {
+    let mapping: Vec<(&str, &str)> = vec![
+        // Chinese pinyin overrides (match before generic romaji)
+        ("qian", "チェン"), ("cheng", "チェン"), ("zhang", "ジャン"),
+        ("chang", "チャン"), ("chun", "チュン"), ("xian", "シエン"),
+        ("jian", "ジエン"), ("yuan", "ユエン"), ("hui", "フイ"),
+        ("song", "ソン"), ("tong", "トン"), ("dong", "ドン"),
+        ("zhen", "ジェン"), ("zheng", "ジェン"), ("shan", "シャン"),
+        ("shen", "シェン"), ("jing", "ジン"), ("yong", "ヨン"),
+        ("tuo", "トウ"), ("jin", "ジン"), ("er", "アル"),
+        ("lun", "ルン"), ("run", "ルン"), ("jun", "ジュン"),
+        // Palatalized clusters (match before simple CV pairs)
+        ("kya", "キャ"), ("kyu", "キュ"), ("kyo", "キョ"),
+        ("sha", "シャ"), ("shu", "シュ"), ("sho", "ショ"),
+        ("cha", "チャ"), ("chu", "チュ"), ("cho", "チョ"),
+        ("nya", "ニャ"), ("nyu", "ニュ"), ("nyo", "ニョ"),
+        ("hya", "ヒャ"), ("hyu", "ヒュ"), ("hyo", "ヒョ"),
+        ("mya", "ミャ"), ("myu", "ミュ"), ("myo", "ミョ"),
+        ("rya", "リャ"), ("ryu", "リュ"), ("ryo", "リョ"),
+        ("gya", "ギャ"), ("gyu", "ギュ"), ("gyo", "ギョ"),
+        ("ja", "ジャ"), ("ju", "ジュ"), ("jo", "ジョ"),
+        ("bya", "ビャ"), ("byu", "ビュ"), ("byo", "ビョ"),
+        ("pya", "ピャ"), ("pyu", "ピュ"), ("pyo", "ピョ"),
+        // Voiced consonant+vowel
+        ("ga", "ガ"), ("gi", "ギ"), ("gu", "グ"), ("ge", "ゲ"), ("go", "ゴ"),
+        ("za", "ザ"), ("ji", "ジ"), ("zu", "ズ"), ("ze", "ゼ"), ("zo", "ゾ"),
+        ("da", "ダ"), ("de", "デ"), ("do", "ド"),
+        ("ba", "バ"), ("bi", "ビ"), ("bu", "ブ"), ("be", "ベ"), ("bo", "ボ"),
+        ("pa", "パ"), ("pi", "ピ"), ("pu", "プ"), ("pe", "ペ"), ("po", "ポ"),
+        // Basic consonant+vowel
+        ("ka", "カ"), ("ki", "キ"), ("ku", "ク"), ("ke", "ケ"), ("ko", "コ"),
+        ("sa", "サ"), ("shi", "シ"), ("su", "ス"), ("se", "セ"), ("so", "ソ"),
+        ("ta", "タ"), ("chi", "チ"), ("tsu", "ツ"), ("te", "テ"), ("to", "ト"),
+        ("na", "ナ"), ("ni", "ニ"), ("nu", "ヌ"), ("ne", "ネ"), ("no", "ノ"),
+        ("ha", "ハ"), ("hi", "ヒ"), ("fu", "フ"), ("he", "ヘ"), ("ho", "ホ"),
+        ("ma", "マ"), ("mi", "ミ"), ("mu", "ム"), ("me", "メ"), ("mo", "モ"),
+        ("ya", "ヤ"), ("yu", "ユ"), ("yo", "ヨ"),
+        ("ra", "ラ"), ("ri", "リ"), ("ru", "ル"), ("re", "レ"), ("ro", "ロ"),
+        ("wa", "ワ"), ("wo", "ヲ"),
+        // Standalone vowels + syllabic n
+        ("a", "ア"), ("i", "イ"), ("u", "ウ"), ("e", "エ"), ("o", "オ"),
+        ("n", "ン"),
+    ];
+
+    fn romanize_word(word: &str, mapping: &[(&str, &str)]) -> String {
+        let lower = word.to_lowercase();
+        let mut result = String::new();
+        let mut pos = 0;
+        let chars: Vec<char> = lower.chars().collect();
+        while pos < chars.len() {
+            // Try up to 6 chars ahead (needed for Chinese pinyin like "cheng")
+            let mut matched = false;
+            for len in (1..=6.min(chars.len() - pos)).rev() {
+                let slice: String = chars[pos..pos + len].iter().collect();
+                for &(pat, kana) in mapping {
+                    if slice == pat {
+                        result.push_str(kana);
+                        pos += len;
+                        matched = true;
+                        break;
+                    }
+                }
+                if matched { break; }
+            }
+            if !matched {
+                // Skip non-romaji characters (spaces handled by caller)
+                if chars[pos].is_ascii_alphabetic() {
+                    // Long vowel at end: add ー (e.g. "tuo" → "トウ" not "トオ")
+                    if pos + 1 == chars.len() && "o".contains(chars[pos]) && result.len() >= 3 {
+                        result.push('ー');
+                    }
+                }
+                pos += 1;
+            }
+        }
+        result
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+
+    // Pass A: concatenated (strip spaces/hyphens/apostrophes)
+    let stripped: String = source
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '\'')
+        .collect();
+    let concat = romanize_word(&stripped, &mapping);
+    if !concat.is_empty() {
+        candidates.push(concat);
+    }
+
+    // Pass B: word-separated form with middle dots
+    let words: Vec<&str> = source.split_whitespace().filter(|w| !w.is_empty()).collect();
+    if words.len() >= 2 {
+        let dot_form: Vec<String> = words.iter()
+            .map(|w| romanize_word(w, &mapping))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if dot_form.len() == words.len() {
+            candidates.push(dot_form.join("・"));
+        }
+    }
+
+    // Deduplicate
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+/// Build a dictionary replacement map for katakana/English → kanji replacement.
+/// Returns (pattern, replacement) pairs sorted longest pattern first.
+fn build_dictionary_replacement_map(
+    characters: &[Character],
+    glossary: &[GlossaryEntry],
+) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    // 1. Characters: hiragana→katakana of japanese_name → japanese_name
+    for c in characters.iter() {
+        let reading = hiragana_to_katakana(&c.japanese_name);
+        if reading != c.japanese_name && !reading.is_empty() {
+            pairs.push((reading, c.japanese_name.clone()));
+        }
+    }
+
+    // 2. Characters: aliases → japanese_name
+    for c in characters.iter() {
+        for alias in &c.aliases {
+            if !alias.is_empty() && alias != &c.japanese_name {
+                pairs.push((alias.clone(), c.japanese_name.clone()));
+            }
+        }
+    }
+
+    // 2b. Characters: English name variants (space-stripped, underscored) → japanese_name
+    for c in characters.iter() {
+        if c.english_name.is_empty() { continue; }
+        let en = c.english_name.trim();
+        // Space-stripped: "Qiao Qiao" → "QiaoQiao"
+        let no_space: String = en.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let no_space_is_diff = no_space != en;
+        if no_space_is_diff {
+            pairs.push((no_space.clone(), c.japanese_name.clone()));
+        }
+        // Underscore: "Qiao Qiao" → "Qiao_Qiao"
+        let underscored = en.replace(' ', "_");
+        if underscored != en && underscored != no_space {
+            pairs.push((underscored, c.japanese_name.clone()));
+        }
+    }
+
+    // 3. Glossary: source → target (direct)
+    for g in glossary.iter() {
+        if !g.source.is_empty() && !g.target.is_empty() {
+            pairs.push((g.source.clone(), g.target.clone()));
+        }
+    }
+
+    // 4. Glossary: stored aliases → target
+    for g in glossary.iter() {
+        for alias in &g.aliases {
+            if !alias.is_empty() && alias != &g.target {
+                pairs.push((alias.clone(), g.target.clone()));
+            }
+        }
+    }
+
+    // 5. Glossary: romanized source → katakana candidates → target
+    for g in glossary.iter() {
+        for kana in romanized_to_katakana_candidates(&g.source) {
+            if !kana.is_empty() {
+                pairs.push((kana, g.target.clone()));
+            }
+        }
+    }
+
+    // 6. Glossary: hiragana→katakana of target → target (kana-containing targets)
+    for g in glossary.iter() {
+        let reading = hiragana_to_katakana(&g.target);
+        if reading != g.target && !reading.is_empty() {
+            pairs.push((reading, g.target.clone()));
+        }
+    }
+
+    // Sort by pattern length descending (longest match first to avoid partial matches)
+    pairs.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
+    // Deduplicate by pattern (first = longest, so keep that)
+    pairs.dedup_by(|a, b| a.0 == b.0);
+
+    pairs
+}
+
+/// Replace katakana/English terms in text with their dictionary kanji equivalents.
+pub fn resolve_known_terms_in_text(
+    text: &str,
+    characters: &[Character],
+    glossary: &[GlossaryEntry],
+) -> String {
+    let pairs = build_dictionary_replacement_map(characters, glossary);
+    if pairs.is_empty() {
+        return text.to_string();
+    }
+    let mut result = text.to_string();
+    for (pattern, replacement) in &pairs {
+        result = result.replace(pattern.as_str(), replacement.as_str());
+    }
+    result
 }
 
 /// Resolve a single unresolved term via DuckDuckGo web search.
@@ -1780,6 +2080,73 @@ pub async fn resolve_unresolved_term_ai(
     }
 }
 
+/// Parse "Please try again in X.Ys" from an OpenAI 429 error body.
+/// Returns X+1 (ceiling + 1s buffer). Falls back to 0 if unparseable.
+fn parse_retry_after_seconds(error_body: &str) -> u64 {
+    static RE_RETRY: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"try again in (\d+\.?\d*)s").expect("valid regex"));
+    if let Some(caps) = RE_RETRY.captures(error_body) {
+        if let Some(m) = caps.get(1) {
+            if let Ok(secs) = m.as_str().parse::<f64>() {
+                return (secs.ceil() as u64) + 1;
+            }
+        }
+    }
+    0
+}
+
+/// Backoff delays for 429 retry (attempts 0, 1, 2 → 3rd attempt is final).
+const RETRY_BACKOFF_SECS: [u64; 3] = [5, 15, 30];
+
+/// Send a request to OpenAI Responses API with automatic 429 retry (up to 3 retries).
+/// Returns the raw reqwest Response on success.
+async fn send_openai_responses_with_retry(
+    app: &tauri::AppHandle,
+    api_key: &str,
+    request_body: &serde_json::Value,
+) -> Result<reqwest::Response, String> {
+    let client = reqwest::Client::new();
+
+    for attempt in 0..4 {
+        let response = client
+            .post("https://api.openai.com/v1/responses")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(request_body)
+            .send()
+            .await
+            .map_err(|e| format!("OpenAI network error: {}", e))?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+
+        if status.as_u16() == 429 && attempt < 3 {
+            let body = response.text().await.unwrap_or_default();
+            let api_wait = parse_retry_after_seconds(&body);
+            let wait_secs = if api_wait > 0 { api_wait } else { RETRY_BACKOFF_SECS[attempt] };
+            emit_log(app, "info", "SRT", &format!(
+                "Rate limit (429): {}秒待機して再試行 (attempt {}/3)",
+                wait_secs,
+                attempt + 1
+            ));
+            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+            continue;
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        emit_log(app, "error", "SRT", &format!(
+            "OpenAI Responses API HTTP {}: {}",
+            status.as_u16(),
+            preview_chars(&body, 500)
+        ));
+        return Err(format!("OpenAI API error ({}): {}", status, preview_chars(&body, 500)));
+    }
+
+    Err("OpenAI API error: 429 retry上限(3回)に達しました".to_string())
+}
+
 /// Resolve a single unresolved term via OpenAI Responses API with web_search.
 #[tauri::command]
 pub async fn resolve_unresolved_term_ai_openai(
@@ -1816,6 +2183,8 @@ pub async fn resolve_unresolved_term_ai_openai(
     let title = drama_title.unwrap_or_default();
     let ctx = prompt_context.unwrap_or_default();
 
+    let (_search_text, _generic_suffix, aliases) = generate_search_aliases(&source_text);
+
     let instructions = "You are a Chinese drama proper noun identification assistant.\
         Use web_search to find the correct Chinese/Japanese kanji forms \
         corresponding to English text from drama subtitles.";
@@ -1823,21 +2192,41 @@ pub async fn resolve_unresolved_term_ai_openai(
     let mut input = if !title.is_empty() {
         if episode_num.is_some() {
             format!(
-                "ドラマ『{}』{}において「{}」と英語字幕表記されるものの漢語表記はなんですか。",
+                "作品『{}』{}において「{}」と英語字幕表記されるものの漢語表記はなんですか。",
                 title, episode_label, source_text
             )
         } else {
             format!(
-                "ドラマ『{}』において「{}」と英語字幕表記されるものの漢語表記はなんですか。",
+                "作品『{}』において「{}」と英語字幕表記されるものの漢語表記はなんですか。",
                 title, source_text
             )
         }
     } else {
-        format!(
-            "「{}」と英語字幕表記されるものの漢語表記はなんですか。",
-            source_text
-        )
+        if episode_num.is_some() {
+            format!(
+                "{}において「{}」と英語字幕表記されるものの漢語表記はなんですか。",
+                episode_label, source_text
+            )
+        } else {
+            format!(
+                "「{}」と英語字幕表記されるものの漢語表記はなんですか。",
+                source_text
+            )
+        }
     };
+
+    // Add alias hint when generic suffix detected
+    if let Some(ref alias_list) = aliases {
+        let safe_aliases = sanitize_search_aliases(alias_list);
+        if !safe_aliases.is_empty() {
+            input.push_str(&format!(
+                "\n\n検索別名: {}\n\
+                ※ search_aliases は検索補助語です。source_text には必ず元の入力表記を使ってください。\
+                一般語すぎる別名は中文タイトルと同時に検索しても根拠が確認できない限り採用しないでください。",
+                safe_aliases.join(", ")
+            ));
+        }
+    }
 
     // Episode-specific search hints
     if let Some(ep) = episode_num {
@@ -1858,44 +2247,30 @@ pub async fn resolve_unresolved_term_ai_openai(
         - status は \"found\" | \"uncertain\" | \"not_found\" のみを使う。\n\
         - confidence は \"high\" | \"medium\" | \"low\" のみを使う。\n\
         - evidence には、根拠ページの title, url, quote または短い要約を入れる。\n\
-        - 根拠ページに直接出ている表記だけを candidate_zh / candidate_ja に入れる。");
+        - 根拠ページに直接出ている表記だけを candidate_zh / candidate_ja に入れる。\n\
+        - Markdownリンク [text](url) は絶対に使わない。URLはJSON文字列として直接書く。");
 
     // Context memo (optional)
     if !ctx.is_empty() {
-        input.push_str(&format!("\n\n参考文脈:\n{}", ctx));
+        input.push_str("\n\n参考文脈（作品世界を理解するための補助情報です。未確認語の候補を作る根拠にはしないでください。candidate_zh は必ずWeb上で直接確認できる表記だけにしてください）:");
+        input.push_str(&format!("\n{}", ctx));
     }
 
     input.push_str("\n\nJSONのみで返してください。");
 
     emit_log(&app, "debug", "SRT", &format!(
-        "OpenAI prompt preview: {}",
-        preview_chars(&input, 500)
+        "OpenAI Responses API: model={} endpoint=https://api.openai.com/v1/responses temperature=omitted json_mode=omitted web_search=on",
+        &model
     ));
 
     let request_body = serde_json::json!({
         "model": &model,
         "instructions": instructions,
         "input": &input,
-        "tools": [{"type": "web_search"}],
-        "temperature": 0.0,
-        "text": {"format": {"type": "json_object"}}
+        "tools": [{"type": "web_search"}]
     });
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post("https://api.openai.com/v1/responses")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("OpenAI network error: {}", e))?;
-
-    let status_code = response.status();
-    if !status_code.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error ({}): {}", status_code.as_u16(), body));
-    }
+    let response = send_openai_responses_with_retry(&app, &api_key, &request_body).await?;
 
     let body: serde_json::Value = response.json().await
         .map_err(|e| format!("Failed to parse OpenAI response: {}", e))?;
@@ -1913,7 +2288,13 @@ pub async fn resolve_unresolved_term_ai_openai(
     // Parse the JSON response
     let cleaned = extract_json(text);
     let parsed: BatchTermResult = serde_json::from_str(cleaned)
-        .map_err(|e| format!("Failed to parse OpenAI term result: {} (raw: {})", e, preview_chars(&text, 300)))?;
+        .map_err(|e| {
+            emit_log(&app, "error", "SRT", &format!(
+                "JSON parse failure (individual): {} | raw: {}",
+                e, preview_chars(text, 500)
+            ));
+            format!("Failed to parse OpenAI term result: {} (raw: {})", e, preview_chars(text, 300))
+        })?;
 
     // Map status: "found" stays, "uncertain" stays, "not_found" stays
     let status = if parsed.status.is_empty() { "not_found".to_string() } else { parsed.status.clone() };
@@ -1951,6 +2332,7 @@ pub async fn resolve_unresolved_terms_batch_openai(
     drama_title_ja: String,
     drama_title_zh: Option<String>,
     drama_title_en: Option<String>,
+    folder_label: Option<String>,
     short_context: Option<String>,
     srt_filename: Option<String>,
 ) -> Result<Vec<WebTermResolution>, String> {
@@ -1976,230 +2358,351 @@ pub async fn resolve_unresolved_terms_batch_openai(
     let overrides = service_settings::read_provider_settings(&app, "OPENAI");
     let model = overrides.model;
 
-    emit_log(&app, "debug", "SRT", &format!("OpenAI model: {}, web_search=on", model));
-    emit_log(&app, "debug", "SRT", &format!("OpenAI prompt episode={}", episode_num.map_or("none".to_string(), |e| e.to_string())));
+    emit_log(&app, "debug", "SRT", &format!("OpenAI model: {}, web_search=on (chunked)", model));
+
+    let zh_title = drama_title_zh.as_deref().filter(|s| !s.is_empty());
+    let en_title = drama_title_en.as_deref().filter(|s| !s.is_empty());
+    let folder = folder_label.as_deref().filter(|s| !s.is_empty());
+    let ja_official = (!drama_title_ja.is_empty()).then(|| drama_title_ja.as_str());
+
+    // The primary search key is always zh. en is auxiliary, folderLabel is context, ja is official-title only.
+    let search_primary = zh_title.or(en_title).or(folder)
+        .map(|s| s.to_string()).unwrap_or_default();
+
+    // Build prompt title block: zh primary, en auxiliary, folder/ja as context
+    let mut title_block = String::new();
+    if let Some(zh) = zh_title {
+        title_block.push_str(&format!("作品中文名: {}", zh));
+    }
+    if let Some(en) = en_title {
+        if zh_title.is_some() {
+            title_block.push_str(&format!("\n英語題: {}（補助情報。一般語で混同しやすいため検索では中文名と併用）", en));
+        } else {
+            title_block.push_str(&format!("\n作品英語名: {}", en));
+        }
+    }
+    if let Some(ja) = ja_official {
+        title_block.push_str(&format!("\n日本語題: {}", ja));
+    }
+    if let Some(f) = folder {
+        title_block.push_str(&format!("\n作業フォルダ名: {}", f));
+    }
+    if title_block.is_empty() {
+        if let Some(f) = folder {
+            title_block.push_str(&format!("作業フォルダ名: {}", f));
+        }
+    }
+    // Append episode info
+    if !episode_label.is_empty() {
+        title_block.push_str(&format!("\n対象: {}", episode_label));
+    }
+
+    // Build the title prefix used in the question format (concise, no newlines)
+    let title_prefix = zh_title
+        .map(|z| format!("作品中文名「{}」", z))
+        .or_else(|| en_title.map(|e| format!("作品「{}」", e)))
+        .or_else(|| folder.map(|f| format!("作業フォルダ「{}」", f)))
+        .unwrap_or_default();
 
     emit_log(&app, "debug", "SRT", &format!(
-        "OpenAI source_terms: {}",
-        terms.iter().map(|t| t.source_text.as_str()).collect::<Vec<_>>().join(", ")
+        "Batch title source: ja=\"{}\" zh=\"{}\" en=\"{}\" folderLabel=\"{}\"",
+        drama_title_ja,
+        zh_title.unwrap_or(""),
+        en_title.unwrap_or(""),
+        folder.unwrap_or("")
+    ));
+    emit_log(&app, "debug", "SRT", &format!(
+        "Search primary title: {}", search_primary
     ));
 
     let instructions = "You are a Chinese drama proper noun identification assistant.\
         Use web_search to find the correct Chinese/Japanese kanji forms \
         corresponding to English text from drama subtitles.";
 
-    // Build the source_text list
-    let source_list: String = terms
-        .iter()
-        .enumerate()
-        .map(|(i, t)| format!("{}. {}", i + 1, t.source_text))
-        .collect::<Vec<_>>()
-        .join("\n");
+    const BATCH_SIZE: usize = 5;
+    let chunks: Vec<&[BatchTermRequest]> = terms.chunks(BATCH_SIZE).collect();
+    let total_chunks = chunks.len();
 
-    let zh_title = drama_title_zh.as_deref().filter(|s| !s.is_empty());
-    let en_title = drama_title_en.as_deref().filter(|s| !s.is_empty());
+    let mut all_results: Vec<WebTermResolution> = Vec::new();
+    let mut chunk_failures: Vec<String> = Vec::new();
 
-    // Build the title line with optional episode info
-    let title_line = match (zh_title, en_title) {
-        (Some(zh), Some(en)) => format!(
-            "ドラマ『{}』（中国語原題：『{}』 / 英語題：『{}』）",
-            drama_title_ja, zh, en
-        ),
-        (Some(zh), None) => format!(
-            "ドラマ『{}』（中国語原題：『{}』）",
-            drama_title_ja, zh
-        ),
-        (None, Some(en)) => format!(
-            "ドラマ『{}』（英語題：『{}』）",
-            drama_title_ja, en
-        ),
-        (None, None) => format!("ドラマ『{}』", drama_title_ja),
-    };
-
-    let mut input = if episode_num.is_some() {
-        format!(
-            "{}{}の英語字幕において、下記の英語字幕表記の漢語表記はなんですか。\n\n{}",
-            title_line, episode_label, source_list
-        )
-    } else {
-        format!(
-            "{}において、下記の英語字幕表記の漢語表記はなんですか。\n\n{}",
-            title_line, source_list
-        )
-    };
-
-    // Episode-specific search hints
-    if let Some(ep) = episode_num {
-        input.push_str(&format!(
-            "\n\n検索時には、作品名に加えて「第{}集」「第{}話」「episode {}」「分集剧情」「剧情介绍」などの話数関連語も考慮してください。",
-            ep, ep, ep
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        let chunk_num = chunk_idx + 1;
+        let chunk_terms: Vec<String> = chunk.iter().map(|t| t.source_text.clone()).collect();
+        emit_log(&app, "info", "SRT", &format!(
+            "Batch {}/{}: {} terms: {}",
+            chunk_num, total_chunks, chunk.len(),
+            chunk_terms.join(", ")
         ));
-    }
 
-    // Rules (in Japanese, per user specification)
-    input.push_str("\n\n\
-        - 推論で漢字候補を作らない。\n\
-        - 英語字幕表記 source_text はソース由来なので、誤字・聞き間違いとは仮定しない。\n\
-        - Web検索結果、配信元ページ、あらすじ、人物関係解説などに直接出ている漢字表記だけを採用する。\n\
-        - 検索結果に明確な漢字表記が見つからない場合は、candidate_zh / candidate_ja を空にし、status を \"not_found\" にする。\n\
-        - 候補が検索結果に直接確認できず、文脈推定にすぎない場合は、status を \"uncertain\"、confidence を \"low\" にする。\n\
-        - 根拠なしに中国語らしい漢字を生成しない。\n\
-        - status は \"found\" | \"uncertain\" | \"not_found\" のみを使う。\n\
-        - confidence は \"high\" | \"medium\" | \"low\" のみを使う。\n\
-        - evidence には、根拠ページの title, url, quote または短い要約を入れる。\n\
-        - 根拠ページに直接出ている表記だけを candidate_zh / candidate_ja に入れる。");
+        // Build prompt for this chunk
+        let source_list: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let mut line = format!("{}. {}", i + 1, t.source_text);
+                let safe_aliases = sanitize_search_aliases(&t.aliases);
+                if !safe_aliases.is_empty() {
+                    let alias_str = safe_aliases.join(", ");
+                    line.push_str(&format!("\n    search_aliases: {}", alias_str));
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
-    // Context memo (optional)
-    if let Some(ref ctx) = short_context {
-        if !ctx.is_empty() {
-            input.push_str(&format!("\n\n参考文脈:\n{}", ctx));
+        // Build prompt: title_block first as context, then question with title_prefix
+        let mut input = String::new();
+        if !title_block.is_empty() {
+            input.push_str(&title_block);
+            input.push_str("\n\n");
+        }
+
+        if !title_prefix.is_empty() {
+            input.push_str(&format!(
+                "{}の英語字幕において、下記の英語字幕表記の漢語表記はなんですか。\n\n{}",
+                title_prefix, source_list
+            ));
+        } else if !episode_label.is_empty() {
+            input.push_str(&format!(
+                "{}の英語字幕において、下記の英語字幕表記の漢語表記はなんですか。\n\n{}",
+                episode_label, source_list
+            ));
+        } else {
+            input.push_str(&format!(
+                "下記の英語字幕表記の漢語表記はなんですか。\n\n{}",
+                source_list
+            ));
+        }
+
+        // Search priority rules (zh-primary, en-auxiliary)
+        input.push_str("\n\n検索方針:\n\
+            - 検索では必ず中文タイトルを主キーとして使う。英語題は一般語で混同しやすいため、中文タイトルと併用する場合のみ使う。\n\
+            - 英語題だけをキーにして検索して得た根拠は採用しない。必ず中文タイトルと組み合わせて検索すること。");
+
+        // Episode-specific search hints
+        if let Some(ep) = episode_num {
+            input.push_str(&format!(
+                "\n\n検索時には、作品名に加えて「第{}集」「第{}話」「episode {}」「分集剧情」「剧情介绍」などの話数関連語も考慮してください。",
+                ep, ep, ep
+            ));
+        }
+
+        // Rules
+        input.push_str("\n\n\
+            - 作品名を確認・出力しない。drama_title や notes, summary, explanation などのトップレベル項目は禁止する。\n\
+            - 返答JSONのトップレベルは必ず {\"terms\": [...]} のみにする。terms 以外のキーは一切含めないこと。\n\
+            - terms 配列には、入力した source_text と同じ件数・同じ順序で返す。\n\
+            - 推論で漢字候補を作らない。\n\
+            - 英語字幕表記 source_text はソース由来なので、誤字・聞き間違いとは仮定しない。\n\
+            - Web検索結果、配信元ページ、あらすじ、人物関係解説などに直接出ている漢字表記だけを採用する。\n\
+            - 検索結果に明確な漢字表記が見つからない場合は、candidate_zh / candidate_ja を空にし、status を \"not_found\" にする。\n\
+            - 候補が検索結果に直接確認できず、文脈推定にすぎない場合は、status を \"uncertain\"、confidence を \"low\" にする。\n\
+            - 根拠なしに中国語らしい漢字を生成しない。\n\
+            - status は \"found\" | \"uncertain\" | \"not_found\" のみを使う。\n\
+            - confidence は \"high\" | \"medium\" | \"low\" のみを使う。\n\
+            - evidence には、根拠ページの title, url, quote または短い要約を入れる。\n\
+            - 根拠ページに直接出ている表記だけを candidate_zh / candidate_ja に入れる。\n\
+            - search_aliases は検索補助語です。返答JSONの source_text には必ず元の入力表記を使ってください。\n\
+              例: Zhenhuang で検索して候補を見つけた場合でも、source_text は \"Zhenhuang City\" のままにする。\n\
+            - search_aliases が一般語すぎる場合（例: \"Moon\", \"Great\", \"Black\"）、\n\
+              中文タイトルと同時に検索しても作品関連の根拠が確認できない限り採用しない。\n\
+            - Markdownリンク [text](url) は絶対に使わない。URLはJSON文字列として直接書く。");
+
+        // Context memo (optional)
+        if let Some(ref ctx) = short_context {
+            if !ctx.is_empty() {
+                input.push_str("\n\n参考文脈（作品世界を理解するための補助情報です。未確認語の候補を作る根拠にはしないでください。candidate_zh は必ずWeb上で直接確認できる表記だけにしてください）:");
+                input.push_str(&format!("\n{}", ctx));
+            }
+        }
+
+        input.push_str("\n\nJSONのみで返してください。");
+
+        emit_log(&app, "debug", "SRT", &format!(
+            "OpenAI Responses API: model={} endpoint=https://api.openai.com/v1/responses temperature=omitted json_mode=omitted web_search=on",
+            &model
+        ));
+
+        let request_body = serde_json::json!({
+            "model": &model,
+            "instructions": instructions,
+            "input": &input,
+            "tools": [{"type": "web_search"}]
+        });
+
+        match send_openai_responses_with_retry(&app, &api_key, &request_body).await {
+            Ok(response) => {
+                let body: serde_json::Value = match response.json().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let msg = format!("Failed to parse OpenAI response for chunk {}/{}: {}", chunk_num, total_chunks, e);
+                        emit_log(&app, "error", "SRT", &msg);
+                        chunk_failures.extend(chunk_terms.iter().map(|s| format!("{} (parse)", s)));
+                        continue;
+                    }
+                };
+
+                let (text, evidence_items, evidence_urls) =
+                    match extract_response_text_and_annotations(&body) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            emit_log(&app, "error", "SRT", &format!(
+                                "Failed to extract text from batch response: {}", e));
+                            chunk_failures.extend(chunk_terms.iter().map(|s| format!("{} (extract)", s)));
+                            continue;
+                        }
+                    };
+
+                emit_log(&app, "debug", "SRT", &format!(
+                    "OpenAI annotations (chunk {}): {} url_citations", chunk_num, evidence_urls.len()));
+
+                let cleaned = extract_json(text);
+                // Robust parse: try strict BatchTermsResponse first; if missing "terms",
+                // extract it from any JSON object (model may add drama_title etc.)
+                let terms_array: Vec<BatchTermResult> = match serde_json::from_str::<BatchTermsResponse>(cleaned) {
+                    Ok(batch) => batch.terms,
+                    Err(e) => {
+                        emit_log(&app, "warn", "SRT", &format!(
+                            "BatchTermsResponse strict parse failed, trying generic extraction: {} | raw preview: {}",
+                            e, preview_chars(text, 300)
+                        ));
+                        // Try to extract from raw JSON value (handles extra top-level keys like drama_title)
+                        match serde_json::from_str::<serde_json::Value>(cleaned) {
+                            Ok(v) => {
+                                if let Some(arr) = v.get("terms").and_then(|t| t.as_array()).cloned() {
+                                    serde_json::from_value::<Vec<BatchTermResult>>(serde_json::Value::Array(arr))
+                                        .unwrap_or_else(|e2| {
+                                            emit_log(&app, "error", "SRT", &format!(
+                                                "terms array parse also failed: {}", e2));
+                                            vec![]
+                                        })
+                                } else if let Some(arr) = v.get("results").and_then(|r| r.as_array()).cloned() {
+                                    serde_json::from_value::<Vec<BatchTermResult>>(serde_json::Value::Array(arr))
+                                        .unwrap_or_else(|e2| {
+                                            emit_log(&app, "error", "SRT", &format!(
+                                                "results array parse also failed: {}", e2));
+                                            vec![]
+                                        })
+                                } else {
+                                    emit_log(&app, "error", "SRT", "No 'terms' or 'results' array in batch response");
+                                    vec![]
+                                }
+                            }
+                            Err(e2) => {
+                                emit_log(&app, "error", "SRT", &format!(
+                                    "Generic JSON parse also failed: {}", e2));
+                                vec![]
+                            }
+                        }
+                    }
+                };
+
+                if terms_array.is_empty() {
+                    emit_log(&app, "warn", "SRT", &format!(
+                        "Batch chunk {}/{}: got 0 terms after parse, marking all as failures",
+                        chunk_num, total_chunks
+                    ));
+                    chunk_failures.extend(chunk_terms.iter().map(|s| format!("{} (empty)", s)));
+                } else {
+                    // Process term results
+                    let batch = BatchTermsResponse { terms: terms_array };
+                    {
+                        for input_term in chunk.iter() {
+                            let matched = batch.terms.iter().find(|r| r.source_text == input_term.source_text);
+                            if let Some(r) = matched {
+                                let status = if r.status.is_empty() { "not_found".to_string() } else { r.status.clone() };
+                                let mut term_evidence: Vec<EvidenceItem> = r.evidence.clone();
+                                let mut term_urls: Vec<String> = r.evidence.iter().map(|e| e.url.clone()).collect();
+                                for url in &evidence_urls {
+                                    if !term_urls.contains(url) { term_urls.push(url.clone()); }
+                                }
+                                for ev in &evidence_items {
+                                    if !term_evidence.iter().any(|e| e.url == ev.url) {
+                                        term_evidence.push(ev.clone());
+                                    }
+                                }
+                                emit_log(&app, "info", "SRT", &format!(
+                                    "AI確認候補: {} → {} confidence={} status={}",
+                                    r.source_text,
+                                    r.candidate_zh.as_deref().unwrap_or("なし"),
+                                    r.confidence,
+                                    status
+                                ));
+                                all_results.push(WebTermResolution {
+                                    source_text: input_term.source_text.clone(),
+                                    surface_ja: input_term.surface_ja.clone(),
+                                    candidate_zh: r.candidate_zh.clone(),
+                                    candidate_ja: r.candidate_ja.clone(),
+                                    confidence: if r.confidence.is_empty() { "low".to_string() } else { r.confidence.clone() },
+                                    evidence_summary: r.reason.clone(),
+                                    evidence_urls: term_urls,
+                                    status,
+                                    source: Some("openai".into()),
+                                    alternatives: if r.alternatives.is_empty() { None } else { Some(r.alternatives.clone()) },
+                                    evidence: if term_evidence.is_empty() { None } else { Some(term_evidence) },
+                                    reason: if r.reason.is_empty() { None } else { Some(r.reason.clone()) },
+                                });
+                            } else {
+                                emit_log(&app, "warn", "SRT", &format!(
+                                    "AI確認: no match for {} in batch chunk {}",
+                                    input_term.source_text, chunk_num
+                                ));
+                                all_results.push(WebTermResolution {
+                                    source_text: input_term.source_text.clone(),
+                                    surface_ja: input_term.surface_ja.clone(),
+                                    candidate_zh: None,
+                                    candidate_ja: None,
+                                    confidence: "none".to_string(),
+                                    evidence_summary: "バッチ応答に対応する結果がありませんでした。".to_string(),
+                                    evidence_urls: vec![],
+                                    status: "not_found".to_string(),
+                                    source: Some("openai".into()),
+                                    alternatives: None,
+                                    evidence: None,
+                                    reason: None,
+                                });
+                            }
+                        }
+                    } // end term processing
+                } // end if terms_array non-empty
+            }
+            Err(e) => {
+                emit_log(&app, "error", "SRT", &format!(
+                    "Batch chunk {}/{} failed: {}", chunk_num, total_chunks, e
+                ));
+                chunk_failures.extend(chunk_terms.iter().map(|s| format!("{} (http)", s)));
+            }
+        }
+
+        // Wait 1.5s between chunks to avoid rate limiting
+        if chunk_idx + 1 < total_chunks {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         }
     }
 
-    input.push_str("\n\nJSONのみで返してください。");
-
-    // Debug: emit prompt preview (first 800 chars) for manual inspection
-    emit_log(&app, "debug", "SRT", &format!(
-        "OpenAI prompt preview: {}",
-        preview_chars(&input, 800)
-    ));
-
-    let request_body = serde_json::json!({
-        "model": &model,
-        "instructions": instructions,
-        "input": &input,
-        "tools": [{"type": "web_search"}],
-        "temperature": 0.0,
-        "text": {"format": {"type": "json_object"}}
-    });
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post("https://api.openai.com/v1/responses")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("OpenAI network error: {}", e))?;
-
-    let status_code = response.status();
-    if !status_code.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error ({}): {}", status_code.as_u16(), body));
+    if !chunk_failures.is_empty() {
+        emit_log(&app, "warn", "SRT", &format!(
+            "一括AI確認: {}件のバッチが失敗しました: {}",
+            chunk_failures.len(),
+            chunk_failures.join(", ")
+        ));
     }
 
-    let body: serde_json::Value = response.json().await
-        .map_err(|e| format!("Failed to parse OpenAI response: {}", e))?;
-
-    let (text, all_evidence_items, all_evidence_urls) =
-        extract_response_text_and_annotations(&body)?;
-
-    emit_log(&app, "debug", "SRT", &format!(
-        "OpenAI annotations: {} url_citations", all_evidence_urls.len()));
-    for ev in &all_evidence_items {
-        emit_log(&app, "debug", "SRT", &format!(
-            "OpenAI evidence URL: {} ({})", ev.url, ev.title));
-    }
-
-    // Parse batch response
-    let cleaned = extract_json(text);
-    let batch: BatchTermsResponse = serde_json::from_str(cleaned)
-        .map_err(|e| format!("Failed to parse batch response: {} (raw: {})", e, preview_chars(&text, 300)))?;
-
-    // Map results back to input terms by source_text match
-    let results: Vec<WebTermResolution> = terms
-        .iter()
-        .map(|input_term| {
-            let matched = batch.terms.iter().find(|r| r.source_text == input_term.source_text);
-
-            if let Some(r) = matched {
-                let status = if r.status.is_empty() { "not_found".to_string() } else { r.status.clone() };
-
-                // Merge JSON-level evidence + annotation URL citations (union)
-                let mut term_evidence: Vec<EvidenceItem> = r.evidence.clone();
-                let mut term_urls: Vec<String> = r.evidence.iter()
-                    .map(|e| e.url.clone()).collect();
-                for url in &all_evidence_urls {
-                    if !term_urls.contains(url) {
-                        term_urls.push(url.clone());
-                    }
-                }
-                for ev in &all_evidence_items {
-                    if !term_evidence.iter().any(|e| e.url == ev.url) {
-                        term_evidence.push(ev.clone());
-                    }
-                }
-
-                emit_log(&app, "info", "SRT", &format!(
-                    "AI確認候補: {} → {} confidence={} status={}",
-                    r.source_text,
-                    r.candidate_zh.as_deref().unwrap_or("なし"),
-                    r.confidence,
-                    status
-                ));
-
-                if !r.evidence.is_empty() {
-                    for ev in &r.evidence {
-                        emit_log(&app, "debug", "SRT", &format!(
-                            "AI確認 evidence: {} → {} ({})",
-                            r.source_text, ev.url, ev.title
-                        ));
-                    }
-                }
-
-                WebTermResolution {
-                    source_text: input_term.source_text.clone(),
-                    surface_ja: input_term.surface_ja.clone(),
-                    candidate_zh: r.candidate_zh.clone(),
-                    candidate_ja: r.candidate_ja.clone(),
-                    confidence: if r.confidence.is_empty() { "low".to_string() } else { r.confidence.clone() },
-                    evidence_summary: r.reason.clone(),
-                    evidence_urls: term_urls,
-                    status,
-                    source: Some("openai".into()),
-                    alternatives: if r.alternatives.is_empty() { None } else { Some(r.alternatives.clone()) },
-                    evidence: if term_evidence.is_empty() { None } else { Some(term_evidence) },
-                    reason: if r.reason.is_empty() { None } else { Some(r.reason.clone()) },
-                }
-            } else {
-                emit_log(&app, "warn", "SRT", &format!(
-                    "AI確認: no match for {} in batch response",
-                    input_term.source_text
-                ));
-
-                WebTermResolution {
-                    source_text: input_term.source_text.clone(),
-                    surface_ja: input_term.surface_ja.clone(),
-                    candidate_zh: None,
-                    candidate_ja: None,
-                    confidence: "none".to_string(),
-                    evidence_summary: "バッチ応答に対応する結果がありませんでした。".to_string(),
-                    evidence_urls: vec![],
-                    status: "not_found".to_string(),
-                    source: Some("openai".into()),
-                    alternatives: None,
-                    evidence: None,
-                    reason: None,
-                }
-            }
-        })
-        .collect();
-
-    let resolved_count = results.iter().filter(|r| r.status == "found" || r.status == "candidate_found").count();
+    let resolved_count = all_results.iter().filter(|r| r.status == "found" || r.status == "candidate_found").count();
     if let Some(ep) = episode_num {
         emit_log(&app, "success", "SRT", &format!(
-            "一括AI確認完了: episode={}, {}/{} terms resolved",
-            ep, resolved_count, results.len()
+            "一括AI確認完了: episode={}, {}/{} terms resolved ({} chunks)",
+            ep, resolved_count, all_results.len(), total_chunks
         ));
     } else {
         emit_log(&app, "success", "SRT", &format!(
-            "一括AI確認完了: {}/{} terms resolved",
-            resolved_count, results.len()
+            "一括AI確認完了: {}/{} terms resolved ({} chunks)",
+            resolved_count, all_results.len(), total_chunks
         ));
     }
 
-    Ok(results)
+    Ok(all_results)
 }
 
 #[cfg(test)]
@@ -2655,6 +3158,10 @@ mod tests {
             source: Some("synopsis".to_string()),
             occurrence_count: 0,
             alias_candidate: None,
+            search_text: None,
+            generic_suffix: None,
+            aliases: None,
+            confirmed_surface: None,
         }
     }
 
@@ -2792,6 +3299,10 @@ mod tests {
             source: Some("synopsis".to_string()),
             occurrence_count: 0,
             alias_candidate: None,
+            search_text: None,
+            generic_suffix: None,
+            aliases: None,
+            confirmed_surface: None,
         }
     }
 
@@ -2878,5 +3389,253 @@ mod tests {
         ];
         validate_term_variants(&mut groups);
         assert_eq!(groups.len(), 1, "Different display strings with same dedup key should be kept");
+    }
+
+    // ---- generate_search_aliases tests ----
+
+    #[test]
+    fn test_generate_search_aliases_city_suffix() {
+        let (search_text, generic_suffix, aliases) = generate_search_aliases("Zhenhuang City");
+        assert_eq!(search_text, Some("Zhenhuang".to_string()));
+        assert_eq!(generic_suffix, Some("City".to_string()));
+        assert_eq!(aliases, Some(vec!["Zhenhuang City".to_string(), "Zhenhuang".to_string()]));
+    }
+
+    #[test]
+    fn test_generate_search_aliases_generic_word_rejected() {
+        // "Moon" is a generic English word → no aliases generated
+        let (search_text, generic_suffix, aliases) = generate_search_aliases("Moon Guards");
+        assert_eq!(search_text, None);
+        assert_eq!(generic_suffix, None);
+        assert_eq!(aliases, None);
+    }
+
+    #[test]
+    fn test_generate_search_aliases_multiword_passes() {
+        // "Black Eagle" is two words → passes filter
+        let (search_text, generic_suffix, aliases) = generate_search_aliases("Black Eagle Army");
+        assert_eq!(search_text, Some("Black Eagle".to_string()));
+        assert_eq!(generic_suffix, Some("Army".to_string()));
+        assert_eq!(aliases, Some(vec!["Black Eagle Army".to_string(), "Black Eagle".to_string()]));
+    }
+
+    #[test]
+    fn test_generate_search_aliases_snow_region_passes() {
+        // "Snow Region" is two words → passes filter
+        let (search_text, generic_suffix, aliases) = generate_search_aliases("Snow Region Tribe");
+        assert_eq!(search_text, Some("Snow Region".to_string()));
+        assert_eq!(generic_suffix, Some("Tribe".to_string()));
+        assert_eq!(aliases, Some(vec!["Snow Region Tribe".to_string(), "Snow Region".to_string()]));
+    }
+
+    #[test]
+    fn test_generate_search_aliases_lake_suffix() {
+        let (search_text, generic_suffix, aliases) = generate_search_aliases("Qianzhang Lake");
+        assert_eq!(search_text, Some("Qianzhang".to_string()));
+        assert_eq!(generic_suffix, Some("Lake".to_string()));
+        assert_eq!(aliases, Some(vec!["Qianzhang Lake".to_string(), "Qianzhang".to_string()]));
+    }
+
+    // ---- sanitize_search_aliases tests ----
+
+    #[test]
+    fn test_sanitize_aliases_removes_generic_single_word() {
+        // "Moon" is generic → removed; only "Moon Guards" remains → returned empty
+        let input = vec!["Moon Guards".to_string(), "Moon".to_string()];
+        let result = sanitize_search_aliases(&input);
+        assert_eq!(result, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_sanitize_aliases_keeps_useful() {
+        // "Zhenhuang" is NOT generic → kept with full source_text
+        let input = vec!["Zhenhuang City".to_string(), "Zhenhuang".to_string()];
+        let result = sanitize_search_aliases(&input);
+        assert_eq!(result, vec!["Zhenhuang City".to_string(), "Zhenhuang".to_string()]);
+    }
+
+    #[test]
+    fn test_sanitize_aliases_empty_returns_empty() {
+        let result = sanitize_search_aliases(&[]);
+        assert_eq!(result, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_sanitize_aliases_multiword_generic_component_passes() {
+        // "Black Eagle" is two words → passes even though "Black" alone is generic
+        let input = vec!["Black Eagle Army".to_string(), "Black Eagle".to_string()];
+        let result = sanitize_search_aliases(&input);
+        assert_eq!(result, vec!["Black Eagle Army".to_string(), "Black Eagle".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Dictionary replacement tests
+    // -----------------------------------------------------------------------
+
+    fn make_glossary_full(src: &str, tgt: &str, aliases: Vec<&str>) -> GlossaryEntry {
+        GlossaryEntry {
+            source: src.to_string(),
+            target: tgt.to_string(),
+            entry_type: "proper_noun".to_string(),
+            notes: None,
+            aliases: aliases.into_iter().map(|s| s.to_string()).collect(),
+            status: None,
+            confidence: None,
+            evidence_urls: None,
+        }
+    }
+
+    fn make_character(en: &str, jp: &str, aliases: Vec<&str>) -> Character {
+        Character {
+            id: "test".to_string(),
+            english_name: en.to_string(),
+            chinese_name: None,
+            japanese_name: jp.to_string(),
+            aliases: aliases.into_iter().map(|s| s.to_string()).collect(),
+            role: None,
+            status: None,
+            gender: None,
+            default_register: "neutral".to_string(),
+            speech_style: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn test_glossary_alias_replacement() {
+        let glossary = vec![
+            make_glossary_full("Ka Tuo", "卡托", vec!["カトウ"]),
+        ];
+        let input = "カトウが金暉部落を扇動する";
+        let expected = "卡托が金暉部落を扇動する";
+        assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
+    }
+
+    #[test]
+    fn test_romanized_source_generates_katakana_key() {
+        // No stored aliases — must generate from source "Ka Tuo" → "カトウ"
+        let glossary = vec![
+            make_glossary_full("Ka Tuo", "卡托", vec![]),
+        ];
+        let input = "カトウが金暉部落を扇動する";
+        let expected = "卡托が金暉部落を扇動する";
+        assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
+    }
+
+    #[test]
+    fn test_longest_match_first() {
+        let glossary = vec![
+            make_glossary_full("Jinhui Tribe", "金暉部落", vec!["ジンフイ部族"]),
+            make_glossary_full("Jinhui", "金暉", vec!["ジンフイ"]),
+        ];
+        let input = "ジンフイ部族の戦士";
+        // "ジンフイ部族" (longer) must match before "ジンフイ" (shorter)
+        let expected = "金暉部落の戦士";
+        assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
+    }
+
+    #[test]
+    fn test_multiple_replacements_in_text() {
+        let glossary = vec![
+            make_glossary_full("Ka Tuo", "卡托", vec!["カトウ"]),
+            make_glossary_full("Jinhui Tribe", "金暉部落", vec!["ジンフイ部族"]),
+            make_glossary_full("Black Eagle Army", "黒鷹軍", vec!["ブラックイーグル軍"]),
+        ];
+        let input = "カトウが金暉部落を扇動して反乱を起こす。ブラックイーグル軍が到着する。";
+        let expected = "卡托が金暉部落を扇動して反乱を起こす。黒鷹軍が到着する。";
+        assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
+    }
+
+    #[test]
+    fn test_source_text_direct_replacement() {
+        let glossary = vec![
+            make_glossary_full("Jinhui Tribe", "金暉部落", vec![]),
+        ];
+        // Direct English source match
+        let input = "Jinhui Tribe warriors arrived.";
+        let expected = "金暉部落 warriors arrived.";
+        assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
+    }
+
+    #[test]
+    fn test_character_alias_replacement() {
+        let characters = vec![
+            make_character("Chu Qiao", "楚喬", vec!["チュウチャオ"]),
+        ];
+        let input = "チュウチャオが戦う";
+        let expected = "楚喬が戦う";
+        assert_eq!(resolve_known_terms_in_text(input, &characters, &[]), expected);
+    }
+
+    #[test]
+    fn test_character_english_name_variant() {
+        // Qiao Qiao → 楚喬 via explicit character alias (e.g. from ChatGPT確認 or buildRoleAliases)
+        let chars_with_alias = vec![
+            make_character("Chu Qiao", "楚喬", vec!["Qiao Qiao", "QiaoQiao", "Qiao_Qiao"]),
+        ];
+        let input = "Qiao Qiaoが李策に火荼水の出所を問う";
+        let expected = "楚喬が李策に火荼水の出所を問う";
+        assert_eq!(resolve_known_terms_in_text(input, &chars_with_alias, &[]), expected);
+
+        // Also works via glossary entry
+        let glossary = vec![
+            make_glossary_full("Qiao Qiao", "楚喬", vec![]),
+        ];
+        assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
+    }
+
+    #[test]
+    fn test_qiao_qiao_generated_alias_replacement() {
+        // "Qiao Qiao" alias auto-generated from 2-token English name "Chu Qiao" in buildRoleAliases.
+        // No explicit Qiao Qiao alias stored — the replacement map generates it from
+        // English name variants (source 2b: space-stripped "ChuQiao", underscored "Chu_Qiao")
+        // plus the repeated-given-name variants "Qiao Qiao"/"QiaoQiao"/"Qiao_Qiao" in aliases.
+        let characters = vec![
+            make_character("Chu Qiao", "楚喬", vec!["Qiao Qiao", "QiaoQiao", "Qiao_Qiao"]),
+        ];
+        let input = "Qiao Qiaoが李策に火荼水の出所を問う";
+        let expected = "楚喬が李策に火荼水の出所を問う";
+        assert_eq!(resolve_known_terms_in_text(input, &characters, &[]), expected);
+
+        // QiaoQiao (space-stripped) also works
+        let input_no_space = "QiaoQiaoが李策に火荼水の出所を問う";
+        let expected_no_space = "楚喬が李策に火荼水の出所を問う";
+        assert_eq!(resolve_known_terms_in_text(input_no_space, &characters, &[]), expected_no_space);
+
+        // Qiao_Qiao (underscored) also works
+        let input_under = "Qiao_Qiaoが李策に火荼水の出所を問う";
+        let expected_under = "楚喬が李策に火荼水の出所を問う";
+        assert_eq!(resolve_known_terms_in_text(input_under, &characters, &[]), expected_under);
+    }
+
+    #[test]
+    fn test_romanized_to_katakana_ka_tuo() {
+        let candidates = romanized_to_katakana_candidates("Ka Tuo");
+        assert!(candidates.contains(&"カトウ".to_string()));
+        assert!(candidates.contains(&"カ・トウ".to_string()));
+    }
+
+    #[test]
+    fn test_romanized_to_katakana_song_cheng() {
+        let candidates = romanized_to_katakana_candidates("Song Cheng");
+        assert!(candidates.contains(&"ソンチェン".to_string()));
+    }
+
+    #[test]
+    fn test_romanized_to_katakana_jinhui() {
+        let candidates = romanized_to_katakana_candidates("Jinhui");
+        assert!(candidates.contains(&"ジンフイ".to_string()));
+    }
+
+    #[test]
+    fn test_romanized_to_katakana_cheng_yuan() {
+        let candidates = romanized_to_katakana_candidates("Cheng Yuan");
+        assert!(candidates.contains(&"チェンユエン".to_string()));
+    }
+
+    #[test]
+    fn test_romanized_to_katakana_chun_er() {
+        let candidates = romanized_to_katakana_candidates("Chun Er");
+        assert!(candidates.contains(&"チュンアル".to_string()));
     }
 }

@@ -362,6 +362,7 @@ export const resolveUnresolvedTermsBatchOpenai = (params: {
   drama_title_ja: string;
   drama_title_zh?: string | null;
   drama_title_en?: string | null;
+  folder_label?: string | null;
   short_context?: string | null;
   srt_filename?: string | null;
 }) => invoke<WebTermResolution[]>("resolve_unresolved_terms_batch_openai", {
@@ -369,6 +370,7 @@ export const resolveUnresolvedTermsBatchOpenai = (params: {
   dramaTitleJa: params.drama_title_ja,
   dramaTitleZh: params.drama_title_zh ?? null,
   dramaTitleEn: params.drama_title_en ?? null,
+  folderLabel: params.folder_label ?? null,
   shortContext: params.short_context ?? null,
   srtFilename: params.srt_filename ?? null,
 });

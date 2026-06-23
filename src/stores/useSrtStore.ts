@@ -55,6 +55,7 @@ interface SrtState {
   // Web term resolution actions
   setTermWebResult: (path: string, sourceText: string, result: WebTermResolution) => void;
   adoptTerm: (path: string, sourceText: string) => void;
+  batchAdoptTerms: (path: string, items: { sourceText: string; entry: GlossaryEntry; surfaceJa?: string; confirmedSurface?: string }[]) => void;
   removeUnresolvedTerm: (path: string, sourceText: string) => void;
   setTermLoading: (path: string, sourceText: string, loading: boolean) => void;
   setBatchTermLoading: (path: string, loading: boolean) => void;
@@ -165,7 +166,13 @@ export const useSrtStore = create<SrtState>((set) => ({
           ? {
               ...f,
               unresolvedTerms: f.unresolvedTerms.map((t) =>
-                t.source_text === sourceText ? { ...t, webResult: result } : t,
+                t.source_text === sourceText
+                  ? {
+                      ...t,
+                      webResult: result,
+                      confirmed_surface: result.candidate_ja || result.candidate_zh || t.surface_ja || undefined,
+                    }
+                  : t,
               ),
             }
           : f,
@@ -190,6 +197,42 @@ export const useSrtStore = create<SrtState>((set) => ({
             t.source_text === sourceText ? { ...t, adopted: true } : t,
           ),
           adoptedTerms: [...f.adoptedTerms, adopted],
+        };
+      }),
+    })),
+
+  batchAdoptTerms: (path, items) =>
+    set((state) => ({
+      files: state.files.map((f) => {
+        if (f.path !== path) return f;
+        const textSet = new Set(items.map((it) => it.sourceText));
+        const existingSources = new Set(f.adoptedTerms.map((a) => a.source));
+        const newEntries = items
+          .filter((it) => !existingSources.has(it.sourceText))
+          .map((it) => it.entry);
+        // Build lookup for optional field updates
+        const fieldUpdates = new Map<string, { surfaceJa?: string; confirmedSurface?: string }>();
+        for (const it of items) {
+          if (it.surfaceJa !== undefined || it.confirmedSurface !== undefined) {
+            fieldUpdates.set(it.sourceText, { surfaceJa: it.surfaceJa, confirmedSurface: it.confirmedSurface });
+          }
+        }
+        return {
+          ...f,
+          unresolvedTerms: f.unresolvedTerms.map((t) => {
+            if (!textSet.has(t.source_text)) return t;
+            const updates = fieldUpdates.get(t.source_text);
+            if (updates) {
+              return {
+                ...t,
+                adopted: true,
+                ...(updates.surfaceJa !== undefined ? { surface_ja: updates.surfaceJa } : {}),
+                ...(updates.confirmedSurface !== undefined ? { confirmed_surface: updates.confirmedSurface } : {}),
+              };
+            }
+            return { ...t, adopted: true };
+          }),
+          adoptedTerms: [...f.adoptedTerms, ...newEntries],
         };
       }),
     })),
@@ -229,7 +272,13 @@ export const useSrtStore = create<SrtState>((set) => ({
           batchTermLoading: false,
           unresolvedTerms: f.unresolvedTerms.map((t) => {
             const r = resultMap.get(t.source_text);
-            return r ? { ...t, webResult: r } : t;
+            if (!r) return t;
+            return {
+              ...t,
+              webResult: r,
+              // Also derive and save confirmed_surface from the paste result
+              confirmed_surface: r.candidate_ja || r.candidate_zh || t.surface_ja || undefined,
+            };
           }),
         };
       }),

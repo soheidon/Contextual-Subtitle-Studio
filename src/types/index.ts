@@ -418,10 +418,14 @@ export interface WebTermResolution {
   evidence_summary: string;
   evidence_urls: string[];
   status: "candidate_found" | "not_found" | "error" | "found" | "uncertain";
-  source?: "web" | "gemini" | "openai";
+  source?: "web" | "gemini" | "openai" | "chatgpt";
   alternatives?: string[];
   evidence?: EvidenceItem[];
   reason?: string;
+  evidence_strength?: "direct" | "indirect" | "none";
+  match_judgment?: "exact" | "probable" | "weak" | "not_found";
+  needs_human_review?: boolean;
+  confidence_reason?: string;
 }
 
 export interface EvidenceItem {
@@ -433,6 +437,7 @@ export interface EvidenceItem {
 export interface BatchTermRequest {
   source_text: string;
   surface_ja: string;
+  aliases?: string[];
 }
 
 export interface UnresolvedTerm {
@@ -446,6 +451,10 @@ export interface UnresolvedTerm {
   source?: string;           // "synopsis" | "srt_body" | "srt_body+synopsis"
   occurrence_count?: number;
   alias_candidate?: boolean; // true when the term looks like a character alias (e.g. "Qiao Qiao")
+  search_text?: string;      // source_text with generic suffix stripped for search (e.g. "Zhenhuang" from "Zhenhuang City")
+  generic_suffix?: string;   // detected generic English suffix (e.g. "City", "River")
+  aliases?: string[];        // search aliases: [full_source_text, search_text, ...] (deduplicated)
+  confirmed_surface?: string; // confirmed kanji notation for glossary output
 }
 
 export interface SrtSynopsisResult {
