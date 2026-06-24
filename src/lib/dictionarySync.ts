@@ -56,7 +56,7 @@ const ROMAJI_MAP: [string, string][] = [
   ["pa","パ"],["pi","ピ"],["pu","プ"],["pe","ペ"],["po","ポ"],
   ["ka","カ"],["ki","キ"],["ku","ク"],["ke","ケ"],["ko","コ"],
   ["sa","サ"],["shi","シ"],["su","ス"],["se","セ"],["so","ソ"],
-  ["ta","タ"],["chi","チ"],["tsu","ツ"],["te","テ"],["to","ト"],
+  ["ta","タ"],["chi","チ"],["tu","トゥ"],["tsu","ツ"],["te","テ"],["to","ト"],
   ["na","ナ"],["ni","ニ"],["nu","ヌ"],["ne","ネ"],["no","ノ"],
   ["ha","ハ"],["hi","ヒ"],["fu","フ"],["he","ヘ"],["ho","ホ"],
   ["ma","マ"],["mi","ミ"],["mu","ム"],["me","メ"],["mo","モ"],
@@ -99,6 +99,44 @@ function romanizedToKatakanaCandidates(source: string): string[] {
     const dotForm = words.map((w) => romanizeWord(w)).filter(Boolean);
     if (dotForm.length === words.length) {
       candidates.push(dotForm.join("・"));
+    }
+  }
+
+  // Pass C: alt mapping without "tuo"→"トウ", so "tu"→"トゥ" + "o"→"オ" produces トゥオ variants
+  if (source.toLowerCase().includes("tuo")) {
+    const altMap: [string, string][] = ROMAJI_MAP.filter(([pat]) => pat !== "tuo");
+    function romanizeWithMap(word: string, map: [string, string][]): string {
+      const lower = word.toLowerCase();
+      let result = "";
+      let pos = 0;
+      while (pos < lower.length) {
+        let matched = false;
+        for (let len = Math.min(6, lower.length - pos); len >= 1; len--) {
+          const slice = lower.slice(pos, pos + len);
+          const entry = map.find(([pat]) => pat === slice);
+          if (entry) {
+            result += entry[1];
+            pos += len;
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) pos++;
+      }
+      return result;
+    }
+    const concatAlt = romanizeWithMap(stripped, altMap);
+    if (concatAlt && concatAlt !== candidates[0]) {
+      candidates.push(concatAlt);
+    }
+    if (words.length >= 2) {
+      const dotAlt = words.map((w) => romanizeWithMap(w, altMap)).filter(Boolean);
+      if (dotAlt.length === words.length) {
+        const dotAltStr = dotAlt.join("・");
+        if (candidates.length < 2 || dotAltStr !== candidates[1]) {
+          candidates.push(dotAltStr);
+        }
+      }
     }
   }
 

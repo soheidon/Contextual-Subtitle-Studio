@@ -462,6 +462,7 @@ code {
 .badge-mdl { background-color: #3b82f6; }
 .badge-tvmao { background-color: #f59e0b; }
 .badge-daddicts { background-color: #8b5cf6; }
+.badge-zh { background-color: #dc2626; color: #fff; padding: 1px 5px; border-radius: 3px; font-size: 10px; font-weight: 700; }
 
 /* JaKanji source badges */
 .badge-pending { background: #fff8e1; color: #f57f17; padding: 0 4px; border-radius: 3px; font-size: 9px; }

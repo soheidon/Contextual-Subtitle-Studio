@@ -124,8 +124,8 @@ export const listEnvVars = () =>
   invoke<EnvVarInfo[]>("list_env_vars");
 
 // Translation
-export const startTranslation = (translationConfig: TranslationConfig) =>
-  invoke<TranslationResult>("start_translation", { translationConfig });
+export const startTranslation = (entries: SubtitleEntry[], translationConfig: TranslationConfig) =>
+  invoke<TranslationResult>("start_translation", { entries, translationConfig });
 
 export const cancelTranslation = () =>
   invoke<void>("cancel_translation");
@@ -325,8 +325,8 @@ export const analyzeSceneContext = (
 export const saveSrtAnalysis = (analysis: SrtAnalysisFile) =>
   invoke<void>("save_srt_analysis", { analysis });
 
-export const loadSrtAnalyses = (srtPaths: string[]) =>
-  invoke<SrtAnalysisFile[]>("load_srt_analyses", { srtPaths });
+export const loadSrtAnalyses = (srtPaths: string[], baseDir?: string) =>
+  invoke<SrtAnalysisFile[]>("load_srt_analyses", { srtPaths, baseDir });
 
 export const resolveSynopsisKatakana = (synopsisJa: string, unresolvedTerms: UnresolvedTerm[]) =>
   invoke<KatakanaKanjiMap[]>("resolve_synopsis_katakana", { synopsisJa, unresolvedTerms });
@@ -374,6 +374,9 @@ export const resolveUnresolvedTermsBatchOpenai = (params: {
   shortContext: params.short_context ?? null,
   srtFilename: params.srt_filename ?? null,
 });
+
+export const disambiguateZhContext = (requests: Array<{ source_text: string; zh_context: string }>) =>
+  invoke<Array<{ source_text: string; selected: string; extracted?: string | null }>>("disambiguate_zh_context", { requests });
 
 export const testOpenaiAiConfirm = () =>
   invoke<boolean>("test_openai_ai_confirm");

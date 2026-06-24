@@ -1,15 +1,16 @@
-import { useState } from "react";
-import { Play, Download } from "lucide-react";
+import { useState, useEffect, useRef } from "react";
+import { Play } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
 import { useSrtStore } from "../../stores/useSrtStore";
 import { useDictionaryStore } from "../../stores/useDictionaryStore";
 import { useLlmStore } from "../../stores/useLlmStore";
 import { useTranslationStore } from "../../stores/useTranslationStore";
 import { startTranslation, saveSrtFile } from "../../lib/tauri";
-import type { TranslationConfig } from "../../types";
+import type { TranslationConfig, TranslationProgress } from "../../types";
 import { useNavigate } from "react-router-dom";
 
 export default function TranslatePanel() {
-  const { entries: srtEntries, isLoaded: srtLoaded } = useSrtStore();
+  const { entries: srtEntries, isLoaded: srtLoaded, filePath } = useSrtStore();
   const { characters, glossary } = useDictionaryStore();
   const { active } = useLlmStore();
   const {
@@ -18,6 +19,7 @@ export default function TranslatePanel() {
     totalChunks,
     isRunning,
     issues,
+    detail,
     setProgress,
     setRunning,
     setIssues,
@@ -25,7 +27,34 @@ export default function TranslatePanel() {
   const navigate = useNavigate();
 
   const [error, setError] = useState<string | null>(null);
-  const [exporting, setExporting] = useState(false);
+  const [savedPath, setSavedPath] = useState<string | null>(null);
+
+  const unlistenRef = useRef<(() => void) | null>(null);
+
+  // Listen for translation-progress events from Rust
+  useEffect(() => {
+    if (!isRunning) {
+      if (unlistenRef.current) {
+        unlistenRef.current();
+        unlistenRef.current = null;
+      }
+      return;
+    }
+    (async () => {
+      unlistenRef.current = await listen<TranslationProgress>("translation-progress", (event) => {
+        const { current_entry_count, total_entry_count, detail } = event.payload;
+        const pct = total_entry_count > 0 ? (current_entry_count / total_entry_count) * 100 : 0;
+        useTranslationStore.getState().setProgress(pct, current_entry_count, total_entry_count);
+        useTranslationStore.getState().setDetail(detail);
+      });
+    })();
+    return () => {
+      if (unlistenRef.current) {
+        unlistenRef.current();
+        unlistenRef.current = null;
+      }
+    };
+  }, [isRunning]);
 
   const isReady = srtLoaded && active.has_key;
 
@@ -33,6 +62,7 @@ export default function TranslatePanel() {
     if (!isReady) return;
     setRunning(true);
     setError(null);
+    setSavedPath(null);
 
     try {
       const translationConfig: TranslationConfig = {
@@ -42,33 +72,39 @@ export default function TranslatePanel() {
         avoid_gendered_speech: true,
       };
 
-      const result = await startTranslation(translationConfig);
+      const result = await startTranslation(srtEntries, translationConfig);
 
-      const { setEntries } = useSrtStore.getState();
-      setEntries(result.entries, useSrtStore.getState().fileName + " (翻訳済)");
       setIssues(result.issues);
       setProgress(100, result.entries.length, result.entries.length);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setRunning(false);
-    }
-  };
 
-  const handleExport = async () => {
-    setExporting(true);
-    try {
-      const { save } = await import("@tauri-apps/plugin-dialog");
-      const path = await save({
-        filters: [{ name: "SRTファイル", extensions: ["srt"] }],
-      });
-      if (path) {
-        await saveSrtFile(path, srtEntries);
+      const highIssues = result.issues.filter((i) => i.severity === "high");
+      const hasHighIssues = highIssues.length > 0;
+
+      if (hasHighIssues) {
+        const issueTypes = [...new Set(highIssues.map((i) => i.issue_type))].join(", ");
+        setError(
+          `重大な課題が${highIssues.length}件見つかったため、画面反映と自動保存をスキップしました（内訳: ${issueTypes}）。課題を確認してください。`
+        );
+        return;
+      }
+
+      // Only update store entries when no high-severity issues exist
+      const { setEntries } = useSrtStore.getState();
+      setEntries(result.entries, useSrtStore.getState().fileName + " (翻訳済)");
+
+      if (filePath) {
+        const jpPath = filePath.replace(/_en\.srt$/i, "_jp.srt");
+        try {
+          await saveSrtFile(jpPath, result.entries);
+          setSavedPath(jpPath);
+        } catch (saveErr) {
+          console.error("Auto-save failed:", saveErr);
+        }
       }
     } catch (e) {
       setError(String(e));
     } finally {
-      setExporting(false);
+      setRunning(false);
     }
   };
 
@@ -118,16 +154,23 @@ export default function TranslatePanel() {
                     />
                   </div>
                   <p style={{ fontSize: 13, color: "var(--text-secondary)" }}>
-                    翻訳中... {progress > 0 ? `${Math.round(progress)}%` : "開始中..."}
+                    {detail || (progress > 0 ? `翻訳中... ${Math.round(progress)}%` : "開始中...")}
                     {totalChunks > 0 && ` (チャンク ${currentChunk}/${totalChunks})`}
                   </p>
                 </div>
               )}
 
               {!isRunning && progress === 100 && (
-                <p style={{ color: "var(--success)", fontSize: 14, marginBottom: 12 }}>
-                  翻訳完了！ {issueCount > 0 ? `${issueCount}件の課題が見つかりました。` : "課題は検出されませんでした。"}
-                </p>
+                <div style={{ marginBottom: 12 }}>
+                  <p style={{ color: "var(--success)", fontSize: 14, marginBottom: 4 }}>
+                    翻訳完了！ {issueCount > 0 ? `${issueCount}件の課題が見つかりました。` : "課題は検出されませんでした。"}
+                  </p>
+                  {savedPath && (
+                    <p style={{ color: "var(--text-secondary)", fontSize: 12 }}>
+                      保存先: {savedPath}
+                    </p>
+                  )}
+                </div>
               )}
             </div>
 
@@ -140,12 +183,6 @@ export default function TranslatePanel() {
                 <Play size={16} />
                 {isRunning ? "翻訳中..." : "翻訳開始"}
               </button>
-              {progress === 100 && (
-                <button className="btn btn-secondary" onClick={handleExport} disabled={exporting}>
-                  <Download size={16} />
-                  {exporting ? "出力中..." : "SRT出力"}
-                </button>
-              )}
             </div>
           </>
         )}
@@ -165,7 +202,60 @@ export default function TranslatePanel() {
             {error}
           </div>
         )}
+
+        {issues.length > 0 && (
+          <div style={{ marginTop: 16 }}>
+            <h3 style={{ fontSize: 14, marginBottom: 8, color: "var(--text-primary)" }}>
+              課題一覧 ({issues.length}件)
+            </h3>
+            <div style={{ maxHeight: 320, overflowY: "auto", fontSize: 12 }}>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead>
+                  <tr style={{ background: "var(--bg-secondary)", position: "sticky", top: 0 }}>
+                    <th style={thStyle}>#</th>
+                    <th style={thStyle}>重大度</th>
+                    <th style={thStyle}>種別</th>
+                    <th style={thStyle}>内容</th>
+                    <th style={thStyle}>翻訳文</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {issues.map((issue, i) => (
+                    <tr key={i} style={{ borderBottom: "1px solid var(--border)" }}>
+                      <td style={tdStyle}>{issue.index === 0 ? "—" : issue.index}</td>
+                      <td style={{ ...tdStyle, color: issue.severity === "high" ? "var(--error)" : "var(--warning)" }}>
+                        {issue.severity === "high" ? "高" : "中"}
+                      </td>
+                      <td style={{ ...tdStyle, fontFamily: "monospace", fontSize: 11 }}>
+                        {issue.issue_type}
+                      </td>
+                      <td style={tdStyle}>{issue.message}</td>
+                      <td style={{ ...tdStyle, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {issue.translation}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
 }
+
+const thStyle: React.CSSProperties = {
+  padding: "6px 8px",
+  textAlign: "left",
+  fontSize: 11,
+  fontWeight: 600,
+  color: "var(--text-secondary)",
+  borderBottom: "1px solid var(--border)",
+};
+
+const tdStyle: React.CSSProperties = {
+  padding: "4px 8px",
+  verticalAlign: "top",
+  color: "var(--text-primary)",
+};

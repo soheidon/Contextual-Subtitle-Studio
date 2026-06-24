@@ -5,8 +5,6 @@ import {
   FileText,
   BookOpen,
   Layers,
-  MessageSquare,
-  Settings,
 } from "lucide-react";
 import { exists } from "@tauri-apps/plugin-fs";
 import { useSrtStore } from "../../stores/useSrtStore";
@@ -31,6 +29,7 @@ import {
   loadCharacterDictionary,
   loadGlossaryDictionary,
   loadDramaInfo,
+  disambiguateZhContext,
 } from "../../lib/tauri";
 import type { SrtFileState } from "../../stores/useSrtStore";
 import type { SubtitleEntry, KatakanaKanjiMap, TermVariantEntry, UnresolvedTerm, GlossaryEntry, BatchTermRequest, WebTermResolution, Character } from "../../types";
@@ -38,6 +37,11 @@ import type { SubtitleEntry, KatakanaKanjiMap, TermVariantEntry, UnresolvedTerm,
 /** Normalize an English name for dictionary matching: lowercase, strip spaces/hyphens/apostrophes/punctuation */
 function normalizeEn(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** Normalize Japanese text for fuzzy matching: strip middle dots and long vowel marks. */
+function normalizeJa(s: string): string {
+  return s.replace(/[・ー]/g, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +79,7 @@ const ROMAJI_MAP: [string, string][] = [
   // Basic consonant+vowel
   ["ka","カ"],["ki","キ"],["ku","ク"],["ke","ケ"],["ko","コ"],
   ["sa","サ"],["shi","シ"],["su","ス"],["se","セ"],["so","ソ"],
-  ["ta","タ"],["chi","チ"],["tsu","ツ"],["te","テ"],["to","ト"],
+  ["ta","タ"],["chi","チ"],["tu","トゥ"],["tsu","ツ"],["te","テ"],["to","ト"],
   ["na","ナ"],["ni","ニ"],["nu","ヌ"],["ne","ネ"],["no","ノ"],
   ["ha","ハ"],["hi","ヒ"],["fu","フ"],["he","ヘ"],["ho","ホ"],
   ["ma","マ"],["mi","ミ"],["mu","ム"],["me","メ"],["mo","モ"],
@@ -122,6 +126,44 @@ function romanizedToKatakanaCandidates(source: string): string[] {
     const dotForm = words.map((w) => romanizeWord(w)).filter(Boolean);
     if (dotForm.length === words.length) {
       candidates.push(dotForm.join("・"));
+    }
+  }
+
+  // Pass C: alt mapping without "tuo"→"トウ", so "tu"→"トゥ" + "o"→"オ" produce トゥオ variants
+  if (source.toLowerCase().includes("tuo")) {
+    const altMap: [string, string][] = ROMAJI_MAP.filter(([pat]) => pat !== "tuo");
+    function romanizeWithMap(word: string, map: [string, string][]): string {
+      const lower = word.toLowerCase();
+      let result = "";
+      let pos = 0;
+      while (pos < lower.length) {
+        let matched = false;
+        for (let len = Math.min(6, lower.length - pos); len >= 1; len--) {
+          const slice = lower.slice(pos, pos + len);
+          const entry = map.find(([pat]) => pat === slice);
+          if (entry) {
+            result += entry[1];
+            pos += len;
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) pos++;
+      }
+      return result;
+    }
+    const concatAlt = romanizeWithMap(stripped, altMap);
+    if (concatAlt && concatAlt !== candidates[0]) {
+      candidates.push(concatAlt);
+    }
+    if (words.length >= 2) {
+      const dotAlt = words.map((w) => romanizeWithMap(w, altMap)).filter(Boolean);
+      if (dotAlt.length === words.length) {
+        const dotAltStr = dotAlt.join("・");
+        if (candidates.length < 2 || dotAltStr !== candidates[1]) {
+          candidates.push(dotAltStr);
+        }
+      }
     }
   }
 
@@ -226,6 +268,168 @@ function resolveKnownTermsInText(
   return result;
 }
 
+/** Detect if a text string is likely Chinese prose rather than Japanese prose.
+ *  Mirrors Rust is_likely_chinese (srt.rs): if kana ratio < 8% among ≥20 CJK chars,
+ *  the text lacks Japanese grammatical particles and is probably Chinese. */
+function containsLikelyChineseProse(text: string): boolean {
+  let cjk = 0, kana = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0)!;
+    if ((code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF)) cjk++;
+    if ((code >= 0x3040 && code <= 0x309F) || (code >= 0x30A0 && code <= 0x30FF)) kana++;
+  }
+  if (cjk < 20) return false;
+  return (kana / cjk) < 0.08;
+}
+
+/** Normalize typographic apostrophes to ASCII ' for reliable parsing. */
+function normalizeApostrophes(text: string): string {
+  return text.replace(/[''']/g, "'");
+}
+
+/** Generate search aliases for a target phrase (after possessive/narrowing).
+ *  Mirrors the core of Rust's `generate_search_aliases` (srt.rs:1193-1278),
+ *  but simplified: no false-positive check, no possessive decomposition. */
+function generateTargetAliases(text: string): string[] {
+  const suffixes = [
+    "Ancestral Temple", "Grand Marshal", "Northwest Army",
+    "Mountains", "Guards", "Emperor", "Princess", "Prince", "General",
+    "Temple", "Palace", "Guard",
+    "City", "River", "Lake", "Mountain", "Pass",
+    "Tribe", "Army", "House", "Lady", "Lord",
+    "King", "Wall",
+  ];
+
+  const aliases: string[] = [text];
+  const normalized = normalizeApostrophes(text);
+
+  // Strip trailing possessive
+  const hasTrailingPs = /'s$/i.test(normalized);
+  const work = hasTrailingPs
+    ? normalized.slice(0, -2).trim()
+    : normalized;
+  if (hasTrailingPs && work && work !== text) {
+    aliases.push(work);
+  }
+
+  // Match known suffix (longest first)
+  for (const suffix of suffixes) {
+    const pat = " " + suffix;
+    if (work.length > pat.length && work.slice(-pat.length).toLowerCase() === pat.toLowerCase()) {
+      const stripped = work.slice(0, -pat.length).trim();
+      if (stripped && !/'\s/.test(stripped)) {
+        aliases.push(stripped);
+        if (suffix.includes(" ")) aliases.push(suffix);
+      }
+      break;
+    }
+  }
+
+  // Title-of decomposition: "King of Zhenxi" → "Zhenxi"
+  const ofPrefixes = [
+    "King of ", "Queen of ", "Emperor of ", "Empress of ",
+    "Prince of ", "Princess of ", "General of ", "Lord of ",
+    "Lady of ", "Commander of ", "Grand Marshal of ", "Marshal of ",
+  ];
+  const lower = text.toLowerCase();
+  for (const prefix of ofPrefixes) {
+    if (lower.startsWith(prefix)) {
+      const remainder = text.slice(prefix.length).trim();
+      if (remainder && !aliases.includes(remainder)) aliases.push(remainder);
+      break;
+    }
+  }
+
+  return aliases;
+}
+
+/** Prune possessive unresolved terms whose owner is already known in the dictionary.
+ *  Mirrors Rust's `prune_possessive_terms` (srt.rs:780-811). */
+function prunePossessiveTermsByDict(
+  terms: UnresolvedTerm[],
+  characters: Character[],
+  glossary: GlossaryEntry[],
+): UnresolvedTerm[] {
+  // Build known-names set (full form + normalized; NO individual words)
+  const known = new Set<string>();
+  const add = (name: string) => {
+    const t = name.trim();
+    if (!t) return;
+    known.add(t.toLowerCase());
+    known.add(normalizeEn(t));
+  };
+  for (const c of characters) {
+    if (c.english_name) add(c.english_name);
+    for (const a of c.aliases) {
+      if (a) add(a);
+    }
+  }
+  for (const g of glossary) {
+    if (g.source) add(g.source);
+    for (const a of (g.aliases ?? [])) {
+      if (a) add(a);
+    }
+  }
+
+  const nameInKnownSet = (name: string): boolean => {
+    const t = name.trim();
+    if (!t) return false;
+    if (known.has(t.toLowerCase())) return true;
+    return known.has(normalizeEn(t));
+  };
+
+  const result: UnresolvedTerm[] = [];
+  for (const term of terms) {
+    const normalized = normalizeApostrophes(term.source_text);
+    // Middle possessive: "A's B" (with space after 's)
+    const midPos = normalized.indexOf("'s ");
+    // Trailing possessive: "A's" (at end of string)
+    const trailPos =
+      midPos < 0 && normalized.endsWith("'s") && normalized.length > 2
+        ? normalized.length - 2
+        : -1;
+    const pos = midPos >= 0 ? midPos : trailPos;
+    if (pos < 0) {
+      result.push(term);
+      continue;
+    }
+    const owner = normalized.slice(0, pos).trim();
+    const target = normalized.slice(pos + 2).trim(); // skip "'s"; trailing → empty
+    if (!owner || !nameInKnownSet(owner)) {
+      result.push(term);
+      continue;
+    }
+    if (!target) {
+      // Trailing possessive: owner known, remove entirely
+      continue;
+    }
+
+    // Owner known — check if target is also fully known
+    const targetAliases = generateTargetAliases(target);
+    const targetKnown =
+      nameInKnownSet(target) || targetAliases.some((a) => nameInKnownSet(a));
+    if (targetKnown) {
+      continue; // remove entirely
+    }
+
+    // Narrow to target
+    result.push({
+      ...term,
+      source_text: target,
+      search_text: undefined,
+      generic_suffix: undefined,
+      aliases: targetAliases,
+      reason: `Derived from possessive: ${owner}'s ${target}; owner '${owner}' already known`,
+    });
+  }
+
+  if (result.length < terms.length) {
+    console.log(`[SRT] possessive prune: ${terms.length} → ${result.length} terms (${terms.length - result.length} removed/narrowed)`);
+  }
+
+  return result;
+}
+
 /** Filter out unresolved_terms that already match dictionary entries (characters or glossary). */
 function filterUnresolvedByDict(
   terms: UnresolvedTerm[],
@@ -245,6 +449,12 @@ function filterUnresolvedByDict(
   for (const g of glossary) {
     if (g.source) dictEnKeys.add(normalizeEn(g.source));
     if (g.target) dictJaKeys.add(g.target);
+    for (const alias of (g.aliases ?? [])) {
+      if (!alias) continue;
+      dictEnKeys.add(normalizeEn(alias));
+      dictJaKeys.add(alias);
+      dictJaKeys.add(normalizeJa(alias));
+    }
   }
 
   // Diagnostic logging — always log to diagnose filtering issues
@@ -269,6 +479,20 @@ function filterUnresolvedByDict(
         if (ja.includes(t.surface_ja) || t.surface_ja.includes(ja)) {
           console.log(`[SRT] filtered by jaKey substring: "${t.source_text}" → surface_ja="${t.surface_ja}" vs dict="${ja}"`);
           return false;
+        }
+      }
+      // Fuzzy: check normalized surface_ja (strip ・ー) against dictJaKeys
+      const normSurface = normalizeJa(t.surface_ja);
+      if (normSurface !== t.surface_ja) {
+        if (dictJaKeys.has(normSurface)) {
+          console.log(`[SRT] filtered by jaKey normalised: "${t.source_text}" → normSurface="${normSurface}"`);
+          return false;
+        }
+        for (const ja of dictJaKeys) {
+          if (ja.includes(normSurface) || normSurface.includes(ja)) {
+            console.log(`[SRT] filtered by jaKey norm substring: "${t.source_text}" → normSurface="${normSurface}" vs dict="${ja}"`);
+            return false;
+          }
         }
       }
     }
@@ -318,7 +542,275 @@ function deriveNeedsHumanReview(wr: WebTermResolution): boolean {
 
 /** Normalize English text for dedup (same as normalizeEn, kept separate for semantics). */
 function normalizeForDedup(text: string): string {
-  return text.toLowerCase().replace(/[^a-z0-9]/g, "");
+  // Normalize curly/typographic apostrophes to ASCII
+  let t = text.replace(/[‘’ʼ]/g, "'");
+  // Strip trailing possessive so "Emperor Pei Luo's" and "Emperor Pei Luo" share a key
+  t = t.replace(/'s$/i, "");
+  return t.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** Format SRT timestamp to compact display: "00:03:45,123" → "03:45" (drop hours if zero). */
+function formatFirstTime(ts?: string): string {
+  if (!ts) return "—";
+  const m = ts.match(/^(\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return ts;
+  const h = parseInt(m[1], 10);
+  const mm = m[2];
+  const ss = m[3];
+  return h > 0 ? `${String(h).padStart(2, "0")}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+// Simplified Chinese → Japanese kanji (Shinjitai) mapping for drama proper nouns.
+// Characters whose simplified form differs from Japanese kanji. Each key appears once.
+const SIMPLIFIED_TO_JAPANESE: Record<string, string> = {
+  "万": "萬", "与": "與", "专": "專", "业": "業", "丛": "叢",
+  "东": "東", "丝": "絲", "两": "兩", "严": "嚴", "个": "個",
+  "丰": "豐", "临": "臨", "为": "為", "丽": "麗", "举": "舉",
+  "义": "義", "乐": "樂", "书": "書", "买": "買", "乱": "亂",
+  "争": "爭", "亚": "亞", "产": "產", "亩": "畝", "亲": "親",
+  "亿": "億", "仅": "僅", "仆": "僕", "从": "從", "仓": "倉",
+  "仪": "儀", "众": "眾", "优": "優", "会": "會", "伟": "偉",
+  "传": "傳", "伤": "傷", "伦": "倫", "伪": "偽", "侦": "偵",
+  "侧": "側", "债": "債", "倾": "傾", "储": "儲", "儿": "兒",
+  "兑": "兌", "兽": "獸", "冯": "馮", "冲": "衝", "决": "決",
+  "冻": "凍", "净": "淨", "凄": "悽", "减": "減", "几": "幾",
+  "击": "擊", "创": "創", "刘": "劉", "则": "則", "刚": "剛",
+  "剧": "劇", "剑": "劍", "剂": "劑",
+  "办": "辦", "协": "協", "单": "單", "华": "華", "卖": "賣",
+  "卫": "衛", "卷": "捲", "厅": "廳", "历": "歷", "压": "壓",
+  "厉": "厲", "厌": "厭", "县": "縣", "发": "發", "变": "變",
+  "叠": "疊", "号": "號", "台": "臺", "叶": "葉",
+  "后": "後", "吕": "呂", "吴": "吳", "员": "員",
+  "园": "園", "围": "圍", "国": "國", "图": "圖", "圆": "圓",
+  "团": "團", "场": "場", "垒": "壘", "堕": "墮", "报": "報",
+  "声": "聲", "壳": "殼", "壶": "壺", "处": "處", "备": "備",
+  "复": "復", "头": "頭", "奖": "獎", "夺": "奪", "奋": "奮",
+  "娇": "嬌", "孙": "孫", "学": "學", "实": "實", "审": "審",
+  "写": "寫", "宽": "寬", "宝": "寶", "导": "導", "寿": "壽",
+  "将": "將", "对": "對", "尔": "爾", "尘": "塵",
+  "尝": "嘗", "岁": "歲", "岂": "豈", "岗": "崗", "岛": "島",
+  "峡": "峽", "峰": "峯", "师": "師", "帐": "帳", "帘": "簾",
+  "帮": "幫", "币": "幣",
+  "庄": "莊", "庆": "慶", "应": "應", "广": "廣", "庙": "廟",
+  "废": "廢", "庐": "廬", "库": "庫", "异": "異", "弃": "棄",
+  "张": "張", "弹": "彈", "强": "強", "归": "歸", "录": "錄",
+  "彻": "徹", "征": "徵", "径": "徑",
+  "态": "態", "恳": "懇", "虑": "慮", "惩": "懲", "悬": "懸",
+  "闷": "悶", "闻": "聞", "问": "問", "间": "間", "关": "關",
+  "闪": "閃", "开": "開", "闲": "閒",
+  "战": "戰", "戏": "戲", "户": "戶", "扑": "撲",
+  "执": "執", "扩": "擴", "扫": "掃", "抚": "撫",
+  "担": "擔", "拟": "擬", "拥": "擁", "拦": "攔",
+  "拨": "撥", "择": "擇", "挥": "揮", "损": "損", "捡": "撿",
+  "换": "換", "据": "據", "掺": "摻", "揽": "攬", "摆": "擺",
+  "敛": "斂", "数": "數", "无": "無", "时": "時",
+  "显": "顯", "晓": "曉", "昼": "晝", "暂": "暫", "旷": "曠",
+  "术": "術", "杂": "雜", "权": "權", "条": "條", "来": "來",
+  "极": "極", "构": "構", "标": "標", "树": "樹", "桥": "橋",
+  "机": "機", "检": "檢", "栏": "欄", "樱": "櫻",
+  "杀": "殺", "歼": "殲", "毁": "毀", "气": "氣",
+  "汉": "漢", "沟": "溝", "沪": "滬", "沦": "淪", "泽": "澤",
+  "洁": "潔", "浇": "澆", "测": "測", "济": "濟", "浓": "濃",
+  "涛": "濤", "涤": "滌", "润": "潤", "涨": "漲", "渗": "滲",
+  "溃": "潰", "溅": "濺", "湾": "灣", "灭": "滅", "灯": "燈",
+  "灵": "靈", "炉": "爐", "炼": "煉", "烂": "爛", "热": "熱",
+  "爷": "爺",
+  "献": "獻", "狱": "獄", "环": "環", "画": "畫",
+  "疗": "療", "疯": "瘋",
+  "监": "監", "盘": "盤", "盖": "蓋", "盗": "盜", "尽": "盡",
+  "盐": "鹽",
+  "础": "礎", "确": "確", "碍": "礙", "礼": "禮", "祷": "禱",
+  "离": "離", "种": "種", "积": "積", "称": "稱", "稳": "穩",
+  "穷": "窮", "窃": "竊", "笔": "筆", "简": "簡", "签": "籤",
+  "节": "節", "范": "範", "筑": "築",
+  "类": "類", "粮": "糧", "粪": "糞",
+  "纠": "糾", "纪": "紀", "约": "約", "纹": "紋", "纺": "紡",
+  "罗": "羅", "罢": "罷", "罚": "罰",
+  "职": "職", "联": "聯", "聪": "聰", "肃": "肅",
+  "肠": "腸", "肤": "膚", "肿": "腫", "胜": "勝", "舆": "輿",
+  "旧": "舊", "舍": "捨", "艺": "藝", "药": "薬", "获": "獲",
+  "虚": "虛", "虏": "虜", "虫": "蟲",
+  "虽": "雖", "蛮": "蠻",
+  "衔": "銜", "补": "補", "装": "裝", "袭": "襲",
+  "观": "觀", "规": "規", "视": "視", "览": "覽", "觉": "覺",
+  "触": "觸",
+  "训": "訓", "访": "訪", "设": "設", "许": "許", "诊": "診",
+  "详": "詳", "诚": "誠", "诞": "誕", "询": "詢", "该": "該",
+  "诱": "誘", "语": "語", "谁": "誰", "谅": "諒", "谋": "謀",
+  "谦": "謙", "谨": "謹", "谬": "謬", "译": "譯",
+  "话": "話", "说": "說", "讲": "講", "记": "記", "识": "識",
+  "认": "認", "让": "讓", "议": "議", "论": "論", "证": "證",
+  "试": "試", "诗": "詩", "误": "誤", "读": "讀", "课": "課",
+  "调": "調", "谈": "談", "请": "請", "诺": "諾", "谓": "謂",
+  "谣": "謠", "谢": "謝", "警": "警", "词": "詞", "评": "評",
+  "诈": "詐", "诉": "訴",
+  "负": "負", "贡": "貢", "财": "財", "责": "責", "贤": "賢",
+  "败": "敗", "购": "購", "贮": "貯", "贯": "貫", "贱": "賤",
+  "贴": "貼", "贺": "賀", "贾": "賈", "赁": "賃", "贿": "賄",
+  "赃": "贓", "资": "資", "赈": "賑", "赌": "賭", "赔": "賠",
+  "赖": "賴", "赚": "賺", "赞": "讚", "赠": "贈",
+  "赵": "趙", "赶": "趕", "趋": "趨", "践": "踐", "踪": "蹤",
+  "跃": "躍",
+  "轩": "軒", "软": "軟", "轰": "轟", "轴": "軸", "轻": "輕",
+  "载": "載", "辅": "輔", "辉": "輝", "辈": "輩", "辐": "輻",
+  "辑": "輯", "输": "輸", "辕": "轅",
+  "辞": "辭", "辩": "辯",
+  "达": "達", "迁": "遷", "违": "違", "迟": "遲", "还": "還",
+  "这": "這", "进": "進", "远": "遠", "连": "連", "选": "選",
+  "逊": "遜", "递": "遞", "遥": "遙", "辽": "遼",
+  "邓": "鄧", "邻": "鄰", "邮": "郵", "郑": "鄭", "邹": "鄒",
+  "释": "釋", "阀": "閥", "阁": "閣", "阅": "閱",
+  "阎": "閻", "阐": "闡", "阔": "闊",
+  "队": "隊", "阶": "階", "际": "際", "陈": "陳",
+  "陆": "陸", "险": "險", "随": "隨", "隐": "隱",
+  "难": "難", "云": "雲", "雾": "霧", "静": "靜",
+  "项": "項", "顺": "順", "须": "須", "顾": "顧", "顿": "頓",
+  "预": "預", "领": "領", "颇": "頗", "频": "頻", "颓": "頹",
+  "颗": "顆", "题": "題", "颜": "顏", "额": "額", "颠": "顛",
+  "颤": "顫",
+  "饥": "饑", "饭": "飯", "饮": "飲", "饲": "飼", "饱": "飽",
+  "饰": "飾", "饺": "餃", "饼": "餅", "饿": "餓", "馆": "館",
+  "馒": "饅",
+  "驶": "駛", "驻": "駐", "驾": "駕", "骂": "罵",
+  "骆": "駱", "骇": "駭", "骗": "騙", "骚": "騷", "验": "驗",
+  "骄": "驕",
+  "鲁": "魯", "鲜": "鮮", "鲤": "鯉", "鲸": "鯨", "鳞": "鱗",
+  "鸡": "雞", "鸣": "鳴", "鸭": "鴨", "鸽": "鴿",
+  "鹅": "鵝", "鹊": "鵲", "鹤": "鶴", "鹰": "鷹",
+  "齿": "齒", "龄": "齡",
+  "红": "紅", "绿": "綠", "线": "線", "组": "組", "织": "織",
+  "结": "結", "给": "給", "经": "經", "绝": "絕", "统": "統",
+  "编": "編", "练": "練", "维": "維", "缘": "緣", "纵": "縱",
+  "纷": "紛", "纸": "紙", "纳": "納", "纯": "純",
+  "细": "細", "绳": "繩", "绪": "緒", "续": "續", "绩": "績",
+  "网": "網", "转": "轉", "轮": "輪", "较": "較",
+  "军": "軍", "动": "動", "劳": "勞", "势": "勢", "励": "勵",
+  "劲": "勁", "务": "務", "勋": "勳",
+  "钢": "鋼", "铁": "鐵", "银": "銀", "铜": "銅", "镜": "鏡",
+  "钱": "錢", "镇": "鎮", "钟": "鐘", "针": "針", "钉": "釘",
+  "阳": "陽", "阴": "陰", "阵": "陣",
+  "质": "質", "货": "貨", "贵": "貴", "费": "費", "赏": "賞",
+  "门": "門", "马": "馬", "鱼": "魚", "鸟": "鳥", "龟": "龜",
+  "龙": "龍", "飞": "飛", "风": "風", "电": "電", "韦": "韋",
+  "页": "頁", "贝": "貝", "见": "見", "长": "長",
+  // Specific Chinese drama proper noun chars
+  "铲": "剷", "斩": "斬", "帅": "帥", "诸": "諸", "寻": "尋",
+  "宫": "宮", "边": "邊", "遗": "遺",
+};
+
+/** Convert simplified Chinese characters in a string to Japanese kanji (Shinjitai). */
+function convertSimplifiedToJapanese(s: string): string {
+  let result = "";
+  for (const ch of s) {
+    result += SIMPLIFIED_TO_JAPANESE[ch] ?? ch;
+  }
+  return result;
+}
+
+/** Transform kanji-converted Chinese compound into natural Japanese.
+ *  Applied AFTER convertSimplifiedToJapanese so regexes match Japanese kanji. */
+function zhSurfaceToReadableJa(_sourceText: string, ja: string): string {
+  let result = ja;
+
+  // 兵馬 in military titles → 軍 (Chinese "兵馬" is too stiff for Japanese)
+  result = result.replace(/兵馬(大元帥|大将軍|将軍|元帥|総督)/g, "軍$1");
+
+  // Insert の between dynasty prefix and direction
+  result = result.replace(/^(大[雍秦漢唐宋明清隋元魏])([東西南北中])/, "$1の$2");
+
+  // X宮Y祖廟/X宮Y殿 → X宮のY…
+  result = result.replace(/(宮)([承光祖宗天太永昭神竜龍玄霊])/g, "$1の$2");
+
+  return result;
+}
+
+/** Choose the best kanji surface from LLM disambiguation result.
+ *  Prefers extracted proper-noun substring over the full selected line,
+ *  but only when extracted is a valid (≥2 char) substring of selected. */
+function chooseZhSurface(selected?: string, extracted?: string | null): string {
+  const s = selected?.trim() ?? "";
+  const e = extracted?.trim() ?? "";
+  if (e.length >= 2 && s.includes(e)) return e;
+  return s;
+}
+
+/** Extract Chinese medicine/herb/poison noun from a sentence context.
+ *  Example: "给他服彻骨草" → "彻骨草" */
+function extractChineseTermFallback(sourceText: string, zh: string): string {
+  const text = zh.trim();
+  if (!text) return text;
+
+  const isMedicinal =
+    /\b(herb|medicine|poison|pill|powder|elixir|drug|grass)\b/i.test(sourceText);
+
+  if (!isMedicinal) return text;
+
+  // Strip common verb/context prefixes before checking whether the remainder is a term.
+  // Example: 给他服彻骨草 → 彻骨草
+  const stripped = text
+    .replace(/^(给他服|給他服|给她服|給她服|给你服|給你服|给我服|給我服)/u, "")
+    .replace(/^(让他服|讓他服|让她服|讓她服|命他服|命她服)/u, "")
+    .replace(/^(服下|服用|吃下|喝下|饮下|飲下|服|吃|喝|饮|飲)/u, "");
+
+  if (
+    stripped !== text &&
+    /^[\p{Script=Han}]{2,8}(草|药|藥|丹|丸|散|粉|毒)$/u.test(stripped)
+  ) {
+    return stripped;
+  }
+
+  // If the original string is already a short noun phrase, keep as-is.
+  // Example: 彻骨草
+  if (/^[\p{Script=Han}]{2,4}(草|药|藥|丹|丸|散|粉|毒)$/u.test(text)) {
+    return text;
+  }
+
+  // Conservative extraction: prefer 2–4 Han chars ending in medicine/herb suffix.
+  const matches = Array.from(
+    text.matchAll(/([\p{Script=Han}]{2,4}(?:草|药|藥|丹|丸|散|粉|毒))/gu)
+  );
+
+  if (matches.length > 0) {
+    return matches[matches.length - 1][1];
+  }
+
+  return text;
+}
+
+/** For terms without first_time, scan SRT entries to find the first occurrence. */
+function fillSynopsisFirstTimes(terms: UnresolvedTerm[], entries: SubtitleEntry[]): UnresolvedTerm[] {
+  return terms.map((t) => {
+    if (t.first_time) return t;
+    const needle = t.source_text.toLowerCase();
+    for (const e of entries) {
+      if (e.text.toLowerCase().includes(needle)) {
+        return { ...t, first_time: e.start };
+      }
+    }
+    return t;
+  });
+}
+
+/** Convert SRT timestamp to seconds: "00:03:45,123" → 225.123 */
+function srtTimeToSeconds(ts: string): number {
+  const m = ts.match(/^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/);
+  if (!m) return 0;
+  return parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseInt(m[3], 10) + parseInt(m[4], 10) / 1000;
+}
+
+/** Search zhEntries around first_time (±3s) and return concatenated text lines. */
+function findZhContext(firstTime: string, zhEntries: SubtitleEntry[]): string | null {
+  const center = srtTimeToSeconds(firstTime);
+  if (center === 0 && firstTime !== "00:00:00,000") return null;
+  const window = 3; // ±3 seconds
+  const lines: string[] = [];
+  for (const e of zhEntries) {
+    const t = srtTimeToSeconds(e.start);
+    if (t >= center - window && t <= center + window) {
+      lines.push(e.text);
+    }
+  }
+  return lines.length > 0 ? lines.join("\n") : null;
 }
 
 /** Merge unresolved terms from synopsis LLM and SRT body extraction.
@@ -347,6 +839,8 @@ function mergeUnresolvedTerms(
         surface_ja: t.surface_ja || existing.surface_ja,
         reason: `${existing.reason}; あらすじでも検出`,
         occurrence_count: existing.occurrence_count,
+        // Preserve earliest first_time (body term wins since it has the actual SRT timestamp)
+        first_time: existing.first_time || t.first_time,
         // Preserve alias fields: synopsis aliases take priority if body doesn't have them
         search_text: existing.search_text || t.search_text,
         generic_suffix: existing.generic_suffix || t.generic_suffix,
@@ -357,8 +851,48 @@ function mergeUnresolvedTerms(
     }
   }
 
+  // Third pass: alias-based dedup.
+  // If term B's normalized source_text matches a normalized alias of term A,
+  // merge B into A (A is the richer term since it produced aliases covering B).
+  const result = Array.from(map.values());
+  const removeIndices = new Set<number>();
+
+  for (let i = 0; i < result.length; i++) {
+    if (removeIndices.has(i)) continue;
+    const aliasesA = result[i].aliases;
+    if (!aliasesA || aliasesA.length === 0) continue;
+    const aliasesANorm = aliasesA.map((a) => normalizeForDedup(a));
+
+    for (let j = 0; j < result.length; j++) {
+      if (i === j || removeIndices.has(j)) continue;
+      const keyB = normalizeForDedup(result[j].source_text);
+      if (aliasesANorm.includes(keyB)) {
+        // Merge B into A
+        removeIndices.add(j);
+        const termA = result[i];
+        const termB = result[j];
+        if (!termA.surface_ja && termB.surface_ja) {
+          termA.surface_ja = termB.surface_ja;
+        }
+        termA.occurrence_count = (termA.occurrence_count ?? 0) + (termB.occurrence_count ?? 0);
+        if (termA.source !== termB.source && termA.source !== "srt_body+synopsis") {
+          termA.source = "srt_body+synopsis";
+        }
+        // Propagate earliest first_time
+        if (!termA.first_time && termB.first_time) {
+          termA.first_time = termB.first_time;
+        }
+        if (termB.reason && !termA.reason.includes(termB.reason)) {
+          termA.reason = `${termA.reason}; ${termB.reason}`;
+        }
+      }
+    }
+  }
+
+  const deduped = result.filter((_, idx) => !removeIndices.has(idx));
+
   // Sort: "both" source first, then by occurrence_count desc
-  return Array.from(map.values()).sort((a, b) => {
+  return deduped.sort((a, b) => {
     const aBoth = a.source === "srt_body+synopsis" ? 0 : 1;
     const bBoth = b.source === "srt_body+synopsis" ? 0 : 1;
     if (aBoth !== bBoth) return aBoth - bBoth;
@@ -415,8 +949,8 @@ function exportSceneDetectionCsv(
 function exportUnresolvedTermsCsv(terms: UnresolvedTerm[], filename: string) {
   const BOM = "﻿";
   const headers = [
-    "source_text", "surface_ja", "search_text", "generic_suffix", "search_aliases",
-    "term_type", "status", "source", "occurrence_count",
+    "source_text", "surface_ja", "zh_surface", "search_text", "generic_suffix", "search_aliases",
+    "term_type", "status", "source", "occurrence_count", "first_time", "zh_context",
     "reason", "web_candidate_zh", "web_status", "web_confidence",
     "web_evidence_summary", "web_evidence_urls",
     "web_evidence_strength", "web_match_judgment", "web_needs_human_review", "web_confidence_reason",
@@ -425,6 +959,7 @@ function exportUnresolvedTermsCsv(terms: UnresolvedTerm[], filename: string) {
   const rows = terms.map((t) => [
     t.source_text,
     t.surface_ja,
+    t.zh_surface ?? "",
     t.search_text ?? "",
     t.generic_suffix ?? "",
     (t.aliases ?? []).join(" | "),
@@ -432,6 +967,8 @@ function exportUnresolvedTermsCsv(terms: UnresolvedTerm[], filename: string) {
     t.status,
     t.source ?? "",
     t.occurrence_count ?? 0,
+    formatFirstTime(t.first_time),
+    t.zh_context ?? "",
     t.reason,
     t.webResult?.candidate_zh ?? "",
     t.webResult?.status ?? "",
@@ -858,15 +1395,18 @@ export default function SrtPage() {
     files,
     setFolder,
     setFileEntries,
+    setFileZhEntries,
     setFileStatus,
     setFileSynopsis,
     setFileSceneDetection,
     setFileSceneContext,
+    clearFileSceneContexts,
     setTermWebResult,
     batchAdoptTerms,
     removeUnresolvedTerm,
     setTermLoading,
     setFileAdoptedTerms,
+    setFileTranslationPrompt,
   } = useSrtStore();
   // batchTermLoading and setBatchTermResults are accessed via useSrtStore.getState() in the handler
   const characters = useDictionaryStore((s) => s.characters);
@@ -882,7 +1422,7 @@ export default function SrtPage() {
   const [shortContext, setShortContext] = useState<string>("");
   const [chatGptPasteText, setChatGptPasteText] = useState("");
   const [pasteError, setPasteError] = useState<string | null>(null);
-  const [showBatchApi, setShowBatchApi] = useState(false);
+  const [correctionTab, setCorrectionTab] = useState<"zh" | "chatgpt" | "api">("zh");
   const [expandedEvidence, setExpandedEvidence] = useState<Set<string>>(new Set());
 
   // Auto-load dictionaries when projectBaseDir becomes available (Tauri only)
@@ -905,7 +1445,8 @@ export default function SrtPage() {
   // Loading states for analysis buttons
   const [loadingSynop, setLoadingSynop] = useState(false);
   const [loadingScene, setLoadingScene] = useState(false);
-  const [loadingContext, setLoadingContext] = useState(false);
+  const [chineseWarningScenes, setChineseWarningScenes] = useState<Set<number>>(new Set());
+  const [subtitleLang, setSubtitleLang] = useState<"en" | "zh">("en");
 
   // Known-title map: when folderLabel is detected but zh/en are missing, fill from this table.
   // TODO: replace with per-project title editing in Settings/DramaInfo UI.
@@ -955,21 +1496,63 @@ export default function SrtPage() {
     return { ja, zh, en, folderLabel, source };
   };
 
-  const persistCurrentFile = async () => {
-    if (!activeFile || !folderPath) return;
-    const f = useSrtStore.getState().files.find((x) => x.path === activeFile.path);
+  const buildAssembledTranslationPromptFromFile = (f: SrtFileState): string | null => {
+    if (!f.sceneDetection?.scenes) return null;
+    const chars = useDictionaryStore.getState().characters;
+    const gloss = useDictionaryStore.getState().glossary;
+    const parts: string[] = [];
+    for (const s of f.sceneDetection.scenes) {
+      const ctx = f.sceneContexts[s.scene_index];
+      if (!ctx) continue;
+      const sceneEntries = (subtitleLang === "zh" && f.zhEntries.length > 0
+        ? f.zhEntries
+        : f.entries
+      ).filter(
+        (e) => e.index >= s.start_entry_index && e.index <= s.end_entry_index,
+      );
+      const promptText = subtitleLang === "zh"
+        ? sceneEntries.map((e) => `${e.index}\n${e.start} --> ${e.end}\n${e.text}`).join("\n\n")
+        : buildSceneTranslationPrompt(
+            chars,
+            gloss,
+            ctx.context_ja,
+            sceneEntries,
+            f.katakanaMap,
+            f.termVariants,
+            f.unresolvedTerms,
+            f.adoptedTerms,
+          );
+      parts.push(
+        `===== 場面 ${s.scene_index + 1}: ${s.title} (${sceneEntries.length}行) =====\n\n${promptText}`,
+      );
+    }
+    return parts.length > 0 ? parts.join("\n\n\n") : null;
+  };
+
+  const persistCurrentFile = async (filePath?: string) => {
+    const path = filePath ?? activeFile?.path;
+    if (!path || !folderPath) return;
+    const f = useSrtStore.getState().files.find((x) => x.path === path);
     if (!f) return;
+    const validSceneIndices = new Set(f.sceneDetection?.scenes.map((s) => s.scene_index) ?? []);
+    const sceneContexts = Object.values(f.sceneContexts).filter((ctx) =>
+      validSceneIndices.has(ctx.scene_index),
+    );
+    const prompt = buildAssembledTranslationPromptFromFile(f);
     await saveSrtAnalysis({
       srt_path: f.path,
       srt_name: f.name,
+      base_dir: useSrtStore.getState().projectBaseDir ?? undefined,
       synopsis: f.synopsis,
       scene_detection: f.sceneDetection,
-      scene_contexts: Object.values(f.sceneContexts),
+      scene_contexts: sceneContexts,
       katakana_map: f.katakanaMap,
       term_variants: f.termVariants,
       unresolved_terms: f.unresolvedTerms,
       adopted_terms: f.adoptedTerms,
+      translation_prompt: prompt,
     });
+    useSrtStore.getState().setFileTranslationPrompt(path, prompt);
   };
 
   // --- AI term resolution handler ---
@@ -1069,6 +1652,84 @@ export default function SrtPage() {
     }
   };
 
+  // --- Find Chinese subtitle context for each unresolved term ---
+  const handleFindZhContext = async () => {
+    if (!activeFile) return;
+    if (activeFile.zhEntries.length === 0) {
+      useAppLogStore.getState().addLog("warn", "SRT", "中国語字幕が読み込まれていません。");
+      return;
+    }
+    const store = useSrtStore.getState();
+    const log = useAppLogStore.getState();
+
+    // --- Phase 1: find zh_context for all terms ---
+    let found = 0;
+    let skipped = 0;
+    const phase1 = activeFile.unresolvedTerms.map((t) => {
+      if (!t.first_time) {
+        skipped++;
+        log.addLog("info", "SRT", `スキップ (first_timeなし): ${t.source_text}`);
+        return t;
+      }
+      const ctx = findZhContext(t.first_time, activeFile.zhEntries);
+      if (ctx) {
+        found++;
+        const lineCount = ctx.split("\n").length;
+        log.addLog("info", "SRT", `中国語字幕ヒット: ${t.source_text} (${formatFirstTime(t.first_time)}, ${lineCount}行)`);
+        return { ...t, zh_context: ctx };
+      } else {
+        log.addLog("info", "SRT", `中国語字幕なし: ${t.source_text} (${formatFirstTime(t.first_time)}付近に該当なし)`);
+        return { ...t, zh_context: undefined };
+      }
+    });
+
+    // --- Phase 2: LLM disambiguation for multi-line zh_context ---
+    const multiLineTerms: Array<{ term: UnresolvedTerm; source_text: string; zh_context: string }> = [];
+    for (const t of phase1) {
+      if (t.zh_context && t.zh_context.includes("\n")) {
+        multiLineTerms.push({ term: t, source_text: t.source_text, zh_context: t.zh_context! });
+      }
+    }
+
+    const selectedMap = new Map<string, { selected: string; extracted?: string | null }>();
+    if (multiLineTerms.length > 0) {
+      log.addLog("info", "SRT", `LLM曖昧性解消開始: ${multiLineTerms.length}件の複数行zh_contextを判定`);
+      try {
+        const requests = multiLineTerms.map((m) => ({
+          source_text: m.source_text,
+          zh_context: m.zh_context,
+        }));
+        const results = await disambiguateZhContext(requests);
+        for (const r of results) {
+          selectedMap.set(r.source_text, { selected: r.selected, extracted: r.extracted });
+        }
+        log.addLog("success", "SRT", `LLM曖昧性解消完了: ${results.length}件判定`);
+      } catch (e: any) {
+        log.addLog("error", "SRT", `LLM曖昧性解消失敗（全行テキストで続行）: ${String(e)}`);
+      }
+    }
+
+    // --- Phase 3: apply results ---
+    const updated = phase1.map((t) => {
+      if (!t.zh_context) return t;
+      const hasExisting = !!t.confirmed_surface;
+      let zhSurface: string;
+      const disambig = selectedMap.get(t.source_text);
+      if (disambig) {
+        zhSurface = chooseZhSurface(disambig.selected, disambig.extracted);
+      } else {
+        zhSurface = t.zh_context;
+      }
+      zhSurface = extractChineseTermFallback(t.source_text, zhSurface);
+      const jaBase = convertSimplifiedToJapanese(zhSurface);
+      const ja = zhSurfaceToReadableJa(t.source_text, jaBase);
+      return { ...t, zh_surface: zhSurface, ...(hasExisting ? {} : { surface_ja: ja, confirmed_surface: ja }) };
+    });
+
+    store.setFileSynopsis(activeFile.path, activeFile.synopsis!, activeFile.katakanaMap, activeFile.termVariants, updated);
+    log.addLog("success", "SRT", `中国語字幕検索完了: ${found}件ヒット, ${skipped}件スキップ (${updated.length}件中)`);
+  };
+
   // --- Batch AI確認 handler ---
   const handleBatchAiConfirm = async () => {
     if (!activeFile || !activeFile.synopsis) return;
@@ -1157,6 +1818,72 @@ export default function SrtPage() {
     if (!activeFile) return;
     removeUnresolvedTerm(activeFile.path, term.source_text);
     console.log(`[SRT] 無視: ${term.source_text}`);
+    persistCurrentFile();
+  };
+
+  function buildSubtitleGlossaryEntry(term: UnresolvedTerm): {
+    entry: GlossaryEntry;
+    target: string;
+    zh: string;
+  } | null {
+    const zh = term.zh_surface?.trim() ?? "";
+    const target =
+      term.surface_ja?.trim() ||
+      (zh ? zhSurfaceToReadableJa(term.source_text, convertSimplifiedToJapanese(zh)) : "");
+
+    if (!target) return null;
+
+    const aliases = Array.from(
+      new Set(
+        [zh, ...(term.aliases ?? [])]
+          .map((v) => v?.trim())
+          .filter((v): v is string => !!v),
+      ),
+    );
+
+    const entry: GlossaryEntry = {
+      source: term.source_text,
+      target,
+      type: term.term_type || "proper_noun",
+      notes: "中国語字幕から採用",
+      aliases,
+    };
+
+    return { entry, target, zh };
+  }
+
+  const handleAdoptSubtitleCandidate = (term: UnresolvedTerm) => {
+    if (!activeFile) return;
+
+    const built = buildSubtitleGlossaryEntry(term);
+    if (!built) {
+      useAppLogStore.getState().addLog(
+        "warn",
+        "SRT",
+        `字幕採用スキップ: 日本語候補なし ${term.source_text}`,
+      );
+      return;
+    }
+
+    batchAdoptTerms(activeFile.path, [
+      {
+        sourceText: term.source_text,
+        entry: built.entry,
+        surfaceJa: built.target,
+        confirmedSurface: built.target,
+      },
+    ]);
+
+    if (projectBaseDir) {
+      appendToGlossary(projectBaseDir, [built.entry]);
+    }
+
+    useAppLogStore.getState().addLog(
+      "info",
+      "SRT",
+      `字幕採用: ${term.source_text} → zh="${built.zh}" ja="${built.target}"`,
+    );
+
     persistCurrentFile();
   };
 
@@ -1270,6 +1997,7 @@ export default function SrtPage() {
       if (!baseDir) {
         baseDir = await deriveBaseDir(dirPath);
       }
+      useSrtStore.getState().setProjectBaseDir(baseDir);
 
       // Load dictionaries (if not already in store)
       const dictStore = useDictionaryStore.getState();
@@ -1326,7 +2054,7 @@ export default function SrtPage() {
       // Auto-load existing analyses (use fresh store state after dictionary load)
       const srtPaths = discovered.map((d) => d.path);
       try {
-        const existing = await loadSrtAnalyses(srtPaths);
+        const existing = await loadSrtAnalyses(srtPaths, baseDir ?? undefined);
         const loadDictState = useDictionaryStore.getState();
         for (const a of existing) {
           if (a.synopsis) {
@@ -1343,6 +2071,9 @@ export default function SrtPage() {
           if (a.scene_detection) setFileSceneDetection(a.srt_path, a.scene_detection);
           for (const ctx of a.scene_contexts) {
             setFileSceneContext(a.srt_path, ctx.scene_index, ctx);
+          }
+          if (a.translation_prompt) {
+            setFileTranslationPrompt(a.srt_path, a.translation_prompt);
           }
         }
       } catch (_) {
@@ -1362,6 +2093,15 @@ export default function SrtPage() {
       try {
         const entries = await parseSrtFile(f.path);
         setFileEntries(f.path, entries);
+        // Also load paired Chinese subtitle file if present
+        if (f.zhPath) {
+          try {
+            const zhEntries = await parseSrtFile(f.zhPath);
+            setFileZhEntries(f.path, zhEntries);
+          } catch (_) {
+            console.warn(`Failed to load zh SRT: ${f.zhPath}`);
+          }
+        }
       } catch (e) {
         setFileStatus(f.path, "error", String(e));
       }
@@ -1441,7 +2181,11 @@ export default function SrtPage() {
       const merged = mergeUnresolvedTerms(synopsisTerms, bodyTerms);
       console.log(`[SRT] merged unresolved: synopsis=${synopsisTerms.length} body=${bodyTerms.length} → merged=${merged.length}`);
 
-      const rawUnresolved = merged.map((t) => ({
+      // Fill first_time for synopsis-only terms by scanning SRT body
+      const mergedWithTimes = fillSynopsisFirstTimes(merged, activeFile.entries);
+
+      const pruned = prunePossessiveTermsByDict(mergedWithTimes, useDictionaryStore.getState().characters, useDictionaryStore.getState().glossary);
+      const rawUnresolved = pruned.map((t) => ({
         ...t,
         // Client-side safety net: clear surface_ja if it's English-only
         surface_ja: /[々〆〡-〩぀-ゟ゠-ヿ一-鿿㐀-䶿]/.test(t.surface_ja) ? t.surface_ja : "",
@@ -1453,22 +2197,7 @@ export default function SrtPage() {
         console.log(`[SRT] unresolved_terms filtered by dictionary: ${removedCount}`);
       }
       setFileSynopsis(activeFile.path, result, katakanaMap, termVariants, unresolvedTerms);
-      // Save after setting state
-      const state = useSrtStore.getState();
-      const f = state.files.find((x) => x.path === activeFile.path);
-      if (f && folderPath) {
-        await saveSrtAnalysis({
-          srt_path: f.path,
-          srt_name: f.name,
-          synopsis: result,
-          scene_detection: f.sceneDetection,
-          scene_contexts: Object.values(f.sceneContexts),
-          katakana_map: katakanaMap,
-          term_variants: termVariants,
-          unresolved_terms: unresolvedTerms,
-          adopted_terms: f.adoptedTerms,
-        });
-      }
+      await persistCurrentFile(activeFile.path);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1611,13 +2340,16 @@ export default function SrtPage() {
       }));
       const merged = mergeUnresolvedTerms(synopsisTerms, bodyTerms);
 
-      const rawUnresolved = merged.map((t) => ({
+      const mergedWithTimes = fillSynopsisFirstTimes(merged, activeFile.entries);
+
+      const dictState = useDictionaryStore.getState();
+      const pruned = prunePossessiveTermsByDict(mergedWithTimes, dictState.characters, dictState.glossary);
+      const rawUnresolved = pruned.map((t) => ({
         ...t,
         surface_ja: /[々〆〡-〩぀-ゟ゠-ヿ一-鿿㐀-䶿]/.test(t.surface_ja) ? t.surface_ja : "",
       }));
 
       // Step 10: Filter against updated dictionaries
-      const dictState = useDictionaryStore.getState();
       const { filtered: newUnresolvedTerms, removedCount } = filterUnresolvedByDict(
         rawUnresolved,
         dictState.characters,
@@ -1630,23 +2362,7 @@ export default function SrtPage() {
 
       // Step 12: Save regenerated state
       setFileSynopsis(activeFile.path, result, katakanaMap, termVariants, newUnresolvedTerms);
-      {
-        const state = useSrtStore.getState();
-        const f = state.files.find((x) => x.path === activeFile.path);
-        if (f && folderPath) {
-          await saveSrtAnalysis({
-            srt_path: f.path,
-            srt_name: f.name,
-            synopsis: result,
-            scene_detection: f.sceneDetection,
-            scene_contexts: Object.values(f.sceneContexts),
-            katakana_map: katakanaMap,
-            term_variants: termVariants,
-            unresolved_terms: newUnresolvedTerms,
-            adopted_terms: [],
-          });
-        }
-      }
+      await persistCurrentFile(activeFile.path);
 
       // Step 13: Log results
       log("success", "SRT", `2.1 あらすじを再生成しました。`);
@@ -1680,22 +2396,11 @@ export default function SrtPage() {
               scene.title = resolveKnownTermsInText(scene.title, useDictionaryStore.getState().characters, useDictionaryStore.getState().glossary);
               scene.reason = resolveKnownTermsInText(scene.reason, useDictionaryStore.getState().characters, useDictionaryStore.getState().glossary);
             }
+            clearFileSceneContexts(activeFile.path);
             setFileSceneDetection(activeFile.path, sceneResult);
-            const f3 = useSrtStore.getState().files.find((x) => x.path === activeFile.path);
-            if (f3 && folderPath) {
-              await saveSrtAnalysis({
-                srt_path: f3.path,
-                srt_name: f3.name,
-                synopsis: f3.synopsis,
-                scene_detection: sceneResult,
-                scene_contexts: Object.values(f3.sceneContexts),
-                katakana_map: f3.katakanaMap,
-                term_variants: f3.termVariants,
-                unresolved_terms: f3.unresolvedTerms,
-                adopted_terms: f3.adoptedTerms,
-              });
-            }
+            await persistCurrentFile(activeFile.path);
             log("success", "SRT", `場面検出を再生成しました (${sceneResult.scenes.length}場面)`);
+            await runContextAnalysis(activeFile.path, sceneResult.scenes);
           }
         } catch (sceneErr) {
           log("warn", "SRT", `場面検出の再実行に失敗しました: ${String(sceneErr)}`);
@@ -1707,6 +2412,59 @@ export default function SrtPage() {
     } finally {
       setLoadingSynop(false);
     }
+  };
+
+  // --- Batch adopt & regenerate: subtitle-derived candidates ---
+  const getSubtitleAdoptableTerms = (): UnresolvedTerm[] => {
+    if (!activeFile) return [];
+    return activeFile.unresolvedTerms.filter((t) => {
+      if (t.adopted) return false;
+      if (!t.source_text?.trim()) return false;
+      if (!t.surface_ja?.trim() && !t.zh_surface?.trim()) return false;
+      return buildSubtitleGlossaryEntry(t) !== null;
+    });
+  };
+
+  const handleBatchAdoptSubtitleCandidates = async () => {
+    if (!activeFile || !projectBaseDir || !hasLoaded) return;
+
+    const terms = getSubtitleAdoptableTerms();
+    if (terms.length === 0) {
+      useAppLogStore.getState().addLog("info", "SRT", "字幕採用対象の候補がありません。");
+      return;
+    }
+
+    const items: { sourceText: string; entry: GlossaryEntry; surfaceJa?: string; confirmedSurface?: string }[] = [];
+    const entries: GlossaryEntry[] = [];
+
+    for (const t of terms) {
+      const built = buildSubtitleGlossaryEntry(t);
+      if (!built) continue;
+      items.push({
+        sourceText: t.source_text,
+        entry: built.entry,
+        surfaceJa: built.target,
+        confirmedSurface: built.target,
+      });
+      entries.push(built.entry);
+    }
+
+    if (items.length === 0) return;
+
+    batchAdoptTerms(activeFile.path, items);
+
+    if (projectBaseDir && entries.length > 0) {
+      appendToGlossary(projectBaseDir, entries);
+    }
+
+    useAppLogStore.getState().addLog(
+      "success",
+      "SRT",
+      `字幕候補を一括採用: ${items.length}件`,
+    );
+
+    persistCurrentFile();
+    await handleRegenerateWithDict();
   };
 
   // --- Batch adopt & regenerate: high confidence only ---
@@ -1862,13 +2620,16 @@ export default function SrtPage() {
       }));
       const merged = mergeUnresolvedTerms(synopsisTerms, bodyTerms);
 
-      const rawUnresolved = merged.map((t) => ({
+      const mergedWithTimes = fillSynopsisFirstTimes(merged, activeFile.entries);
+
+      const dictState = useDictionaryStore.getState();
+      const pruned = prunePossessiveTermsByDict(mergedWithTimes, dictState.characters, dictState.glossary);
+      const rawUnresolved = pruned.map((t) => ({
         ...t,
         surface_ja: /[々〆〡-〩぀-ゟ゠-ヿ一-鿿㐀-䶿]/.test(t.surface_ja) ? t.surface_ja : "",
       }));
 
       // Filter against UPDATED dictionaries
-      const dictState = useDictionaryStore.getState();
       const { filtered: newUnresolvedTerms, removedCount } = filterUnresolvedByDict(
         rawUnresolved,
         dictState.characters,
@@ -1881,23 +2642,7 @@ export default function SrtPage() {
 
       // Phase 6: Save regenerated state (adopted_terms cleared)
       setFileSynopsis(activeFile.path, result, katakanaMap, termVariants, newUnresolvedTerms);
-      {
-        const state = useSrtStore.getState();
-        const f = state.files.find((x) => x.path === activeFile.path);
-        if (f && folderPath) {
-          await saveSrtAnalysis({
-            srt_path: f.path,
-            srt_name: f.name,
-            synopsis: result,
-            scene_detection: f.sceneDetection,
-            scene_contexts: Object.values(f.sceneContexts),
-            katakana_map: katakanaMap,
-            term_variants: termVariants,
-            unresolved_terms: newUnresolvedTerms,
-            adopted_terms: [],
-          });
-        }
-      }
+      await persistCurrentFile(activeFile.path);
 
       // Phase 7: Log regeneration stats
       const afterCount = newUnresolvedTerms.length;
@@ -1930,22 +2675,11 @@ export default function SrtPage() {
               scene.title = resolveKnownTermsInText(scene.title, useDictionaryStore.getState().characters, useDictionaryStore.getState().glossary);
               scene.reason = resolveKnownTermsInText(scene.reason, useDictionaryStore.getState().characters, useDictionaryStore.getState().glossary);
             }
+            clearFileSceneContexts(activeFile.path);
             setFileSceneDetection(activeFile.path, sceneResult);
-            const f3 = useSrtStore.getState().files.find((x) => x.path === activeFile.path);
-            if (f3 && folderPath) {
-              await saveSrtAnalysis({
-                srt_path: f3.path,
-                srt_name: f3.name,
-                synopsis: f3.synopsis,
-                scene_detection: sceneResult,
-                scene_contexts: Object.values(f3.sceneContexts),
-                katakana_map: f3.katakanaMap,
-                term_variants: f3.termVariants,
-                unresolved_terms: f3.unresolvedTerms,
-                adopted_terms: f3.adoptedTerms,
-              });
-            }
+            await persistCurrentFile(activeFile.path);
             log("success", "SRT", `場面検出を再生成しました (${sceneResult.scenes.length}場面)`);
+            await runContextAnalysis(activeFile.path, sceneResult.scenes);
           }
         } catch (sceneErr) {
           log("warn", "SRT", `場面検出の再実行に失敗しました: ${String(sceneErr)}`);
@@ -1959,10 +2693,47 @@ export default function SrtPage() {
     }
   };
 
+  /** Run 2.3 context analysis for all scenes and save results. */
+  const runContextAnalysis = async (filePath: string, scenes: { scene_index: number; start_entry_index: number; end_entry_index: number }[]) => {
+    const state = useSrtStore.getState();
+    const f = state.files.find((x) => x.path === filePath);
+    if (!f) return;
+    const characterNames = f.synopsis?.detected_characters;
+    const dictState = useDictionaryStore.getState();
+    const chars = dictState.characters;
+    const glos = dictState.glossary;
+    for (const scene of scenes) {
+      const sceneEntries = f.entries.filter(
+        (e) => e.index >= scene.start_entry_index && e.index <= scene.end_entry_index,
+      );
+      if (sceneEntries.length === 0) continue;
+      const ctx = buildPromptContext(chars, glos, f.katakanaMap, f.termVariants, f.unresolvedTerms, f.adoptedTerms);
+      const result = await analyzeSceneContext(sceneEntries, characterNames, ctx);
+      result.scene_index = scene.scene_index;
+      result.context_ja = resolveKnownTermsInText(result.context_ja, chars, glos);
+      if (result.hierarchy) result.hierarchy = resolveKnownTermsInText(result.hierarchy, chars, glos);
+      result.gender_notes = result.gender_notes.map((g) => resolveKnownTermsInText(g, chars, glos));
+      setFileSceneContext(filePath, scene.scene_index, result);
+      const chineseWarnings: string[] = [];
+      if (containsLikelyChineseProse(result.context_ja)) chineseWarnings.push("context_ja");
+      if (result.hierarchy && containsLikelyChineseProse(result.hierarchy)) chineseWarnings.push("hierarchy");
+      for (const note of result.gender_notes) {
+        if (containsLikelyChineseProse(note)) chineseWarnings.push(`gender_notes: "${note.slice(0, 30)}..."`);
+      }
+      if (chineseWarnings.length > 0) {
+        useAppLogStore.getState().addLog("warn", "SRT", `場面${scene.scene_index + 1} 2.3出力に中国語疑い: ${chineseWarnings.join(", ")}`);
+        setChineseWarningScenes(prev => new Set(prev).add(scene.scene_index));
+      }
+    }
+    // Save after all contexts are set
+    await persistCurrentFile(filePath);
+  };
+
   const handleDetectScenes = async () => {
     if (!activeFile) return;
     setLoadingScene(true);
     setError(null);
+    setChineseWarningScenes(new Set());
     try {
       const ctx = buildPromptContext(characters, glossary, activeFile.katakanaMap, activeFile.termVariants, activeFile.unresolvedTerms, activeFile.adoptedTerms);
       const result = await detectSrtScenes(activeFile.entries, ctx);
@@ -1971,73 +2742,15 @@ export default function SrtPage() {
         scene.title = resolveKnownTermsInText(scene.title, characters, glossary);
         scene.reason = resolveKnownTermsInText(scene.reason, characters, glossary);
       }
-      setFileSceneDetection(activeFile.path, result);
-      const state = useSrtStore.getState();
-      const f = state.files.find((x) => x.path === activeFile.path);
-      if (f && folderPath) {
-        await saveSrtAnalysis({
-          srt_path: f.path,
-          srt_name: f.name,
-          synopsis: f.synopsis,
-          scene_detection: result,
-          scene_contexts: Object.values(f.sceneContexts),
-          katakana_map: f.katakanaMap,
-          term_variants: f.termVariants,
-          unresolved_terms: f.unresolvedTerms,
-          adopted_terms: f.adoptedTerms,
-        });
-      }
+      clearFileSceneContexts(activeFile.path);
+            setFileSceneDetection(activeFile.path, result);
+
+      // 2.3 Scene context analysis — run automatically after scene detection
+      await runContextAnalysis(activeFile.path, result.scenes);
     } catch (e) {
       setError(String(e));
     } finally {
       setLoadingScene(false);
-    }
-  };
-
-  const handleAnalyzeContext = async () => {
-    if (!activeFile) return;
-    const sceneDetection = activeFile.sceneDetection;
-    if (!sceneDetection || sceneDetection.scenes.length === 0) return;
-    setLoadingContext(true);
-    setError(null);
-    try {
-      const characterNames = activeFile.synopsis?.detected_characters;
-      for (const scene of sceneDetection.scenes) {
-        const sceneEntries = activeFile.entries.filter(
-          (e) => e.index >= scene.start_entry_index && e.index <= scene.end_entry_index,
-        );
-        if (sceneEntries.length === 0) continue;
-        const ctx = buildPromptContext(characters, glossary, activeFile.katakanaMap, activeFile.termVariants, activeFile.unresolvedTerms, activeFile.adoptedTerms);
-        const result = await analyzeSceneContext(sceneEntries, characterNames, ctx);
-        result.scene_index = scene.scene_index;
-        // Apply dictionary normalization to context fields
-        const chars = useDictionaryStore.getState().characters;
-        const glos = useDictionaryStore.getState().glossary;
-        result.context_ja = resolveKnownTermsInText(result.context_ja, chars, glos);
-        if (result.hierarchy) result.hierarchy = resolveKnownTermsInText(result.hierarchy, chars, glos);
-        result.gender_notes = result.gender_notes.map((g) => resolveKnownTermsInText(g, chars, glos));
-        setFileSceneContext(activeFile.path, scene.scene_index, result);
-      }
-      // Save after all contexts are set
-      const state = useSrtStore.getState();
-      const f = state.files.find((x) => x.path === activeFile.path);
-      if (f && folderPath) {
-        await saveSrtAnalysis({
-          srt_path: f.path,
-          srt_name: f.name,
-          synopsis: f.synopsis,
-          scene_detection: f.sceneDetection,
-          scene_contexts: Object.values(f.sceneContexts),
-          katakana_map: f.katakanaMap,
-          term_variants: f.termVariants,
-          unresolved_terms: f.unresolvedTerms,
-          adopted_terms: f.adoptedTerms,
-        });
-      }
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoadingContext(false);
     }
   };
 
@@ -2166,6 +2879,9 @@ export default function SrtPage() {
               >
                 <FileText size={12} />
                 {f.name}
+                {f.zhEntries.length > 0 && (
+                  <span className="badge-zh" style={{ marginLeft: 4, fontSize: 10 }}>ZH</span>
+                )}
               </button>
             ))}
           </div>
@@ -2173,9 +2889,25 @@ export default function SrtPage() {
           {/* Tab content */}
           {activeFile && (
             <div style={{ padding: "16px 0" }}>
-              <h3 style={{ fontSize: 14, marginBottom: 12, color: "var(--text-secondary)" }}>
-                分析 — {activeFile.name} ({activeFile.entries.length}行)
-              </h3>
+              <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
+                <h3 style={{ fontSize: 14, margin: 0, color: "var(--text-secondary)" }}>
+                  分析 — {activeFile.name} ({subtitleLang === "zh" && activeFile.zhEntries.length > 0 ? activeFile.zhEntries.length : activeFile.entries.length}行)
+                </h3>
+                {activeFile.zhEntries.length > 0 && (
+                  <div style={{ display: "flex", gap: 2, background: "var(--bg-secondary)", borderRadius: 4, padding: 2 }}>
+                    <button
+                      className={subtitleLang === "en" ? "btn btn-primary" : "btn btn-secondary"}
+                      style={{ fontSize: 11, padding: "2px 8px", minHeight: 22 }}
+                      onClick={() => setSubtitleLang("en")}
+                    >EN</button>
+                    <button
+                      className={subtitleLang === "zh" ? "btn btn-primary" : "btn btn-secondary"}
+                      style={{ fontSize: 11, padding: "2px 8px", minHeight: 22 }}
+                      onClick={() => setSubtitleLang("zh")}
+                    >ZH</button>
+                  </div>
+                )}
+              </div>
 
               {/* 4 fire buttons */}
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
@@ -2204,14 +2936,6 @@ export default function SrtPage() {
                     採用語を辞書保存して再生成 ({activeFile.adoptedTerms.length}件採用済)
                   </button>
                 )}
-                <button
-                  className="btn btn-primary"
-                  disabled={!allContextsReady}
-                  style={{ fontSize: 12 }}
-                >
-                  <Settings size={14} />
-                  2.4 翻訳設定
-                </button>
               </div>
 
               {characters.length === 0 && glossary.length === 0 && (
@@ -2263,100 +2987,255 @@ export default function SrtPage() {
                             </span>
                           )}
                         </h4>
-                        {/* ChatGPT paste — primary flow */}
-                        <div className="srt-chatgpt-paste-panel">
-                          <div className="srt-chatgpt-paste-panel-heading">
+                        {/* 固有名詞補正 method tabs */}
+                        <div style={{ display: "flex", gap: 4, marginBottom: 8, borderBottom: "1px solid var(--border)" }}>
+                          <button
+                            className={`btn btn-sm ${correctionTab === "zh" ? "active" : ""}`}
+                            onClick={() => setCorrectionTab("zh")}
+                            style={{
+                              fontSize: 12,
+                              borderBottom: correctionTab === "zh" ? "2px solid var(--accent)" : "2px solid transparent",
+                              borderRadius: "4px 4px 0 0",
+                            }}
+                          >
+                            中国語字幕から検索
+                          </button>
+                          <button
+                            className={`btn btn-sm ${correctionTab === "chatgpt" ? "active" : ""}`}
+                            onClick={() => setCorrectionTab("chatgpt")}
+                            style={{
+                              fontSize: 12,
+                              borderBottom: correctionTab === "chatgpt" ? "2px solid var(--accent)" : "2px solid transparent",
+                              borderRadius: "4px 4px 0 0",
+                            }}
+                          >
                             ChatGPT連携
-                          </div>
-                          <p className="srt-chatgpt-paste-panel-desc">
-                            1. プロンプトをコピーしてChatGPTに貼り付け → 2. 回答を下に貼り付けて「結果を取り込む」
-                          </p>
-                          <div className="srt-chatgpt-paste-btn-row">
-                            {pending.filter((t) => !t.adopted && !t.webResult).length > 0 && (
-                              <button
-                                className="btn btn-primary"
-                                onClick={handleCopyPrompt}
-                                style={{ fontSize: 12 }}
-                              >
-                                プロンプトをコピー ({pending.filter((t) => !t.adopted && !t.webResult).length}件)
-                              </button>
-                            )}
-                          </div>
-                          <textarea
-                            value={chatGptPasteText}
-                            onChange={(e) => { setChatGptPasteText(e.target.value); setPasteError(null); }}
-                            placeholder="ChatGPTの回答をここに貼り付け..."
-                            rows={4}
-                            className={`srt-chatgpt-paste-textarea${pasteError ? " has-error" : ""}`}
-                          />
-                          <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8 }}>
-                            <button
-                              className="btn btn-primary"
-                              onClick={handlePasteChatGptResponse}
-                              disabled={!chatGptPasteText.trim()}
-                              style={{ fontSize: 12 }}
-                            >
-                              結果を取り込む
-                            </button>
-                            {pasteError && (
-                              <span className="srt-chatgpt-paste-error">{pasteError}</span>
-                            )}
-                          </div>
+                          </button>
+                          <button
+                            className={`btn btn-sm ${correctionTab === "api" ? "active" : ""}`}
+                            onClick={() => setCorrectionTab("api")}
+                            style={{
+                              fontSize: 12,
+                              borderBottom: correctionTab === "api" ? "2px solid var(--accent)" : "2px solid transparent",
+                              borderRadius: "4px 4px 0 0",
+                            }}
+                          >
+                            APIを利用
+                          </button>
                         </div>
 
-                        {/* Accordion: API batch AI confirm (optional, collapsed by default) */}
-                        <details open={showBatchApi} onToggle={(e) => setShowBatchApi((e.target as HTMLDetailsElement).open)} style={{ marginBottom: 8 }}>
-                          <summary style={{ fontSize: 12, cursor: "pointer", color: "var(--text-secondary)", userSelect: "none" }}>
-                            APIでAI確認 (オプション)
-                          </summary>
-                          <div style={{ marginTop: 6, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                            {pending.filter((t) => !t.adopted && !t.webResult).length > 0 && (
-                              <button
-                                className="btn btn-primary"
-                                onClick={handleBatchAiConfirm}
-                                disabled={activeFile.batchTermLoading}
-                                style={{ fontSize: 12 }}
-                              >
-                                {activeFile.batchTermLoading
-                                  ? "一括AI確認中…"
-                                  : `未確認語をまとめてAI確認 (${pending.filter((t) => !t.adopted && !t.webResult).length}件)`}
-                              </button>
-                            )}
-                            {/* Batch adopt high-confidence button */}
-                            {(() => {
-                              const highCount = pending.filter((t) => {
-                                const wr = t.webResult;
-                                if (!wr) return false;
-                                if (wr.status !== "found") return false;
-                                if (wr.confidence !== "high") return false;
-                                if (!wr.candidate_zh && !wr.candidate_ja) return false;
-                                if (!wr.evidence || wr.evidence.length === 0) return false;
-                                if (wr.source_text === wr.candidate_zh || wr.source_text === wr.candidate_ja) return false;
-                                return true;
-                              }).length;
-                              if (highCount === 0) return null;
-                              return (
+                        {/* Tab: 中国語字幕から検索 */}
+                        {correctionTab === "zh" && (
+                          <div style={{ marginBottom: 8 }}>
+                            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                              {activeFile.zhEntries.length > 0 && pending.some((t) => t.first_time) ? (
                                 <button
                                   className="btn btn-sm"
-                                  onClick={handleBatchAdoptHighConfidence}
-                                  style={{ fontSize: 12, background: "var(--success, #22c55e)", color: "#fff" }}
+                                  onClick={handleFindZhContext}
+                                  style={{ fontSize: 12 }}
                                 >
-                                  found/high を一括採用 ({highCount}件)
+                                  中国語字幕から検索
+                                </button>
+                              ) : (
+                                <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                                  中国語字幕または初出時間がないため検索できません。
+                                </span>
+                              )}
+                            </div>
+                            {(() => {
+                              const subtitleCount = getSubtitleAdoptableTerms().length;
+                              return (
+                                <button
+                                  className="btn btn-primary"
+                                  style={{ fontSize: 12, marginTop: 8 }}
+                                  onClick={handleBatchAdoptSubtitleCandidates}
+                                  disabled={subtitleCount === 0 || !hasLoaded || loadingSynop || !projectBaseDir}
+                                >
+                                  <RefreshCw size={14} />
+                                  {loadingSynop ? "保存・再生成中…" : `すべて受け入れて再生成 (${subtitleCount}件)`}
                                 </button>
                               );
                             })()}
                           </div>
-                        </details>
+                        )}
+
+                        {/* Tab: ChatGPT連携 */}
+                        {correctionTab === "chatgpt" && (
+                          <div className="srt-chatgpt-paste-panel">
+                            <p className="srt-chatgpt-paste-panel-desc">
+                              1. プロンプトをコピーしてChatGPTに貼り付け → 2. 回答を下に貼り付けて「結果を取り込む」
+                            </p>
+                            <div className="srt-chatgpt-paste-btn-row">
+                              {pending.filter((t) => !t.adopted && !t.webResult).length > 0 && (
+                                <button
+                                  className="btn btn-primary"
+                                  onClick={handleCopyPrompt}
+                                  style={{ fontSize: 12 }}
+                                >
+                                  プロンプトをコピー ({pending.filter((t) => !t.adopted && !t.webResult).length}件)
+                                </button>
+                              )}
+                            </div>
+                            <textarea
+                              value={chatGptPasteText}
+                              onChange={(e) => { setChatGptPasteText(e.target.value); setPasteError(null); }}
+                              placeholder="ChatGPTの回答をここに貼り付け..."
+                              rows={4}
+                              className={`srt-chatgpt-paste-textarea${pasteError ? " has-error" : ""}`}
+                            />
+                            <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8 }}>
+                              <button
+                                className="btn btn-primary"
+                                onClick={handlePasteChatGptResponse}
+                                disabled={!chatGptPasteText.trim()}
+                                style={{ fontSize: 12 }}
+                              >
+                                結果を取り込む
+                              </button>
+                              {pasteError && (
+                                <span className="srt-chatgpt-paste-error">{pasteError}</span>
+                              )}
+                            </div>
+                            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                              {(() => {
+                                const highCount = activeFile ? activeFile.unresolvedTerms.filter(t => {
+                                  const wr = t.webResult;
+                                  if (!wr || t.adopted || !wr.candidate_zh && !wr.candidate_ja) return false;
+                                  if (wr.status !== "found" || wr.confidence !== "high") return false;
+                                  if (wr.evidence_strength !== "direct" || wr.match_judgment !== "exact") return false;
+                                  if (deriveNeedsHumanReview(wr) !== false) return false;
+                                  return true;
+                                }).length : 0;
+                                return (
+                                  <button
+                                    className="btn btn-primary"
+                                    onClick={handleBatchAdoptHighAndRegen}
+                                    disabled={highCount === 0 || !hasLoaded || loadingSynop || !projectBaseDir}
+                                    style={{ fontSize: 12 }}
+                                  >
+                                    <RefreshCw size={14} />
+                                    {loadingSynop ? "保存・再生成中…" : `高確度のものを受け入れて再生成 (${highCount}件)`}
+                                  </button>
+                                );
+                              })()}
+                              {(() => {
+                                const allFoundCount = activeFile ? activeFile.unresolvedTerms.filter(t => {
+                                  const wr = t.webResult;
+                                  if (!wr || t.adopted || !wr.candidate_zh && !wr.candidate_ja) return false;
+                                  if (wr.status !== "found") return false;
+                                  return true;
+                                }).length : 0;
+                                return (
+                                  <button
+                                    className="btn btn-primary"
+                                    onClick={handleBatchAdoptAllAndRegen}
+                                    disabled={allFoundCount === 0 || !hasLoaded || loadingSynop || !projectBaseDir}
+                                    style={{ fontSize: 12 }}
+                                  >
+                                    <RefreshCw size={14} />
+                                    {loadingSynop ? "保存・再生成中…" : `すべて受け入れて再生成 (${allFoundCount}件)`}
+                                  </button>
+                                );
+                              })()}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Tab: APIを利用 */}
+                        {correctionTab === "api" && (
+                          <div style={{ marginBottom: 8 }}>
+                            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                              {pending.filter((t) => !t.adopted && !t.webResult).length > 0 && (
+                                <button
+                                  className="btn btn-primary"
+                                  onClick={handleBatchAiConfirm}
+                                  disabled={activeFile.batchTermLoading}
+                                  style={{ fontSize: 12 }}
+                                >
+                                  {activeFile.batchTermLoading
+                                    ? "一括AI確認中…"
+                                    : `未確認語をまとめてAI確認 (${pending.filter((t) => !t.adopted && !t.webResult).length}件)`}
+                                </button>
+                              )}
+                              {(() => {
+                                const highCount = pending.filter((t) => {
+                                  const wr = t.webResult;
+                                  if (!wr) return false;
+                                  if (wr.status !== "found") return false;
+                                  if (wr.confidence !== "high") return false;
+                                  if (!wr.candidate_zh && !wr.candidate_ja) return false;
+                                  if (!wr.evidence || wr.evidence.length === 0) return false;
+                                  if (wr.source_text === wr.candidate_zh || wr.source_text === wr.candidate_ja) return false;
+                                  return true;
+                                }).length;
+                                if (highCount === 0) return null;
+                                return (
+                                  <button
+                                    className="btn btn-sm"
+                                    onClick={handleBatchAdoptHighConfidence}
+                                    style={{ fontSize: 12, background: "var(--success, #22c55e)", color: "#fff" }}
+                                  >
+                                    found/high を一括採用 ({highCount}件)
+                                  </button>
+                                );
+                              })()}
+                            </div>
+                            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                              {(() => {
+                                const highCount = activeFile ? activeFile.unresolvedTerms.filter(t => {
+                                  const wr = t.webResult;
+                                  if (!wr || t.adopted || !wr.candidate_zh && !wr.candidate_ja) return false;
+                                  if (wr.status !== "found" || wr.confidence !== "high") return false;
+                                  if (wr.evidence_strength !== "direct" || wr.match_judgment !== "exact") return false;
+                                  if (deriveNeedsHumanReview(wr) !== false) return false;
+                                  return true;
+                                }).length : 0;
+                                return (
+                                  <button
+                                    className="btn btn-primary"
+                                    onClick={handleBatchAdoptHighAndRegen}
+                                    disabled={highCount === 0 || !hasLoaded || loadingSynop || !projectBaseDir}
+                                    style={{ fontSize: 12 }}
+                                  >
+                                    <RefreshCw size={14} />
+                                    {loadingSynop ? "保存・再生成中…" : `高確度のものを受け入れて再生成 (${highCount}件)`}
+                                  </button>
+                                );
+                              })()}
+                              {(() => {
+                                const allFoundCount = activeFile ? activeFile.unresolvedTerms.filter(t => {
+                                  const wr = t.webResult;
+                                  if (!wr || t.adopted || !wr.candidate_zh && !wr.candidate_ja) return false;
+                                  if (wr.status !== "found") return false;
+                                  return true;
+                                }).length : 0;
+                                return (
+                                  <button
+                                    className="btn btn-primary"
+                                    onClick={handleBatchAdoptAllAndRegen}
+                                    disabled={allFoundCount === 0 || !hasLoaded || loadingSynop || !projectBaseDir}
+                                    style={{ fontSize: 12 }}
+                                  >
+                                    <RefreshCw size={14} />
+                                    {loadingSynop ? "保存・再生成中…" : `すべて受け入れて再生成 (${allFoundCount}件)`}
+                                  </button>
+                                );
+                              })()}
+                            </div>
+                          </div>
+                        )}
                         <div className="table-container" style={{ maxHeight: 300, overflowY: "auto" }}>
                           <table>
                             <thead>
                               <tr>
-                                <th style={{ width: "13%" }}>元の表記</th>
-                                <th style={{ width: 80 }}>日本語候補</th>
-                                <th style={{ width: 90 }}>検索候補</th>
-                                <th style={{ width: "10%" }}>確定表記</th>
-                                <th style={{ width: 90, textAlign: "center" }}>判定</th>
-                                <th style={{ maxWidth: 260 }}>理由</th>
+                                <th style={{ width: "13%" }}>English</th>
+                                <th style={{ width: 110 }}>日本語</th>
+                                <th style={{ width: 110 }}>中文</th>
+                                <th style={{ width: 170 }}>中文候補</th>
+                                <th style={{ width: 140 }}>検索別名</th>
+                                <th style={{ width: 65 }}>初出時間</th>
+                                <th style={{ width: 85, textAlign: "center" }}>判定</th>
+                                <th style={{ width: 180 }}>理由</th>
                                 <th style={{ width: 140, textAlign: "center" }}>操作</th>
                               </tr>
                             </thead>
@@ -2370,11 +3249,6 @@ export default function SrtPage() {
                                   <tr key={t.source_text}>
                                     <td style={{ fontFamily: "monospace", fontSize: 12 }}>
                                       {t.source_text}
-                                      {t.search_text && (
-                                        <div style={{ fontSize: 10, color: "#888", marginTop: 1 }}>
-                                          検索別名: {(t.aliases ?? [t.source_text]).join(", ")}
-                                        </div>
-                                      )}
                                       {t.source && t.source !== "synopsis" && (
                                         <span style={{
                                           display: "inline-block",
@@ -2407,12 +3281,20 @@ export default function SrtPage() {
                                       )}
                                     </td>
                                     <td style={{ fontFamily: "monospace", fontSize: 12 }}>
-                                      {t.webResult ? (t.surface_ja || "—") : "—"}
+                                      {t.surface_ja || "—"}
                                     </td>
                                     <td style={{ fontFamily: "monospace", fontSize: 12 }}>
-                                      {t.webResult ? (t.webResult?.candidate_zh ?? "—") : "—"}
+                                      {t.zh_surface || "—"}
                                     </td>
-                                    <td style={{ fontFamily: "monospace", fontSize: 12 }}>{t.confirmed_surface || "—"}</td>
+                                    <td style={{ fontFamily: "monospace", fontSize: 11, color: "var(--text-secondary)", whiteSpace: "pre-wrap", lineHeight: 1.3 }}>
+                                      {t.zh_context || "—"}
+                                    </td>
+                                    <td style={{ fontFamily: "monospace", fontSize: 10, color: "#888" }}>
+                                      {(t.aliases?.length) ? t.aliases.join(", ") : "—"}
+                                    </td>
+                                    <td style={{ fontFamily: "monospace", fontSize: 11, color: "var(--text-secondary)", textAlign: "center" }}>
+                                      {formatFirstTime(t.first_time)}
+                                    </td>
                                     <td style={{ textAlign: "center" }}>
                                       {!t.webResult && (
                                         <span className="status-pill high">未確認</span>
@@ -2505,6 +3387,16 @@ export default function SrtPage() {
                                       >
                                         手入力
                                       </button>
+                                      {(t.surface_ja || t.zh_surface) && (
+                                        <button
+                                          className="btn btn-sm"
+                                          style={{ background: "var(--success, #22c55e)", color: "#fff", marginRight: 4 }}
+                                          onClick={() => handleAdoptSubtitleCandidate(t)}
+                                          title="中国語字幕から取得した候補を辞書に採用"
+                                        >
+                                          字幕採用
+                                        </button>
+                                      )}
                                       {!t.webResult && (
                                         <>
                                           <button
@@ -2604,49 +3496,6 @@ export default function SrtPage() {
                             CSV出力 ({activeFile.unresolvedTerms.length}件)
                           </button>
                         </div>
-                        {/* Batch adopt & regenerate buttons at the bottom of the proper noun correction block */}
-                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
-                          {(() => {
-                            const highCount = activeFile ? activeFile.unresolvedTerms.filter(t => {
-                              const wr = t.webResult;
-                              if (!wr || t.adopted || !wr.candidate_zh && !wr.candidate_ja) return false;
-                              if (wr.status !== "found" || wr.confidence !== "high") return false;
-                              if (wr.evidence_strength !== "direct" || wr.match_judgment !== "exact") return false;
-                              if (deriveNeedsHumanReview(wr) !== false) return false;
-                              return true;
-                            }).length : 0;
-                            return (
-                              <button
-                                className="btn btn-primary"
-                                onClick={handleBatchAdoptHighAndRegen}
-                                disabled={highCount === 0 || !hasLoaded || loadingSynop || !projectBaseDir}
-                                style={{ fontSize: 12 }}
-                              >
-                                <RefreshCw size={14} />
-                                {loadingSynop ? "保存・再生成中…" : `高確度のものを受け入れて再生成 (${highCount}件)`}
-                              </button>
-                            );
-                          })()}
-                          {(() => {
-                            const allFoundCount = activeFile ? activeFile.unresolvedTerms.filter(t => {
-                              const wr = t.webResult;
-                              if (!wr || t.adopted || !wr.candidate_zh && !wr.candidate_ja) return false;
-                              if (wr.status !== "found") return false;
-                              return true;
-                            }).length : 0;
-                            return (
-                              <button
-                                className="btn btn-primary"
-                                onClick={handleBatchAdoptAllAndRegen}
-                                disabled={allFoundCount === 0 || !hasLoaded || loadingSynop || !projectBaseDir}
-                                style={{ fontSize: 12 }}
-                              >
-                                <RefreshCw size={14} />
-                                {loadingSynop ? "保存・再生成中…" : `すべて受け入れて再生成 (${allFoundCount}件)`}
-                              </button>
-                            );
-                          })()}
-                        </div>
                       </div>
                     );
                   })()}
@@ -2732,7 +3581,7 @@ export default function SrtPage() {
                 </div>
               )}
 
-              {/* 2.2 Scene detection button — placed below proper noun correction block */}
+              {/* 2.2 Scene detection button — runs 2.3 context analysis automatically */}
               {activeFile.synopsis && (
                 <div style={{ marginBottom: 16 }}>
                   <button
@@ -2742,7 +3591,7 @@ export default function SrtPage() {
                     style={{ fontSize: 12 }}
                   >
                     <Layers size={14} />
-                    2.2 場面検出
+                    {loadingScene ? "2.2 場面検出 + 2.3 状況分析..." : "2.2 場面検出 + 2.3 状況分析"}
                   </button>
                 </div>
               )}
@@ -2754,16 +3603,6 @@ export default function SrtPage() {
                     <h4 style={{ fontSize: 13, margin: 0 }}>
                       2.2 場面検出 ({activeFile.sceneDetection.scenes.length}場面)
                     </h4>
-                    <button
-                      className="btn btn-primary btn-sm"
-                      onClick={handleAnalyzeContext}
-                      disabled={!hasSceneDetection || loadingContext}
-                      style={{ fontSize: 11 }}
-                      title="2.3 状況分析を実行"
-                    >
-                      <MessageSquare size={12} />
-                      {loadingContext ? "分析中…" : "2.3 状況分析を実行"}
-                    </button>
                   </div>
                   {Object.keys(activeFile.sceneContexts).length === 0 && (
                     <p style={{ fontSize: 11, color: "var(--text-secondary)", margin: "0 0 6px 0" }}>
@@ -2824,6 +3663,9 @@ export default function SrtPage() {
                                 ) : (
                                   <span style={{ color: "var(--text-secondary)", opacity: 0.5 }}>未分析</span>
                                 )}
+                                {chineseWarningScenes.has(s.scene_index) && (
+                                  <span title="中国語文体の可能性あり" style={{ color: "#e6a817", marginLeft: 4, cursor: "help" }}>⚠</span>
+                                )}
                               </td>
                             </tr>
                           );
@@ -2868,6 +3710,11 @@ export default function SrtPage() {
                         <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>
                           場面 {s.scene_index + 1}: {s.title}
                         </div>
+                        {chineseWarningScenes.has(s.scene_index) && (
+                          <div style={{ fontSize: 11, color: "#e6a817", marginBottom: 6, background: "rgba(230,168,23,0.1)", padding: "4px 8px", borderRadius: 4 }}>
+                            ⚠ この場面の説明に中国語の文体が混入している可能性があります。2.3を再実行してください。
+                          </div>
+                        )}
                         <div style={{ fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
                           {ctx.context_ja}
                         </div>
@@ -2891,51 +3738,95 @@ export default function SrtPage() {
                 </div>
               )}
 
-              {/* 2.4 Translation settings — assembled prompt per scene */}
-              {allContextsReady && activeFile.sceneDetection && (
-                <div>
-                  <h4 style={{ fontSize: 13, marginBottom: 8 }}>2.4 翻訳設定</h4>
-                  {activeFile.sceneDetection.scenes.map((s) => {
-                    const ctx = activeFile.sceneContexts[s.scene_index];
-                    if (!ctx) return null;
-                    const sceneEntries = activeFile.entries.filter(
-                      (e) => e.index >= s.start_entry_index && e.index <= s.end_entry_index,
-                    );
-                    const promptText = buildSceneTranslationPrompt(
-                      characters,
-                      glossary,
-                      ctx.context_ja,
-                      sceneEntries,
-                      activeFile.katakanaMap,
-                      activeFile.termVariants,
-                      activeFile.unresolvedTerms,
-                      activeFile.adoptedTerms,
-                    );
-                    return (
-                      <div key={s.scene_index} style={{ marginBottom: 12 }}>
-                        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
-                          場面 {s.scene_index + 1}: {s.title} ({sceneEntries.length}行)
+              {/* 2.4 Translation prompt preview — assembled prompt per scene */}
+              {(allContextsReady || activeFile.translation_prompt) && activeFile.sceneDetection && (
+                <details style={{ marginBottom: 16 }}>
+                  <summary style={{ fontSize: 13, fontWeight: 600, cursor: "pointer", marginBottom: 8 }}>
+                    2.4 翻訳プロンプト確認
+                  </summary>
+                  <p style={{ fontSize: 12, color: "var(--text-secondary)", margin: "4px 0 8px 0", lineHeight: 1.5 }}>
+                    各シーンを翻訳する際にLLMへ送る予定のプロンプトです。現在は確認用で、翻訳実行は未実装です。
+                  </p>
+                  <p style={{ fontSize: 11, color: "var(--text-secondary)", margin: "0 0 12px 0", lineHeight: 1.4 }}>
+                    翻訳品質がおかしい場合は、ここで辞書・人物関係・場面文脈が正しく入っているか確認できます。
+                    <br />
+                    翻訳実行機能は今後追加予定です。
+                  </p>
+                  {allContextsReady ? (
+                    activeFile.sceneDetection.scenes.map((s) => {
+                      const ctx = activeFile.sceneContexts[s.scene_index];
+                      if (!ctx) return null;
+                      const sceneEntries = (subtitleLang === "zh" && activeFile.zhEntries.length > 0
+                        ? activeFile.zhEntries
+                        : activeFile.entries
+                      ).filter(
+                        (e) => e.index >= s.start_entry_index && e.index <= s.end_entry_index,
+                      );
+                      const promptText = subtitleLang === "zh"
+                        ? sceneEntries.map((e) => `${e.index}\n${e.start} --> ${e.end}\n${e.text}`).join("\n\n")
+                        : buildSceneTranslationPrompt(
+                            characters,
+                            glossary,
+                            ctx.context_ja,
+                            sceneEntries,
+                            activeFile.katakanaMap,
+                            activeFile.termVariants,
+                            activeFile.unresolvedTerms,
+                            activeFile.adoptedTerms,
+                          );
+                      return (
+                        <div key={s.scene_index} style={{ marginBottom: 12 }}>
+                          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2 }}>
+                            場面 {s.scene_index + 1}: {s.title} ({sceneEntries.length}行)
+                          </div>
+                          <div style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 4 }}>
+                            {subtitleLang === "zh"
+                              ? "中国語字幕（参考表示）"
+                              : "このシーンを翻訳する際にLLMへ渡すプロンプト（確認用）"}
+                          </div>
+                          <textarea
+                            readOnly
+                            value={promptText}
+                            style={{
+                              width: "100%",
+                              height: 200,
+                              fontFamily: "monospace",
+                              fontSize: 11,
+                              lineHeight: 1.5,
+                              padding: 8,
+                              borderRadius: 4,
+                              border: "1px solid var(--border)",
+                              background: "var(--bg-secondary)",
+                              resize: "vertical",
+                            }}
+                          />
                         </div>
-                        <textarea
-                          readOnly
-                          value={promptText}
-                          style={{
-                            width: "100%",
-                            height: 200,
-                            fontFamily: "monospace",
-                            fontSize: 11,
-                            lineHeight: 1.5,
-                            padding: 8,
-                            borderRadius: 4,
-                            border: "1px solid var(--border)",
-                            background: "var(--bg-secondary)",
-                            resize: "vertical",
-                          }}
-                        />
+                      );
+                    })
+                  ) : activeFile.translation_prompt ? (
+                    <div style={{ marginBottom: 12 }}>
+                      <div style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 4 }}>
+                        保存済みの翻訳プロンプト（場面状況未生成のため保存データを表示）
                       </div>
-                    );
-                  })}
-                </div>
+                      <textarea
+                        readOnly
+                        value={activeFile.translation_prompt}
+                        style={{
+                          width: "100%",
+                          height: 400,
+                          fontFamily: "monospace",
+                          fontSize: 11,
+                          lineHeight: 1.5,
+                          padding: 8,
+                          borderRadius: 4,
+                          border: "1px solid var(--border)",
+                          background: "var(--bg-secondary)",
+                          resize: "vertical",
+                        }}
+                      />
+                    </div>
+                  ) : null}
+                </details>
               )}
             </div>
           )}

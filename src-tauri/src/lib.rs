@@ -133,6 +133,7 @@ pub fn run() {
             commands::util::open_url,
             commands::synopsis::summarize_synopsis,
             commands::ja_kanji::correct_ja_kanji,
+            commands::srt::disambiguate_zh_context,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

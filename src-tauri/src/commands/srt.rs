@@ -59,6 +59,10 @@ pub fn save_srt_file(
 pub struct SrtFileEntry {
     pub path: String,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zh_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zh_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +113,22 @@ pub struct UnresolvedTerm {
     pub aliases: Option<Vec<String>>, // search aliases: [full, stripped, ...] deduplicated
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_surface: Option<String>, // confirmed kanji notation for glossary output
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_time: Option<String>, // earliest SRT timestamp where this term appears
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZhDisambiguationRequest {
+    pub source_text: String,
+    pub zh_context: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZhDisambiguationResponse {
+    pub source_text: String,
+    pub selected: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extracted: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +227,8 @@ pub struct KatakanaKanjiMap {
 pub struct SrtAnalysisFile {
     pub srt_path: String,
     pub srt_name: String,
+    #[serde(default)]
+    pub base_dir: Option<String>,
     pub synopsis: Option<SrtSynopsisResult>,
     pub scene_detection: Option<SceneDetectionResult>,
     #[serde(default)]
@@ -219,6 +241,8 @@ pub struct SrtAnalysisFile {
     pub unresolved_terms: Vec<UnresolvedTerm>,
     #[serde(default)]
     pub adopted_terms: Vec<GlossaryEntry>,
+    #[serde(default)]
+    pub translation_prompt: Option<String>,
 }
 
 // Batch AI確認 types
@@ -380,7 +404,15 @@ fn build_scene_context_prompt(
     prompt_context: &str,
 ) -> (String, String) {
     let system = "あなたは中国ドラマの字幕分析アシスタントです。\
-        場面の状況設定を日本語で記述してください。";
+        場面の状況設定を必ず自然な日本語で記述してください。\n\
+        \n\
+        【禁止事項】\n\
+        - 中国語（簡体字）での説明文は禁止\n\
+        - 中国語の文法・語順で書かないこと\n\
+        \n\
+        【許可事項】\n\
+        - 固有名詞（人名・地名・称号等）の漢字表記はそのまま使用してよい\n\
+        - ただし文章そのもの（助詞・活用・語順）は日本語で書くこと";
 
     let srt_text: String = entries
         .iter()
@@ -407,9 +439,18 @@ fn build_scene_context_prompt(
     }
 
     user.push_str(
-        "\n出力は以下のJSON形式で返してください：\n\
-         {\"scene_index\": 0, \"context_ja\": \"状況説明\", \
-         \"hierarchy\": \"身分関係（ある場合のみ）\", \"gender_notes\": []}",
+        "\n【重要】\n\
+         以下の例のように、固有名詞の漢字はそのままでも、説明文は必ず日本語で記述してください。\n\
+         \n\
+         悪い例（中国語文体）:\n\
+         \"楚乔在院子里和宇文玥谈话，讨论反抗大魏的计划\"\n\
+         \n\
+         良い例（日本語）:\n\
+         \"楚喬が庭で宇文玥と話し、大魏への反抗計画について議論している\"\n\
+         \n\
+         出力は以下のJSON形式で返してください：\n\
+         {\"scene_index\": 0, \"context_ja\": \"状況説明（日本語のみ、中国語禁止）\", \
+         \"hierarchy\": \"身分関係（日本語のみ、ある場合のみ）\", \"gender_notes\": []}",
     );
 
     (system.to_string(), user)
@@ -741,6 +782,66 @@ fn is_covered_by_known_names(phrase: &str, known_names: &std::collections::HashS
     known_names.contains(&dedup) || known_names.contains(&combined.to_lowercase())
 }
 
+/// Check whether a name is present in the known-names set.
+/// Uses the same multi-form lookup as build_known_names_set.
+fn name_in_known_set(name: &str, known_names: &std::collections::HashSet<String>) -> bool {
+    let lower = name.trim().to_lowercase();
+    if lower.is_empty() { return false; }
+    if known_names.contains(&lower) { return true; }
+    let dedup = normalize_en_for_dedup(&lower);
+    known_names.contains(&dedup)
+}
+
+/// Narrow or remove unresolved terms whose possessive owner is already known.
+///
+/// For phrases like "Yanbei's King of Zhenxi" where "Yanbei" is in the dictionary:
+/// - If the target ("King of Zhenxi") is also fully known → remove the term
+/// - Otherwise, narrow source_text to the target and rebuild aliases
+///
+/// Keeps the original phrase context in the `reason` field for traceability.
+fn prune_possessive_terms(
+    terms: &mut Vec<UnresolvedTerm>,
+    known_names: &std::collections::HashSet<String>,
+) {
+    let mut pruned = Vec::with_capacity(terms.len());
+    for mut term in terms.drain(..) {
+        let normalized = normalize_apostrophes(&term.source_text);
+        // Middle possessive: "A's B" (with space after 's)
+        let mid = normalized.find("'s ");
+        // Trailing possessive: "A's" (at end of string)
+        let trail = if mid.is_none() && normalized.ends_with("'s") && normalized.len() > 2 {
+            Some(normalized.len() - 2)
+        } else {
+            None
+        };
+        if let Some(pos) = mid.or(trail) {
+            let owner = normalized[..pos].trim();
+            let target = normalized[pos + 2..].trim(); // skip "'s" (2 chars); trailing case → empty
+            if !owner.is_empty() && name_in_known_set(owner, known_names) {
+                if target.is_empty() {
+                    // Trailing possessive: owner known, remove entirely
+                    continue;
+                }
+                if is_covered_by_known_names(target, known_names) {
+                    continue; // both owner and target known → remove
+                }
+                // Owner known, target unknown → narrow to target
+                let (st, gs, aliases) = generate_search_aliases(target);
+                term.source_text = target.to_string();
+                term.search_text = st;
+                term.generic_suffix = gs;
+                term.aliases = aliases;
+                term.reason = format!(
+                    "Derived from possessive: {}'s {}; owner '{}' already known",
+                    owner, target, owner
+                );
+            }
+        }
+        pruned.push(term);
+    }
+    *terms = pruned;
+}
+
 /// Check if a word is a title/rank word commonly used before names.
 fn is_title_word(word: &str) -> bool {
     let lower = word.to_lowercase();
@@ -967,6 +1068,7 @@ struct SrtBodyCandidate {
     original_text: String,
     count: u32,
     is_alias: bool,
+    first_time: Option<String>,
 }
 
 /// Strip trailing CJK parenthetical from source_text.
@@ -988,6 +1090,13 @@ fn is_likely_chinese(text: &str) -> bool {
     }).count();
     let ratio = kana_count as f64 / cjk_count as f64;
     ratio < 0.08
+}
+
+/// Check whether any field in a SceneContextResult contains likely Chinese prose.
+fn scene_context_has_chinese_prose(result: &SceneContextResult) -> bool {
+    is_likely_chinese(&result.context_ja)
+        || result.hierarchy.as_deref().map_or(false, is_likely_chinese)
+        || result.gender_notes.iter().any(|s| is_likely_chinese(s))
 }
 
 /// Replace guessed kanji/katakana renderings in synopsis_ja with the English source_text
@@ -1042,6 +1151,101 @@ fn strip_trailing_cjk_parenthetical(text: &str) -> &str {
     text
 }
 
+/// Normalize typographic/curly apostrophes to ASCII single quote for consistent parsing.
+/// Handles: ' (U+2019 right single quotation mark), ' (U+2018 left single quotation mark),
+/// ʼ (U+02BC modifier letter apostrophe)
+fn normalize_apostrophes(text: &str) -> String {
+    text.replace('\u{2019}', "'")
+        .replace('\u{2018}', "'")
+        .replace('\u{02BC}', "'")
+}
+
+/// Find possessive pattern in text after normalizing apostrophes.
+/// Returns (owner, target) sliced from the ORIGINAL text with correct byte offsets.
+/// For trailing possessives ("A's"), target is empty.
+///
+/// Walks the original text char-by-char, tracking both the original byte offset
+/// and the normalized byte offset (where curly apostrophes count as 1 byte).
+/// When the normalized offset reaches the apostrophe position, we know the
+/// original byte offset of that apostrophe character.
+fn find_possessive_in_text(text: &str) -> Option<(&str, &str)> {
+    let normalized = normalize_apostrophes(text);
+    // Middle possessive: "A's B" — find returns pos of ' in normalized
+    let mid = normalized.find("'s ");
+    // Trailing possessive: "A's" at end — apostrophe at len-2 in normalized
+    let trail = if mid.is_none() && normalized.ends_with("'s") && normalized.len() > 2 {
+        Some(normalized.len() - 2)
+    } else {
+        None
+    };
+    let norm_apos_pos = mid.or(trail)?;
+    let has_target = mid.is_some();
+
+    // Walk original text to find the apostrophe's byte position
+    let mut norm_idx = 0;
+    let mut orig_idx = 0;
+    for ch in text.chars() {
+        if norm_idx == norm_apos_pos {
+            // orig_idx now points to the apostrophe character in the original text
+            let ap_len = ch.len_utf8();
+            let owner = text[..orig_idx].trim();
+            if has_target {
+                // Skip "'s " (apostrophe + 's' + space)
+                let target_start = orig_idx + ap_len + 2; // +1 for 's', +1 for ' '
+                if target_start <= text.len() {
+                    let target = text[target_start..].trim();
+                    if !owner.is_empty() && !target.is_empty() {
+                        return Some((owner, target));
+                    }
+                }
+            } else {
+                if !owner.is_empty() {
+                    return Some((owner, ""));
+                }
+            }
+            return None;
+        }
+        let orig_len = ch.len_utf8();
+        let norm_len = match ch {
+            '\u{2019}' | '\u{2018}' | '\u{02BC}' => 1,
+            _ => orig_len,
+        };
+        norm_idx += norm_len;
+        orig_idx += orig_len;
+    }
+    None
+}
+
+/// Terms that should never appear as unresolved proper nouns.
+/// Includes English contractions and standalone honorifics/titles (without a name).
+fn is_false_positive_unresolved(text: &str) -> bool {
+    let normalized = normalize_apostrophes(text);
+    let lower = normalized.to_lowercase();
+    let lower = lower.trim();
+
+    // English contractions
+    if matches!(lower,
+        "i've" | "i'm" | "you're" | "we're" | "they're" |
+        "he's" | "she's" | "it's" |
+        "don't" | "can't" | "won't" | "isn't" | "aren't" |
+        "wasn't" | "weren't" | "hasn't" | "haven't" | "hadn't" |
+        "doesn't" | "didn't" | "shouldn't" | "wouldn't" | "couldn't"
+    ) {
+        return true;
+    }
+
+    // Standalone titles/honorifics without a proper name
+    if matches!(lower,
+        "master" | "sir" | "madam" |
+        "my lord" | "your highness" | "your majesty" |
+        "his highness" | "her highness" | "his majesty" | "her majesty"
+    ) {
+        return true;
+    }
+
+    false
+}
+
 /// Single generic English words that are too vague to use as search terms alone.
 const GENERIC_ALIAS_WORDS: &[&str] = &[
     "moon", "sun", "star", "wind", "fire", "water", "earth", "sky",
@@ -1072,36 +1276,230 @@ fn sanitize_search_aliases(aliases: &[String]) -> Vec<String> {
 /// Detect generic English suffixes on proper nouns and generate search aliases.
 /// Example: "Zhenhuang City" → search_text="Zhenhuang", generic_suffix="City",
 /// aliases=["Zhenhuang City", "Zhenhuang"]
+///
+/// Also decomposes possessive phrases ("Yanbei's King of Zhenxiao") and
+/// title-prefixed names ("Emperor Pei Luo") into searchable components.
 fn generate_search_aliases(source_text: &str) -> (Option<String>, Option<String>, Option<Vec<String>>) {
+    // False positives (contractions, standalone titles) get no aliases
+    if is_false_positive_unresolved(source_text) {
+        return (None, None, None);
+    }
+
+    // Longest first so "Ancestral Temple" matches before "Temple"
     let suffixes: &[&str] = &[
-        "Mountains", "Guards", "Prince", "Princess", "General",
+        "Ancestral Temple", "Grand Marshal", "Northwest Army",
+        "Mountains", "Guards", "Emperor", "Princess", "Prince", "General",
+        "Temple", "Palace", "Guard",
         "City", "River", "Lake", "Mountain", "Pass",
         "Tribe", "Army", "House", "Lady", "Lord",
-        "Guard",
+        "King", "Wall",
     ];
-    // Sorted by length desc so "Mountains" matches before "Mountain", "Guards" before "Guard"
 
+    let mut search_text: Option<String> = None;
+    let mut generic_suffix: Option<String> = None;
+    let mut aliases: Vec<String> = vec![source_text.to_string()];
+
+    // Normalize apostrophes for reliable processing, but keep source_text as-is
+    let normalized = normalize_apostrophes(source_text);
+
+    // Strip trailing possessive for suffix-matching purposes:
+    // "Emperor Pei Luo's" → work on "Emperor Pei Luo"
+    let has_trailing_ps = normalized.len() > 2
+        && normalized[normalized.len()-2..].eq_ignore_ascii_case("'s");
+    let work = if has_trailing_ps {
+        let stripped = normalized[..normalized.len()-2].trim().to_string();
+        if !stripped.is_empty() && stripped != source_text {
+            aliases.push(stripped.clone());
+        }
+        stripped
+    } else {
+        normalized.clone()
+    };
+
+    // Single suffix match (longest first) — on the work text (without trailing 's)
     for suffix in suffixes {
         let pat = format!(" {}", suffix);
-        if source_text.len() > pat.len()
-            && source_text[source_text.len() - pat.len()..].to_lowercase() == pat.to_lowercase()
+        if work.len() > pat.len()
+            && work[work.len() - pat.len()..].eq_ignore_ascii_case(&pat)
         {
-            let stripped = source_text[..source_text.len() - pat.len()].to_string();
+            let stripped = work[..work.len() - pat.len()].trim().to_string();
             if !stripped.is_empty() {
-                // Reject if stripped text is a single generic English word
                 let is_single_word = !stripped.contains(' ');
                 let is_generic = is_single_word
                     && GENERIC_ALIAS_WORDS.contains(&stripped.to_lowercase().as_str());
-                if is_generic {
-                    return (None, None, None);
+                // Reject stripped forms that still contain a possessive — the
+                // decompose_possessive_phrase call below produces clean owner/target forms.
+                let has_possessive = stripped.contains("'s");
+                if !is_generic && !has_possessive {
+                    aliases.push(stripped.clone());
+                    search_text = Some(stripped);
+                    generic_suffix = Some(suffix.to_string());
+                    // Multi-word suffixes (e.g. "Grand Marshal") as standalone aliases
+                    if suffix.contains(' ') {
+                        aliases.push(suffix.to_string());
+                    }
                 }
-                let mut aliases: Vec<String> = vec![source_text.to_string(), stripped.clone()];
-                aliases.dedup();
-                return (Some(stripped), Some(suffix.to_string()), Some(aliases));
+            }
+            break; // first (longest) match only
+        }
+    }
+
+    // Add possessive/prefix decomposition aliases — use normalized text for decomposition
+    let extras = decompose_possessive_phrase(&normalized);
+    for a in extras {
+        if !aliases.contains(&a) {
+            aliases.push(a);
+        }
+    }
+
+    // Add title-of decomposition aliases ("King of Zhenxi" → "Zhenxi")
+    let title_of_extras = decompose_title_of_phrase(&normalized);
+    for a in title_of_extras {
+        if !aliases.contains(&a) {
+            aliases.push(a);
+        }
+    }
+
+    aliases.dedup();
+    let sanitized = sanitize_search_aliases(&aliases);
+
+    (search_text, generic_suffix, if sanitized.is_empty() { None } else { Some(sanitized) })
+}
+
+/// Split possessive and title-prefixed proper noun phrases into searchable components.
+///
+/// Examples:
+/// - "Yanbei's King of Zhenxiao" → ["Yanbei", "King of Zhenxiao", "Zhenxiao"]
+/// - "Shengjin Palace's Chengguang Ancestral Temple" → ["Shengjin Palace", "Chengguang Ancestral Temple", "Chengguang"]
+/// - "Emperor Pei Luo" → ["Pei Luo"]
+/// - "Emperor Pei Luo's" → ["Emperor Pei Luo", "Pei Luo"]
+fn decompose_possessive_phrase(phrase: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let phrase = normalize_apostrophes(phrase);
+
+    // 1. Possessive split on "'s "
+    if let Some(pos) = phrase.find("'s ") {
+        let owner = phrase[..pos].trim().to_string();
+        let target = phrase[pos + 3..].trim().to_string();
+
+        if !owner.is_empty() {
+            result.push(owner);
+        }
+        if !target.is_empty() {
+            result.push(target.clone());
+
+            // Strip "X of Y" title prefix from target: "King of Zhenxiao" → "Zhenxiao"
+            let of_prefixes = [
+                "King of ", "Queen of ", "Emperor of ", "Empress of ",
+                "Prince of ", "Princess of ", "General of ", "Lord of ",
+                "Lady of ", "Commander of ", "Grand Marshal of ",
+            ];
+            for prefix in &of_prefixes {
+                if target.len() > prefix.len()
+                    && target[..prefix.len()].eq_ignore_ascii_case(prefix)
+                {
+                    let remainder = target[prefix.len()..].trim().to_string();
+                    if !remainder.is_empty() {
+                        result.push(remainder);
+                    }
+                    break;
+                }
+            }
+
+            // Strip generic suffix from target: "Xun Lie Wall" → "Xun Lie"
+            // Also emit multi-word suffixes as supplementary aliases (e.g. "Grand Marshal")
+            let gen_suffixes: &[&str] = &[
+                "Ancestral Temple", "Grand Marshal",
+                "Northwest Army", "Army", "Temple", "Palace", "Wall",
+                "Guard", "Guards", "City", "River", "Lake", "Mountain",
+                "Mountains", "Pass", "Tribe", "House",
+            ];
+            for suffix in gen_suffixes {
+                let pat = format!(" {}", suffix);
+                if target.len() > pat.len()
+                    && target[target.len() - pat.len()..].eq_ignore_ascii_case(&pat)
+                {
+                    let stripped = target[..target.len() - pat.len()].trim().to_string();
+                    if !stripped.is_empty() {
+                        let is_single = !stripped.contains(' ');
+                        let is_generic = is_single
+                            && GENERIC_ALIAS_WORDS.contains(&stripped.to_lowercase().as_str());
+                        if !is_generic {
+                            result.push(stripped);
+                        }
+                    }
+                    // Emit multi-word suffix itself as supplementary alias
+                    if suffix.contains(' ') {
+                        result.push(suffix.to_string());
+                    }
+                    break;
+                }
             }
         }
     }
-    (None, None, None)
+
+    // 2. Strip leading title without possessive: "Emperor Pei Luo" → "Pei Luo"
+    if !phrase.contains("'s ") && !phrase.to_lowercase().contains(" of ") {
+        // Strip trailing possessive first: "Emperor Pei Luo's" → "Emperor Pei Luo"
+        let work = if phrase.len() > 2 && phrase[phrase.len()-2..].eq_ignore_ascii_case("'s")
+            && !phrase[..phrase.len()-2].ends_with(' ')
+        {
+            phrase[..phrase.len()-2].trim().to_string()
+        } else {
+            phrase.clone()
+        };
+
+        let lead_titles = [
+            "Emperor ", "Empress ", "King ", "Queen ",
+            "General ", "Prince ", "Princess ", "Lord ", "Lady ",
+            "Grand Marshal ",
+        ];
+        for title in &lead_titles {
+            if work.len() > title.len()
+                && work[..title.len()].eq_ignore_ascii_case(title)
+            {
+                let remainder = work[title.len()..].trim().to_string();
+                // Only strip if remainder is a multi-word name
+                if remainder.split_whitespace().count() >= 2 {
+                    result.push(remainder);
+                }
+                break;
+            }
+        }
+
+        // Also push the trailing-stripped form if different from original
+        if work != phrase {
+            result.push(work);
+        }
+    }
+
+    result
+}
+
+/// Decompose a "X of Y" title phrase into its core name.
+/// Examples:
+/// - "King of Zhenxi" → ["Zhenxi"]
+/// - "Prince of Biantang" → ["Biantang"]
+/// - "Grand Marshal of Yanbei" → ["Yanbei"]
+fn decompose_title_of_phrase(text: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let lower = text.to_lowercase();
+    let of_prefixes: &[&str] = &[
+        "King of ", "Queen of ", "Emperor of ", "Empress of ",
+        "Prince of ", "Princess of ", "General of ", "Lord of ",
+        "Lady of ", "Commander of ", "Grand Marshal of ",
+        "Marshal of ",
+    ];
+    for prefix in of_prefixes {
+        if lower.starts_with(&prefix.to_lowercase()) {
+            let remainder = text[prefix.len()..].trim();
+            if !remainder.is_empty() {
+                result.push(remainder.to_string());
+            }
+            break;
+        }
+    }
+    result
 }
 
 /// Extract proper noun candidates from all SRT subtitle text.
@@ -1114,7 +1512,7 @@ pub fn extract_srt_body_candidates(
     glossary: Vec<GlossaryEntry>,
 ) -> Result<Vec<UnresolvedTerm>, String> {
     let known_names = build_known_names_set(&characters, &glossary);
-    let mut raw_candidates: Vec<(String, bool)> = Vec::new();
+    let mut raw_candidates: Vec<(String, bool, String)> = Vec::new(); // (phrase, is_alias, entry_start)
 
     for entry in &entries {
         let text = entry.text.trim();
@@ -1160,7 +1558,7 @@ pub fn extract_srt_body_candidates(
 
             if word_count >= 2 || has_keyword {
                 // Apply filters to a single cleaned candidate, pushing if valid
-                let try_push = |raw: &mut Vec<(String, bool)>, cand: &str, kn: &std::collections::HashSet<String>| {
+                let try_push = |raw: &mut Vec<(String, bool, String)>, cand: &str, kn: &std::collections::HashSet<String>| {
                     let cleaned = match clean_candidate(cand) {
                         Some(c) => c,
                         None => return,
@@ -1174,12 +1572,28 @@ pub fn extract_srt_body_candidates(
                     if is_covered_by_known_names(&cleaned, kn) { return; }
 
                     let is_alias = looks_like_repeated_alias(&cleaned);
-                    raw.push((cleaned, is_alias));
+                    raw.push((cleaned, is_alias, entry.start.clone()));
                 };
 
                 // Dialogue punctuation → skip (check raw phrase BEFORE cleaning,
                 // because clean_candidate strips trailing ! and ?)
                 if contains_dialogue_punctuation(&phrase) {
+                    i = seq_end;
+                    continue;
+                }
+
+                // Possessive decomposition: split "Shengjin Palace's Chengguang
+                // Ancestral Temple" into owner + target and emit each separately.
+                // Uses normalize_apostrophes + byte-offset mapping to handle
+                // curly apostrophes (U+2019 etc.) correctly.
+                if let Some((owner_raw, target_raw)) = find_possessive_in_text(&phrase) {
+                    if !target_raw.is_empty() {
+                        for part in [owner_raw, target_raw] {
+                            try_push(&mut raw_candidates, part, &known_names);
+                        }
+                    } else {
+                        try_push(&mut raw_candidates, owner_raw, &known_names);
+                    }
                     i = seq_end;
                     continue;
                 }
@@ -1238,7 +1652,7 @@ pub fn extract_srt_body_candidates(
     let mut candidate_map: std::collections::HashMap<String, SrtBodyCandidate> =
         std::collections::HashMap::new();
 
-    for (phrase, is_alias) in raw_candidates {
+    for (phrase, is_alias, start_time) in raw_candidates {
         let key = normalize_en_for_dedup(&phrase);
         candidate_map
             .entry(key)
@@ -1258,16 +1672,18 @@ pub fn extract_srt_body_candidates(
                 original_text: phrase,
                 count: 1,
                 is_alias,
+                first_time: Some(start_time),
             });
     }
 
     // Resolve containment: if "Black Eagle Army" and "Black Eagle" both exist,
-    // keep only the longer form and bump its count.
+    // keep only the longer form and bump its count. Also propagate earliest first_time.
     let keys: Vec<String> = candidate_map.keys().cloned().collect();
     let mut sorted_keys = keys.clone();
     sorted_keys.sort_by_key(|k| -(k.len() as i32));
     let mut to_remove: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut to_bump: Vec<(String, u32)> = Vec::new();
+    let mut short_to_long: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     for i in 0..sorted_keys.len() {
         if to_remove.contains(&sorted_keys[i]) { continue; }
@@ -1277,11 +1693,35 @@ pub fn extract_srt_body_candidates(
                 let shorter_count = candidate_map.get(&sorted_keys[j]).map(|c| c.count).unwrap_or(0);
                 to_remove.insert(sorted_keys[j].clone());
                 to_bump.push((sorted_keys[i].clone(), shorter_count));
+                short_to_long.insert(sorted_keys[j].clone(), sorted_keys[i].clone());
             }
         }
     }
 
-    for key in &to_remove { candidate_map.remove(key); }
+    // Collect first_time propagations before mutation
+    let mut first_time_props: Vec<(String, Option<String>)> = Vec::new(); // (longer_key, shorter_first_time)
+    for key in &to_remove {
+        if let Some(shorter) = candidate_map.get(key) {
+            if let Some(longer_key) = short_to_long.get(key) {
+                first_time_props.push((longer_key.clone(), shorter.first_time.clone()));
+            }
+        }
+    }
+
+    // Apply first_time propagations
+    for (longer_key, shorter_ft) in &first_time_props {
+        if let Some(longer) = candidate_map.get_mut(longer_key) {
+            match (&longer.first_time, shorter_ft) {
+                (None, Some(_)) => longer.first_time.clone_from(shorter_ft),
+                (Some(la), Some(sa)) if sa < la => longer.first_time.clone_from(shorter_ft),
+                _ => {}
+            }
+        }
+    }
+
+    for key in &to_remove {
+        candidate_map.remove(key);
+    }
     for (longer_key, extra_count) in to_bump {
         if let Some(c) = candidate_map.get_mut(&longer_key) {
             c.count += extra_count;
@@ -1292,6 +1732,7 @@ pub fn extract_srt_body_candidates(
     let mut results: Vec<UnresolvedTerm> = candidate_map
         .into_values()
         .filter(|c| c.count >= 2 || contains_proper_noun_keyword(&c.original_text))
+        .filter(|c| !is_false_positive_unresolved(&c.original_text))
         .map(|c| {
             let (search_text, generic_suffix, aliases) = generate_search_aliases(&c.original_text);
             UnresolvedTerm {
@@ -1307,6 +1748,7 @@ pub fn extract_srt_body_candidates(
                 generic_suffix,
                 aliases,
                 confirmed_surface: None,
+                first_time: c.first_time,
             }
         })
         .collect();
@@ -1320,38 +1762,98 @@ pub fn extract_srt_body_candidates(
 // Commands
 // ---------------------------------------------------------------------------
 
+/// Derive a zh SRT pattern from the en pattern by replacing "en" with "zh".
+fn derive_zh_pattern(en_pattern: &str) -> Option<String> {
+    // Count occurrences of "en" in the pattern
+    let en_matches: Vec<_> = en_pattern.match_indices("en").collect();
+    if en_matches.len() == 1 {
+        let pos = en_matches[0].0;
+        let mut derived = String::with_capacity(en_pattern.len());
+        derived.push_str(&en_pattern[..pos]);
+        derived.push_str("zh");
+        derived.push_str(&en_pattern[pos + 2..]);
+        Some(derived)
+    } else if en_matches.is_empty() {
+        None
+    } else {
+        // Multiple "en" — fall back to default _zh\.srt$
+        None
+    }
+}
+
+const DEFAULT_SRT_ZH_PATTERN: &str = r"_zh\.srt$";
+
 /// List SRT files in a directory matching the configured English pattern.
+/// Also detects paired Chinese subtitle files (same base name with _zh instead of _en).
 #[tauri::command]
 pub fn list_srt_in_dir(
     app: tauri::AppHandle,
     dir_path: String,
 ) -> Result<Vec<SrtFileEntry>, String> {
-    let pattern = service_settings::read_srt_en_pattern(&app);
-    let re = regex::Regex::new(&pattern).map_err(|e| format!("Invalid regex: {}", e))?;
+    let en_pattern = service_settings::read_srt_en_pattern(&app);
+    let en_re = regex::Regex::new(&en_pattern).map_err(|e| format!("Invalid regex: {}", e))?;
+    let zh_pattern = derive_zh_pattern(&en_pattern).unwrap_or_else(|| DEFAULT_SRT_ZH_PATTERN.to_string());
+    let zh_re = regex::Regex::new(&zh_pattern).map_err(|e| format!("Invalid zh regex: {}", e))?;
 
     let dir = std::path::Path::new(&dir_path);
     if !dir.is_dir() {
         return Err(format!("Not a directory: {}", dir_path));
     }
 
-    let mut results: Vec<SrtFileEntry> = Vec::new();
+    // Collect all .srt files in the directory
+    let mut all_srt: Vec<(String, std::path::PathBuf)> = Vec::new();
     let entries = std::fs::read_dir(dir).map_err(|e| format!("Failed to read dir: {}", e))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().map(|e| e == "srt").unwrap_or(false) {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if re.is_match(name) {
-                    results.push(SrtFileEntry {
-                        path: path.to_string_lossy().to_string(),
-                        name: name.to_string(),
-                    });
-                }
+                all_srt.push((name.to_string(), path));
             }
         }
     }
 
+    // Separate en and zh files
+    let mut en_files: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut zh_files: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for (name, path) in &all_srt {
+        if en_re.is_match(name) {
+            en_files.push((name.clone(), path.clone()));
+        } else if zh_re.is_match(name) {
+            zh_files.push((name.clone(), path.clone()));
+        }
+    }
+
+    // Build a set of zh file paths for quick lookup
+    let zh_names: std::collections::HashSet<String> = zh_files.iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+
+    // For each en file, try to find its zh pair by replacing the en pattern match with zh
+    let mut results: Vec<SrtFileEntry> = Vec::new();
+    for (en_name, en_path) in &en_files {
+        let zh_candidate = en_re.replace(en_name, |caps: &regex::Captures| {
+            caps.get(0).unwrap().as_str().replace("en", "zh")
+        }).to_string();
+        let (zh_path, zh_name) = if zh_names.contains(&zh_candidate) {
+            let zh_full = dir.join(&zh_candidate);
+            (Some(zh_full.to_string_lossy().to_string()), Some(zh_candidate))
+        } else {
+            (None, None)
+        };
+        results.push(SrtFileEntry {
+            path: en_path.to_string_lossy().to_string(),
+            name: en_name.clone(),
+            zh_path,
+            zh_name,
+        });
+    }
+
     results.sort_by(|a, b| a.name.cmp(&b.name));
-    emit_log(&app, "info", "SRT", &format!("list_srt_in_dir: {} files found in {}", results.len(), dir_path));
+    let paired = results.iter().filter(|r| r.zh_path.is_some()).count();
+    emit_log(&app, "info", "SRT", &format!(
+        "list_srt_in_dir: {} en files found ({} with zh pair) in {}",
+        results.len(), paired, dir_path
+    ));
     Ok(results)
 }
 
@@ -1436,20 +1938,62 @@ pub async fn generate_srt_synopsis(
         }
     }
 
+    // Filter false positives (contractions, standalone titles) before processing
+    result.unresolved_terms.retain(|t| !is_false_positive_unresolved(&t.source_text));
+
     // Normalize synopsis-produced terms:
     // - surface_ja is always cleared (kanji resolution happens later via AI確認)
     // - trailing parenthesized Chinese candidates like "Huotu Water (火屠水)" are stripped
     // - generate search aliases for generic English suffixes
-    for term in &mut result.unresolved_terms {
-        term.source = Some("synopsis".to_string());
-        term.occurrence_count = 0;
-        term.surface_ja = String::new();
-        // Strip trailing parenthesized Chinese: "Huotu Water (火屠水)" → "Huotu Water"
-        term.source_text = strip_trailing_cjk_parenthetical(&term.source_text).to_string();
-        let (search_text, generic_suffix, aliases) = generate_search_aliases(&term.source_text);
-        term.search_text = search_text;
-        term.generic_suffix = generic_suffix;
-        term.aliases = aliases;
+    // - prune possessive terms whose owner is already known
+    {
+        let characters = state.characters.lock().map_err(|e| e.to_string())?;
+        let glossary = state.glossary.lock().map_err(|e| e.to_string())?;
+        let known_names = build_known_names_set(&characters, &glossary);
+
+        for term in &mut result.unresolved_terms {
+            term.source = Some("synopsis".to_string());
+            term.occurrence_count = 0;
+            term.surface_ja = String::new();
+            // Strip trailing parenthesized Chinese: "Huotu Water (火屠水)" → "Huotu Water"
+            term.source_text = strip_trailing_cjk_parenthetical(&term.source_text).to_string();
+            let (search_text, generic_suffix, aliases) = generate_search_aliases(&term.source_text);
+            term.search_text = search_text;
+            term.generic_suffix = generic_suffix;
+            term.aliases = aliases;
+        }
+
+        // Prune possessive terms whose owner is already known in the dictionary
+        let before_prune = result.unresolved_terms.len();
+        prune_possessive_terms(&mut result.unresolved_terms, &known_names);
+        let after_prune = result.unresolved_terms.len();
+        if before_prune != after_prune {
+            emit_log(&app, "info", "SRT", &format!(
+                "possessive prune: {} → {} terms ({} removed/narrowed)",
+                before_prune, after_prune, before_prune - after_prune
+            ));
+        }
+    }
+
+    // Filter pure-ASCII entries from detected_characters.
+    // Romanized names like "Ka Tuo" or "Yue Qi" are English subtitle artifacts;
+    // the character name list for Japanese context analysis should only contain
+    // kanji/kana entries.
+    let chars_before = result.detected_characters.len();
+    result.detected_characters.retain(|name| {
+        name.chars().any(|c| {
+            ('\u{4e00}'..='\u{9fff}').contains(&c)
+                || ('\u{3400}'..='\u{4dbf}').contains(&c)
+                || ('\u{3040}'..='\u{309f}').contains(&c)
+                || ('\u{30a0}'..='\u{30ff}').contains(&c)
+        })
+    });
+    let chars_removed = chars_before - result.detected_characters.len();
+    if chars_removed > 0 {
+        emit_log(&app, "info", "SRT", &format!(
+            "detected_characters からローマ字表記 {} 件を除外しました",
+            chars_removed
+        ));
     }
 
     emit_log(&app, "success", "SRT", &format!(
@@ -1523,8 +2067,32 @@ pub async fn analyze_scene_context(
     let (system, user) = build_scene_context_prompt(&entries, &names, &ctx);
     let value = client.chat_json(&system, &user).await?;
 
-    let result: SceneContextResult = serde_json::from_value(value)
+    let mut result: SceneContextResult = serde_json::from_value(value)
         .map_err(|e| format!("Failed to parse scene context JSON: {}", e))?;
+
+    // Detect Chinese-output and retry once with explicit Japanese instruction
+    if scene_context_has_chinese_prose(&result) {
+        emit_log(&app, "warn", "SRT",
+            "2.3 context_ja/hierarchy/gender_notes に中国語が疑われるため再生成します");
+        let retry_user = format!(
+            "{}\n\n【重要：再出力指示】\n\
+             あなたの前回の出力は日本語ではありませんでした。\n\
+             context_ja, hierarchy, gender_notes のすべてを必ず自然な日本語で書き直してください。\n\
+             中国語の文をそのまま出力しないでください。簡体字中国語文体は禁止です。\n\
+             日本語の助詞・助動詞を含む自然な文章で書き直してください。\n\
+             例: 「楚喬が庭で宇文玥と話している。二人は対等な立場にある。」",
+            user
+        );
+        let retry_value = client.chat_json(&system, &retry_user).await?;
+        result = serde_json::from_value(retry_value)
+            .map_err(|e| format!("Failed to parse retry scene context JSON: {}", e))?;
+        if scene_context_has_chinese_prose(&result) {
+            emit_log(&app, "warn", "SRT",
+                "再生成後も中国語判定に失敗しましたが、そのまま処理を続行します");
+        } else {
+            emit_log(&app, "success", "SRT", "再生成で日本語の状況設定を取得しました");
+        }
+    }
 
     emit_log(&app, "success", "SRT", "状況分析完了");
     Ok(result)
@@ -1537,12 +2105,21 @@ pub fn save_srt_analysis(
     analysis: SrtAnalysisFile,
 ) -> Result<(), String> {
     let srt_path = std::path::Path::new(&analysis.srt_path);
-    let parent = srt_path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let stem = srt_path
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy();
-    let analysis_path = parent.join(format!("{}.analysis.json", stem));
+
+    let analysis_path = if let Some(ref base_dir) = analysis.base_dir {
+        let dir = std::path::Path::new(base_dir).join(".srt_analysis");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Failed to create .srt_analysis/: {}", e))?;
+        dir.join(format!("{}.analysis.json", stem))
+    } else {
+        // Fallback: save next to the SRT file (legacy behavior)
+        let parent = srt_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        parent.join(format!("{}.analysis.json", stem))
+    };
 
     let json = serde_json::to_string_pretty(&analysis)
         .map_err(|e| format!("Failed to serialize analysis: {}", e))?;
@@ -1554,46 +2131,65 @@ pub fn save_srt_analysis(
 }
 
 /// Load analysis results for multiple SRT files.
+/// If base_dir is provided, tries `{base_dir}/.srt_analysis/{stem}.analysis.json` first,
+/// then falls back to the legacy sibling path `{srt_parent}/{stem}.analysis.json`.
 #[tauri::command]
 pub fn load_srt_analyses(
     app: tauri::AppHandle,
     srt_paths: Vec<String>,
+    base_dir: Option<String>,
 ) -> Result<Vec<SrtAnalysisFile>, String> {
     let mut results = Vec::new();
     for srt_path in &srt_paths {
         let p = std::path::Path::new(srt_path);
         let stem = p.file_stem().unwrap_or_default().to_string_lossy();
         let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
-        let analysis_path = parent.join(format!("{}.analysis.json", stem));
-        if analysis_path.exists() {
-            match std::fs::read_to_string(&analysis_path) {
-                Ok(content) => {
-                    match serde_json::from_str::<SrtAnalysisFile>(&content) {
-                        Ok(mut a) => {
-                            // Backward compat: ensure srt_path/srt_name match current path
-                            a.srt_path = srt_path.clone();
-                            if a.srt_name.is_empty() {
-                                a.srt_name = p
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string();
+
+        // Try new .srt_analysis/ path first, then legacy sibling path
+        let candidates: Vec<std::path::PathBuf> = if let Some(ref bd) = base_dir {
+            vec![
+                std::path::Path::new(bd).join(".srt_analysis").join(format!("{}.analysis.json", stem)),
+                parent.join(format!("{}.analysis.json", stem)),
+            ]
+        } else {
+            vec![parent.join(format!("{}.analysis.json", stem))]
+        };
+
+        for analysis_path in &candidates {
+            if analysis_path.exists() {
+                match std::fs::read_to_string(analysis_path) {
+                    Ok(content) => {
+                        match serde_json::from_str::<SrtAnalysisFile>(&content) {
+                            Ok(mut a) => {
+                                a.srt_path = srt_path.clone();
+                                if a.srt_name.is_empty() {
+                                    a.srt_name = p
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .to_string();
+                                }
+                                // Ensure base_dir is set even for old files without it
+                                if a.base_dir.is_none() {
+                                    a.base_dir = base_dir.clone();
+                                }
+                                results.push(a);
                             }
-                            results.push(a);
+                            Err(e) => {
+                                emit_log(&app, "warn", "SRT", &format!(
+                                    "Failed to parse analysis: {} — {}",
+                                    analysis_path.display(), e
+                                ));
+                            }
                         }
-                        Err(e) => {
-                            emit_log(&app, "warn", "SRT", &format!(
-                                "Failed to parse analysis: {} — {}",
-                                analysis_path.display(), e
-                            ));
-                        }
+                        break; // found one, stop checking candidates
                     }
-                }
-                Err(e) => {
-                    emit_log(&app, "debug", "SRT", &format!(
-                        "Failed to read analysis: {} — {}",
-                        analysis_path.display(), e
-                    ));
+                    Err(e) => {
+                        emit_log(&app, "debug", "SRT", &format!(
+                            "Failed to read analysis: {} — {}",
+                            analysis_path.display(), e
+                        ));
+                    }
                 }
             }
         }
@@ -1734,7 +2330,7 @@ fn romanized_to_katakana_candidates(source: &str) -> Vec<String> {
         // Basic consonant+vowel
         ("ka", "カ"), ("ki", "キ"), ("ku", "ク"), ("ke", "ケ"), ("ko", "コ"),
         ("sa", "サ"), ("shi", "シ"), ("su", "ス"), ("se", "セ"), ("so", "ソ"),
-        ("ta", "タ"), ("chi", "チ"), ("tsu", "ツ"), ("te", "テ"), ("to", "ト"),
+        ("ta", "タ"), ("chi", "チ"), ("tu", "トゥ"), ("tsu", "ツ"), ("te", "テ"), ("to", "ト"),
         ("na", "ナ"), ("ni", "ニ"), ("nu", "ヌ"), ("ne", "ネ"), ("no", "ノ"),
         ("ha", "ハ"), ("hi", "ヒ"), ("fu", "フ"), ("he", "ヘ"), ("ho", "ホ"),
         ("ma", "マ"), ("mi", "ミ"), ("mu", "ム"), ("me", "メ"), ("mo", "モ"),
@@ -1802,6 +2398,31 @@ fn romanized_to_katakana_candidates(source: &str) -> Vec<String> {
             .collect();
         if dot_form.len() == words.len() {
             candidates.push(dot_form.join("・"));
+        }
+    }
+
+    // Pass C: alt mapping without `tuo`→`トウ`, so `tu`→`トゥ` + `o`→`オ` produce トゥオ variants
+    if source.to_lowercase().contains("tuo") {
+        let alt_mapping: Vec<(&str, &str)> = mapping
+            .iter()
+            .filter(|&&(pat, _)| pat != "tuo")
+            .cloned()
+            .collect();
+        let concat_alt = romanize_word(&stripped, &alt_mapping);
+        if !concat_alt.is_empty() && concat_alt != candidates[0] {
+            candidates.push(concat_alt);
+        }
+        if words.len() >= 2 {
+            let dot_alt: Vec<String> = words.iter()
+                .map(|w| romanize_word(w, &alt_mapping))
+                .filter(|s| !s.is_empty())
+                .collect();
+            if dot_alt.len() == words.len() {
+                let dot_alt_str = dot_alt.join("・");
+                if candidates.len() < 2 || dot_alt_str != candidates[1] {
+                    candidates.push(dot_alt_str);
+                }
+            }
         }
     }
 
@@ -2705,6 +3326,72 @@ pub async fn resolve_unresolved_terms_batch_openai(
     Ok(all_results)
 }
 
+/// Disambiguate multi-line zh_context via LLM.
+/// Each request has an English `source_text` and a multi-line `zh_context`.
+/// The LLM picks which line(s) actually correspond to the source term.
+#[tauri::command]
+pub async fn disambiguate_zh_context(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    env_store: State<'_, EnvStoreState>,
+    requests: Vec<ZhDisambiguationRequest>,
+) -> Result<Vec<ZhDisambiguationResponse>, String> {
+    if requests.is_empty() {
+        return Ok(vec![]);
+    }
+
+    emit_log(&app, "info", "SRT", &format!(
+        "LLM曖昧性解消開始: {}件の複数行zh_contextを判定",
+        requests.len()
+    ));
+
+    let provider = resolve_provider(&state, &env_store, &app)?;
+    let client = LlmClient::new(provider);
+
+    let system = "\
+あなたは中国語字幕の翻訳アシスタントです。\
+与えられた英語の固有名詞・用語に対して、複数行の中国語字幕テキストの中から、\
+その用語に実際に対応する中国語表記を選んでください。\
+\
+ルール:\
+- 各行を注意深く読み、英語のsource_textの意味に最も合致する行を1つ選んでください\
+- 複数行が同じ意味を指している場合は、最も具体的・完全な表記の行を選んでください\
+- 出力は必ず元の簡体字中国語のまま返してください（日本語漢字に変換しないでください）\
+- 該当する行がない場合は、最も関連性の高そうな行を選んでください\
+- JSON配列のみを出力し、説明は一切含めないでください\
+\
+selected行から固有名詞を抽出（extracted）:\
+- selected行の中にsource_textに対応する固有名詞・称号・地名・組織名などの部分表現が\
+  含まれる場合は、その部分だけをextractedに返してください\
+- selected行全体が固有名詞そのものである場合は、selectedと同じ文字列をextractedに返してください\
+- 対応する部分表現を安全に切り出せない場合はextractedをnullにしてください\
+- extractedは必ずselectedの部分文字列でなければなりません（推測表記を作らないでください）\
+\
+出力例:\
+[{\"source_text\":\"Emperor Pei Luo\",\"selected\":\"效忠雍皇\",\"extracted\":\"雍皇\"}]";
+
+    let mut user = String::from("以下の各用語について、対応する中国語字幕の行を選んでください:\n\n");
+    for (i, req) in requests.iter().enumerate() {
+        user.push_str(&format!(
+            "--- 用語 {} ---\nsource_text: {}\nzh_context:\n{}\n\n",
+            i + 1,
+            req.source_text,
+            req.zh_context
+        ));
+    }
+
+    let value = client.chat_json(&system, &user).await?;
+    let results: Vec<ZhDisambiguationResponse> = serde_json::from_value(value)
+        .map_err(|e| format!("Failed to parse disambiguation JSON: {}", e))?;
+
+    emit_log(&app, "success", "SRT", &format!(
+        "LLM曖昧性解消完了: {}件判定",
+        results.len()
+    ));
+
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3144,6 +3831,61 @@ mod tests {
         assert!(!is_likely_chinese("This is a story about a young girl."));
     }
 
+    #[test]
+    fn test_scene_context_has_chinese_prose() {
+        let japanese = SceneContextResult {
+            scene_index: 0,
+            context_ja: "楚喬が庭で宇文玥と会話している。二人は互いに警戒している。".into(),
+            hierarchy: None,
+            gender_notes: vec![],
+        };
+        assert!(!scene_context_has_chinese_prose(&japanese));
+
+        let chinese_context = SceneContextResult {
+            scene_index: 0,
+            context_ja: "楚乔在院子里和宇文玥谈话，讨论反抗大魏的计划。这一场戏发生在夜晚。".into(),
+            hierarchy: None,
+            gender_notes: vec![],
+        };
+        assert!(scene_context_has_chinese_prose(&chinese_context));
+
+        // Chinese in gender_notes should also be caught (needs 20+ CJK to trigger)
+        let chinese_notes = SceneContextResult {
+            scene_index: 0,
+            context_ja: "楚喬と諸葛玥が話している。".into(),
+            hierarchy: None,
+            gender_notes: vec!["说话人是女性，她是燕北部落的领导者，对方是男性将军，两人之间存在复杂的情感关系和政治对立".into()],
+        };
+        assert!(scene_context_has_chinese_prose(&chinese_notes));
+    }
+
+    #[test]
+    fn test_filter_ascii_detected_characters() {
+        let mut names: Vec<String> = vec![
+            "楚喬".into(),
+            "李策".into(),
+            "Ka Tuo".into(),
+            "Yue Qi".into(),
+            "諸葛玥".into(),
+            "繯繯".into(),
+            "General Shi Yan".into(),
+            "燕洵".into(),
+        ];
+        names.retain(|name| {
+            name.chars().any(|c| {
+                ('\u{4e00}'..='\u{9fff}').contains(&c)
+                    || ('\u{3400}'..='\u{4dbf}').contains(&c)
+                    || ('\u{3040}'..='\u{309f}').contains(&c)
+                    || ('\u{30a0}'..='\u{30ff}').contains(&c)
+            })
+        });
+        // ASCII-only and pure-romanized should be removed
+        assert_eq!(names, vec!["楚喬", "李策", "諸葛玥", "繯繯", "燕洵"]);
+        assert!(!names.contains(&"Ka Tuo".to_string()));
+        assert!(!names.contains(&"Yue Qi".to_string()));
+        assert!(!names.contains(&"General Shi Yan".to_string()));
+    }
+
     // -----------------------------------------------------------------------
     // filter_synopsis_terms_by_known_names tests
     // -----------------------------------------------------------------------
@@ -3162,6 +3904,7 @@ mod tests {
             generic_suffix: None,
             aliases: None,
             confirmed_surface: None,
+            first_time: None,
         }
     }
 
@@ -3303,6 +4046,7 @@ mod tests {
             generic_suffix: None,
             aliases: None,
             confirmed_surface: None,
+            first_time: None,
         }
     }
 
@@ -3434,6 +4178,160 @@ mod tests {
         assert_eq!(search_text, Some("Qianzhang".to_string()));
         assert_eq!(generic_suffix, Some("Lake".to_string()));
         assert_eq!(aliases, Some(vec!["Qianzhang Lake".to_string(), "Qianzhang".to_string()]));
+    }
+
+    #[test]
+    fn test_possessive_split_king_of() {
+        let (_, _, aliases) = generate_search_aliases("Yanbei's King of Zhenxiao");
+        let a = aliases.unwrap();
+        assert!(a.contains(&"Yanbei".to_string()), "should contain Yanbei: {:?}", a);
+        assert!(a.contains(&"King of Zhenxiao".to_string()), "should contain King of Zhenxiao: {:?}", a);
+        assert!(a.contains(&"Zhenxiao".to_string()), "should contain Zhenxiao: {:?}", a);
+        assert!(a[0] == "Yanbei's King of Zhenxiao", "first alias must be source_text");
+    }
+
+    #[test]
+    fn test_possessive_split_ancestral_temple() {
+        let (_, _, aliases) = generate_search_aliases("Shengjin Palace's Chengguang Ancestral Temple");
+        let a = aliases.unwrap();
+        assert!(a.contains(&"Shengjin Palace".to_string()), "should contain Shengjin Palace: {:?}", a);
+        assert!(a.contains(&"Chengguang Ancestral Temple".to_string()), "should contain Chengguang Ancestral Temple: {:?}", a);
+        assert!(a.contains(&"Chengguang".to_string()), "should contain Chengguang: {:?}", a);
+    }
+
+    #[test]
+    fn test_possessive_split_northwest_army() {
+        let (_, _, aliases) = generate_search_aliases("Great Yong's Northwest Army");
+        let a = aliases.unwrap();
+        assert!(a.contains(&"Great Yong".to_string()), "should contain Great Yong: {:?}", a);
+        assert!(a.contains(&"Northwest Army".to_string()), "should contain Northwest Army: {:?}", a);
+    }
+
+    #[test]
+    fn test_possessive_split_wall_suffix() {
+        let (_, _, aliases) = generate_search_aliases("Yanbei's Xun Lie Wall");
+        let a = aliases.unwrap();
+        assert!(a.contains(&"Yanbei".to_string()), "should contain Yanbei: {:?}", a);
+        assert!(a.contains(&"Xun Lie Wall".to_string()), "should contain Xun Lie Wall: {:?}", a);
+        assert!(a.contains(&"Xun Lie".to_string()), "should contain Xun Lie: {:?}", a);
+    }
+
+    #[test]
+    fn test_leading_title_emperor() {
+        let (_, _, aliases) = generate_search_aliases("Emperor Pei Luo");
+        let a = aliases.unwrap();
+        assert!(a.contains(&"Pei Luo".to_string()), "should contain Pei Luo: {:?}", a);
+    }
+
+    #[test]
+    fn test_leading_title_single_word_skipped() {
+        // "Emperor Pei" — only 1 word after title → no decomposition produced,
+        // source_text only → sanitize returns None (nothing useful to search)
+        let (_, _, aliases) = generate_search_aliases("Emperor Pei");
+        assert!(aliases.is_none(), "no extra search hints for single-word remainder");
+    }
+
+    #[test]
+    fn test_no_possessive_no_suffix_returns_source_only() {
+        let (search_text, generic_suffix, aliases) = generate_search_aliases("Ka Tuo");
+        assert_eq!(search_text, None);
+        assert_eq!(generic_suffix, None);
+        assert_eq!(aliases, None, "no aliases for plain proper noun with no suffix/possessive");
+    }
+
+    #[test]
+    fn test_curly_apostrophe_decomposition() {
+        // \u{2019} = '
+        let (_, _, aliases) = generate_search_aliases("Shengjin Palace\u{2019}s Chengguang Ancestral Temple");
+        let a = aliases.unwrap();
+        assert!(a.contains(&"Shengjin Palace".to_string()), "should contain Shengjin Palace: {:?}", a);
+        assert!(a.contains(&"Chengguang Ancestral Temple".to_string()), "should contain Chengguang Ancestral Temple: {:?}", a);
+        assert!(a.contains(&"Chengguang".to_string()), "should contain Chengguang: {:?}", a);
+    }
+
+    #[test]
+    fn test_trailing_possessive_stripped_for_alias() {
+        // "Emperor Pei Luo's" → aliases should include "Emperor Pei Luo" and "Pei Luo"
+        let (_, _, aliases) = generate_search_aliases("Emperor Pei Luo\u{2019}s");
+        let a = aliases.unwrap();
+        assert!(a[0] == "Emperor Pei Luo\u{2019}s", "first alias must be original source_text");
+        assert!(a.contains(&"Emperor Pei Luo".to_string()), "should contain trailing-stripped: {:?}", a);
+        assert!(a.contains(&"Pei Luo".to_string()), "should contain title-stripped: {:?}", a);
+    }
+
+    #[test]
+    fn test_grand_marshal_decomposition() {
+        let (_, _, aliases) = generate_search_aliases("Great Yong\u{2019}s Northwest Army Grand Marshal");
+        let a = aliases.unwrap();
+        assert!(a.contains(&"Great Yong".to_string()), "should contain Great Yong: {:?}", a);
+        assert!(a.contains(&"Northwest Army Grand Marshal".to_string()), "should contain Northwest Army Grand Marshal: {:?}", a);
+        assert!(a.contains(&"Northwest Army".to_string()), "should contain Northwest Army: {:?}", a);
+        assert!(a.contains(&"Grand Marshal".to_string()), "should contain Grand Marshal: {:?}", a);
+    }
+
+    #[test]
+    fn test_false_positive_contraction_ive() {
+        let (_, _, aliases) = generate_search_aliases("I've");
+        assert!(aliases.is_none(), "I've should produce no search aliases");
+    }
+
+    #[test]
+    fn test_false_positive_contraction_dont() {
+        let (_, _, aliases) = generate_search_aliases("Don't");
+        assert!(aliases.is_none(), "Don't should produce no search aliases");
+    }
+
+    #[test]
+    fn test_false_positive_contraction_curly() {
+        // I\u{2019}m = I'm with curly apostrophe
+        let (_, _, aliases) = generate_search_aliases("I\u{2019}m");
+        assert!(aliases.is_none(), "I'm (curly) should produce no search aliases");
+    }
+
+    #[test]
+    fn test_false_positive_master_standalone() {
+        let (_, _, aliases) = generate_search_aliases("Master");
+        assert!(aliases.is_none(), "Master standalone should produce no search aliases");
+    }
+
+    #[test]
+    fn test_false_positive_your_highness() {
+        let (_, _, aliases) = generate_search_aliases("Your Highness");
+        assert!(aliases.is_none(), "Your Highness should produce no search aliases");
+    }
+
+    #[test]
+    fn test_false_positive_does_not_affect_emperor_name() {
+        // "Emperor Pei Luo" has a title + name — should still get aliases
+        let (_, _, aliases) = generate_search_aliases("Emperor Pei Luo");
+        assert!(aliases.is_some(), "Emperor Pei Luo should have aliases");
+    }
+
+    #[test]
+    fn test_suffix_stripping_rejects_possessive_remnant() {
+        let (search_text, _, aliases) = generate_search_aliases("Shengjin Palace's Chengguang Ancestral Temple");
+        assert!(aliases.is_some());
+        let a = aliases.unwrap();
+        assert!(!a.contains(&"Shengjin Palace's Chengguang".to_string()),
+            "should NOT contain half-baked possessive remnant: {:?}", a);
+        assert_eq!(search_text, None, "search_text should be None for possessive phrases");
+    }
+
+    #[test]
+    fn test_grand_marshal_rejects_possessive_remnant() {
+        let (search_text, _, aliases) = generate_search_aliases("Great Yong\u{2019}s Northwest Army Grand Marshal");
+        assert!(aliases.is_some());
+        let a = aliases.unwrap();
+        assert!(!a.contains(&"Great Yong's Northwest Army".to_string()),
+            "should NOT contain half-baked remnant: {:?}", a);
+        assert_eq!(search_text, None);
+    }
+
+    #[test]
+    fn test_suffix_stripping_allows_clean_form() {
+        let (search_text, generic_suffix, _) = generate_search_aliases("Zhenhuang City");
+        assert_eq!(search_text, Some("Zhenhuang".to_string()));
+        assert_eq!(generic_suffix, Some("City".to_string()));
     }
 
     // ---- sanitize_search_aliases tests ----
@@ -3613,6 +4511,41 @@ mod tests {
         let candidates = romanized_to_katakana_candidates("Ka Tuo");
         assert!(candidates.contains(&"カトウ".to_string()));
         assert!(candidates.contains(&"カ・トウ".to_string()));
+        assert!(candidates.contains(&"カトゥオ".to_string()), "expected カトゥオ for トゥ+オ decomposition");
+        assert!(candidates.contains(&"カ・トゥオ".to_string()), "expected カ・トゥオ for dot form with トゥ");
+    }
+
+    #[test]
+    fn test_resolve_known_terms_katou_to_ka_tuo() {
+        // Regression: カトウ → 卡托 via glossary alias (existing behavior)
+        let glossary = vec![
+            make_glossary_full("Ka Tuo", "卡托", vec!["カトウ", "カ・トウ"]),
+        ];
+        let input = "カトウが反乱を起こす";
+        let expected = "卡托が反乱を起こす";
+        assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
+    }
+
+    #[test]
+    fn test_resolve_known_terms_katuo_to_ka_tuo() {
+        // カトゥオ → 卡托 via glossary alias (new behavior from Pass C)
+        let glossary = vec![
+            make_glossary_full("Ka Tuo", "卡托", vec!["カトゥオ", "カ・トゥオ"]),
+        ];
+        let input = "カトゥオが金暉部落を扇動して反乱を起こす";
+        let expected = "卡托が金暉部落を扇動して反乱を起こす";
+        assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
+    }
+
+    #[test]
+    fn test_resolve_known_terms_katou_dot_to_ka_tuo() {
+        // カ・トゥオ → 卡托 (dot form)
+        let glossary = vec![
+            make_glossary_full("Ka Tuo", "卡托", vec!["カトゥオ", "カ・トゥオ"]),
+        ];
+        let input = "カ・トゥオが到着した";
+        let expected = "卡托が到着した";
+        assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
     }
 
     #[test]
@@ -3638,4 +4571,159 @@ mod tests {
         let candidates = romanized_to_katakana_candidates("Chun Er");
         assert!(candidates.contains(&"チュンアル".to_string()));
     }
+
+    // -----------------------------------------------------------------------
+    // Title-of decomposition tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_search_aliases_king_of_decomposes() {
+        let (_, _, aliases) = generate_search_aliases("King of Zhenxi");
+        let a = aliases.unwrap();
+        assert!(a.contains(&"King of Zhenxi".to_string()));
+        assert!(a.contains(&"Zhenxi".to_string()),
+            "should decompose 'King of X' → X: {:?}", a);
+    }
+
+    #[test]
+    fn test_generate_search_aliases_prince_of_decomposes() {
+        let (_, _, aliases) = generate_search_aliases("Prince of Biantang");
+        let a = aliases.unwrap();
+        assert!(a.contains(&"Biantang".to_string()));
+    }
+
+    #[test]
+    fn test_generate_search_aliases_general_of_decomposes() {
+        let (_, _, aliases) = generate_search_aliases("General of Yanbei");
+        let a = aliases.unwrap();
+        assert!(a.contains(&"Yanbei".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Possessive pruning tests
+    // -----------------------------------------------------------------------
+
+    fn make_test_term(source_text: &str) -> UnresolvedTerm {
+        UnresolvedTerm {
+            source_text: source_text.to_string(),
+            surface_ja: String::new(),
+            term_type: "proper_noun".to_string(),
+            status: "unresolved".to_string(),
+            reason: String::new(),
+            source: Some("synopsis".to_string()),
+            occurrence_count: 0,
+            alias_candidate: None,
+            search_text: None,
+            generic_suffix: None,
+            aliases: None,
+            confirmed_surface: None,
+            first_time: None,
+        }
+    }
+
+    #[test]
+    fn test_prune_known_owner_narrows_to_target_with_core() {
+        let mut set = std::collections::HashSet::new();
+        set.insert("yanbei".to_string());
+        let mut terms = vec![make_test_term("Yanbei's King of Zhenxi")];
+        prune_possessive_terms(&mut terms, &set);
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].source_text, "King of Zhenxi");
+        let a = terms[0].aliases.as_ref().unwrap();
+        assert!(a.contains(&"Zhenxi".to_string()),
+            "aliases should include title-of core 'Zhenxi': {:?}", a);
+        assert!(terms[0].reason.contains("Yanbei"),
+            "reason should preserve derivation context: {:?}", terms[0].reason);
+    }
+
+    #[test]
+    fn test_prune_known_owner_narrows_great_yong() {
+        let mut set = std::collections::HashSet::new();
+        set.insert("great yong".to_string());
+        let mut terms = vec![make_test_term("Great Yong's Northwest Army Grand Marshal")];
+        prune_possessive_terms(&mut terms, &set);
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].source_text, "Northwest Army Grand Marshal");
+        let a = terms[0].aliases.as_ref().unwrap();
+        assert!(a.contains(&"Northwest Army Grand Marshal".to_string()),
+            "should keep the full target: {:?}", a);
+        assert!(a.contains(&"Northwest Army".to_string()),
+            "should decompose suffix: {:?}", a);
+        assert!(a.contains(&"Grand Marshal".to_string()),
+            "should emit multi-word suffix: {:?}", a);
+    }
+
+    #[test]
+    fn test_prune_all_known_removes_term() {
+        let mut set = std::collections::HashSet::new();
+        set.insert("yanbei".to_string());
+        for part in ["xun", "lie", "wall", "xun lie wall"] {
+            set.insert(part.to_string());
+        }
+        set.insert("xunliewall".to_string());
+        let mut terms = vec![make_test_term("Yanbei's Xun Lie Wall")];
+        prune_possessive_terms(&mut terms, &set);
+        assert_eq!(terms.len(), 0, "term should be removed when owner and target are known");
+    }
+
+    #[test]
+    fn test_prune_unknown_owner_kept_as_is() {
+        let mut set = std::collections::HashSet::new();
+        set.insert("yanbei".to_string());
+        let mut terms = vec![make_test_term("Unknown Lord's Dark Tower")];
+        prune_possessive_terms(&mut terms, &set);
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].source_text, "Unknown Lord's Dark Tower");
+    }
+
+    // --- find_possessive_in_text tests ---
+
+    #[test]
+    fn test_find_possessive_ascii_apostrophe() {
+        let (owner, target) = find_possessive_in_text("Yanbei's King of Zhenxi").unwrap();
+        assert_eq!(owner, "Yanbei");
+        assert_eq!(target, "King of Zhenxi");
+    }
+
+    #[test]
+    fn test_find_possessive_curly_apostrophe_u2019() {
+        // \u{2019} = ' (right single quotation mark, 3 bytes)
+        let text = "Shengjin Palace\u{2019}s Chengguang Ancestral Temple";
+        let (owner, target) = find_possessive_in_text(text).unwrap();
+        assert_eq!(owner, "Shengjin Palace");
+        assert_eq!(target, "Chengguang Ancestral Temple");
+    }
+
+    #[test]
+    fn test_find_possessive_trailing_curly() {
+        let text = "Emperor Pei Luo\u{2019}s";
+        let (owner, target) = find_possessive_in_text(text).unwrap();
+        assert_eq!(owner, "Emperor Pei Luo");
+        assert_eq!(target, "");
+    }
+
+    #[test]
+    fn test_find_possessive_trailing_ascii() {
+        let text = "Emperor Pei Luo's";
+        let (owner, target) = find_possessive_in_text(text).unwrap();
+        assert_eq!(owner, "Emperor Pei Luo");
+        assert_eq!(target, "");
+    }
+
+    #[test]
+    fn test_find_possessive_none_when_absent() {
+        assert!(find_possessive_in_text("Chengguang Ancestral Temple").is_none());
+    }
+
+    #[test]
+    fn test_find_possessive_middle_curly_with_prefix() {
+        // "Great Yong\u{2019}s Northwest Army Grand Marshal"
+        let text = "Great Yong\u{2019}s Northwest Army Grand Marshal";
+        let (owner, target) = find_possessive_in_text(text).unwrap();
+        assert_eq!(owner, "Great Yong");
+        assert_eq!(target, "Northwest Army Grand Marshal");
+    }
+
+    // --- map_normalized_offset tests ---
+
 }

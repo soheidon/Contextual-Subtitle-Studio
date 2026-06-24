@@ -108,6 +108,15 @@ export interface TranslationResult {
   issues: ValidationIssue[];
 }
 
+export interface TranslationProgress {
+  phase: string;
+  current_scene: number;
+  total_scenes: number;
+  current_entry_count: number;
+  total_entry_count: number;
+  detail: string;
+}
+
 // ---------------------------------------------------------------------------
 // Scraper types (mirrors Rust scraper/mod.rs)
 // ---------------------------------------------------------------------------
@@ -403,6 +412,8 @@ export interface ServiceSettings {
 export interface SrtFileEntry {
   path: string;
   name: string;
+  zh_path?: string;
+  zh_name?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +466,20 @@ export interface UnresolvedTerm {
   generic_suffix?: string;   // detected generic English suffix (e.g. "City", "River")
   aliases?: string[];        // search aliases: [full_source_text, search_text, ...] (deduplicated)
   confirmed_surface?: string; // confirmed kanji notation for glossary output
+  first_time?: string;       // earliest SRT timestamp where this term appears (e.g. "00:03:45,123")
+  zh_context?: string;       // Chinese subtitle text around first_time from paired zh SRT (raw search context)
+  zh_surface?: string;       // simplified Chinese term selected from zh_context (before Japanese conversion)
+}
+
+export interface ZhDisambiguationRequest {
+  source_text: string;
+  zh_context: string;
+}
+
+export interface ZhDisambiguationResponse {
+  source_text: string;
+  selected: string;
+  extracted?: string | null;
 }
 
 export interface SrtSynopsisResult {
@@ -503,6 +528,7 @@ export interface KatakanaKanjiMap {
 export interface SrtAnalysisFile {
   srt_path: string;
   srt_name: string;
+  base_dir?: string;
   synopsis: SrtSynopsisResult | null;
   scene_detection: SceneDetectionResult | null;
   scene_contexts: SceneContextResult[];
@@ -510,6 +536,7 @@ export interface SrtAnalysisFile {
   term_variants: TermVariantEntry[];
   unresolved_terms: UnresolvedTerm[];
   adopted_terms?: GlossaryEntry[];
+  translation_prompt?: string | null;
 }
 
 // ---------------------------------------------------------------------------

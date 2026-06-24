@@ -82,14 +82,15 @@ pub fn build_translation_user_prompt(entries: &[SubtitleEntry]) -> String {
     prompt
 }
 
-/// Build the user prompt for translating a single scene,
-/// including the scene's description and characters as context.
+/// Build the user prompt for translating a single scene.
+/// Asks the LLM to return a JSON array of {index, text} — timestamps are never sent to the LLM
+/// and are always reconstructed from the original on the Rust side.
 pub fn build_scene_translation_user_prompt(
     scene: &super::super::translation::Scene,
     entries: &[SubtitleEntry],
 ) -> String {
     let mut prompt = String::from(
-        "以下の英語SRTを日本語に翻訳してください。SRT番号とタイムコードは絶対に変更しないでください。\n\n",
+        "以下の英語字幕を日本語に翻訳してください。\n\n",
     );
 
     prompt.push_str("【シーン情報】\n");
@@ -102,13 +103,14 @@ pub fn build_scene_translation_user_prompt(
     prompt.push_str("\n");
 
     for entry in entries {
-        prompt.push_str(&format!(
-            "{}\n{} --> {}\n{}\n\n",
-            entry.index, entry.start, entry.end, entry.text
-        ));
+        prompt.push_str(&format!("{}: {}\n", entry.index, entry.text));
     }
 
-    prompt.push_str("上記のSRTを日本語に翻訳し、同じSRT形式で出力してください。");
+    prompt.push_str("\n出力は以下のJSON形式で返してください：\n");
+    prompt.push_str("{\n  \"translations\": [\n");
+    prompt.push_str("    { \"index\": 番号, \"text\": \"日本語訳\" }\n");
+    prompt.push_str("  ]\n}\n");
+    prompt.push_str("\n全字幕を必ず含めてください。indexは入力と同じ番号を使ってください。");
     prompt
 }
 

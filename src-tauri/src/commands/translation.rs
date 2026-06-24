@@ -20,13 +20,9 @@ pub async fn start_translation(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     env_store: State<'_, EnvStoreState>,
+    entries: Vec<SubtitleEntry>,
     translation_config: TranslationConfig,
 ) -> Result<TranslationResult, String> {
-    let entries = {
-        let stored = state.srt_entries.lock().map_err(|e| e.to_string())?;
-        stored.clone()
-    };
-
     let characters: Vec<Character> = {
         let stored = state.characters.lock().map_err(|e| e.to_string())?;
         stored.clone()
@@ -37,10 +33,31 @@ pub async fn start_translation(
         stored.clone()
     };
 
-    let provider = resolve_provider(&state, &env_store, &app)?;
+    let mut provider = resolve_provider(&state, &env_store, &app)?;
+
+    let base_url_lower = provider.base_url.to_ascii_lowercase();
+    let model_lower = provider.model.to_ascii_lowercase();
+    let is_deepseek =
+        base_url_lower.contains("deepseek") || model_lower.contains("deepseek");
+
+    if is_deepseek && model_lower.contains("flash") {
+        let old_model = provider.model.clone();
+        provider.model = "deepseek-v4-pro".to_string();
+        eprintln!(
+            "[LLM] Translation model override: old_model={} new_model={}",
+            old_model, provider.model
+        );
+    }
+
+    eprintln!(
+        "[LLM] final translation model: provider={} base_url={} model={}",
+        provider.provider, provider.base_url, provider.model
+    );
+
     let client = LlmClient::new(provider);
 
     let (translated, issues) = run_translation_pipeline(
+        &app,
         &entries,
         &characters,
         &glossary,

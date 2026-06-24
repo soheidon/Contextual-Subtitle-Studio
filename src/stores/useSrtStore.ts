@@ -23,6 +23,9 @@ export interface SrtFileState {
   entries: SubtitleEntry[];
   status: "pending" | "loading" | "loaded" | "error";
   error?: string;
+  // Chinese subtitle pair (auto-detected by list_srt_in_dir)
+  zhPath: string | null;
+  zhEntries: SubtitleEntry[];
   // Analysis results (2.1, 2.2, 2.3)
   synopsis: SrtSynopsisResult | null;
   sceneDetection: SceneDetectionResult | null;
@@ -31,6 +34,7 @@ export interface SrtFileState {
   termVariants: TermVariantEntry[];
   unresolvedTerms: UnresolvedTerm[];
   adoptedTerms: GlossaryEntry[];
+  translation_prompt?: string | null;
   termLoading: Record<string, boolean>;
   batchTermLoading: boolean;
 }
@@ -38,6 +42,7 @@ export interface SrtFileState {
 interface SrtState {
   // Multi-file state
   folderPath: string | null;
+  projectBaseDir: string | null;
   files: SrtFileState[];
   // Backward-compatible single-file accessors (reflects first file)
   entries: SubtitleEntry[];
@@ -45,13 +50,15 @@ interface SrtState {
   filePath: string | null;
   isLoaded: boolean;
   // Multi-file actions
-  setFolder: (folderPath: string, files: { path: string; name: string }[]) => void;
+  setFolder: (folderPath: string, files: { path: string; name: string; zh_path?: string; zh_name?: string }[]) => void;
   setFileEntries: (path: string, entries: SubtitleEntry[]) => void;
+  setFileZhEntries: (path: string, entries: SubtitleEntry[]) => void;
   setFileStatus: (path: string, status: SrtFileState["status"], error?: string) => void;
   // Analysis actions
   setFileSynopsis: (path: string, synopsis: SrtSynopsisResult, katakanaMap?: KatakanaKanjiMap[], termVariants?: TermVariantEntry[], unresolvedTerms?: UnresolvedTerm[]) => void;
   setFileSceneDetection: (path: string, result: SceneDetectionResult) => void;
   setFileSceneContext: (path: string, sceneIndex: number, context: SceneContextResult) => void;
+  clearFileSceneContexts: (path: string) => void;
   // Web term resolution actions
   setTermWebResult: (path: string, sourceText: string, result: WebTermResolution) => void;
   adoptTerm: (path: string, sourceText: string) => void;
@@ -61,6 +68,8 @@ interface SrtState {
   setBatchTermLoading: (path: string, loading: boolean) => void;
   setBatchTermResults: (path: string, results: WebTermResolution[]) => void;
   setFileAdoptedTerms: (path: string, adoptedTerms: GlossaryEntry[]) => void;
+  setFileTranslationPrompt: (path: string, translationPrompt: string | null) => void;
+  setProjectBaseDir: (dir: string | null) => void;
   // Legacy single-file action (kept for TranslatePanel compatibility)
   setEntries: (entries: SubtitleEntry[], fileName: string, filePath?: string) => void;
   clear: () => void;
@@ -81,6 +90,7 @@ function deriveSingleFile(state: Pick<SrtState, "files">): {
 
 export const useSrtStore = create<SrtState>((set) => ({
   folderPath: null,
+  projectBaseDir: null,
   files: [],
   entries: [],
   fileName: null,
@@ -94,6 +104,8 @@ export const useSrtStore = create<SrtState>((set) => ({
         name: f.name,
         entries: [],
         status: "pending" as const,
+        zhPath: f.zh_path ?? null,
+        zhEntries: [],
         synopsis: null,
         sceneDetection: null,
         sceneContexts: {},
@@ -126,6 +138,13 @@ export const useSrtStore = create<SrtState>((set) => ({
       return { ...state, files: newFiles, ...derived, isLoaded };
     }),
 
+  setFileZhEntries: (path, entries) =>
+    set((state) => ({
+      files: state.files.map((f) =>
+        f.path === path ? { ...f, zhEntries: entries } : f,
+      ),
+    })),
+
   setFileStatus: (path, status, error) =>
     set((state) => {
       const newFiles = state.files.map((f) =>
@@ -156,6 +175,13 @@ export const useSrtStore = create<SrtState>((set) => ({
         f.path === path
           ? { ...f, sceneContexts: { ...f.sceneContexts, [sceneIndex]: context } }
           : f,
+      ),
+    })),
+
+  clearFileSceneContexts: (path) =>
+    set((state) => ({
+      files: state.files.map((f) =>
+        f.path === path ? { ...f, sceneContexts: {} } : f,
       ),
     })),
 
@@ -291,12 +317,23 @@ export const useSrtStore = create<SrtState>((set) => ({
       ),
     })),
 
+  setFileTranslationPrompt: (path, translationPrompt) =>
+    set((state) => ({
+      files: state.files.map((f) =>
+        f.path === path ? { ...f, translation_prompt: translationPrompt } : f,
+      ),
+    })),
+
+  setProjectBaseDir: (dir) => set({ projectBaseDir: dir }),
+
   setEntries: (entries, fileName, filePath) => {
     const singleFile: SrtFileState = {
       path: filePath ?? "inline",
       name: fileName,
       entries,
       status: "loaded",
+      zhPath: null,
+      zhEntries: [],
       synopsis: null,
       sceneDetection: null,
       sceneContexts: {},
@@ -320,6 +357,7 @@ export const useSrtStore = create<SrtState>((set) => ({
   clear: () =>
     set({
       folderPath: null,
+      projectBaseDir: null,
       files: [],
       entries: [],
       fileName: null,
