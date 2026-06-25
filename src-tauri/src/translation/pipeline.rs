@@ -1,12 +1,18 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::dictionary::{Character, GlossaryEntry};
-use crate::llm::{TranslationConfig, LlmClient, build_system_prompt, build_scene_translation_user_prompt};
+use crate::llm::{
+    build_scene_translation_user_prompt, build_system_prompt, LlmClient, TranslationConfig,
+};
+use crate::log::{emit_log, preview_chars};
 use crate::srt::SubtitleEntry;
 use tauri::Emitter;
 
 use super::scene_detector::detect_scenes;
-use super::validator::{validate_translations, ValidationIssue, should_remove_from_final_output, is_empty_subtitle_entry};
+use super::validator::{
+    is_empty_subtitle_entry, should_remove_from_final_output, validate_translations,
+    ValidationIssue,
+};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TranslationProgress {
@@ -94,14 +100,17 @@ pub async fn run_translation_pipeline(
     let total_entry_count = entries.len();
 
     // Phase 1: ask the LLM to identify scene boundaries.
-    let _ = app.emit("translation-progress", TranslationProgress {
-        phase: "シーン検出中...".to_string(),
-        current_scene: 0,
-        total_scenes: 0,
-        current_entry_count: 0,
-        total_entry_count,
-        detail: "LLMがシーンの境界を分析しています".to_string(),
-    });
+    let _ = app.emit(
+        "translation-progress",
+        TranslationProgress {
+            phase: "シーン検出中...".to_string(),
+            current_scene: 0,
+            total_scenes: 0,
+            current_entry_count: 0,
+            total_entry_count,
+            detail: "LLMがシーンの境界を分析しています".to_string(),
+        },
+    );
 
     let scenes = detect_scenes(entries, client).await?;
     if scenes.is_empty() {
@@ -136,26 +145,27 @@ pub async fn run_translation_pipeline(
 
         // Use JSON mode with one automatic retry on parse failure.
         // LLM returns {"translations": [{index, text}]} — no timestamps.
-        let json_value = match translate_scene_json_with_retry(
-            client,
-            &system_prompt,
-            &user_prompt,
-            scene_idx,
-        ).await {
-            Ok(v) => v,
-            Err(e) => {
-                all_issues.push(ValidationIssue {
-                    index: scene.start_index,
-                    issue_type: "translation_error".to_string(),
-                    severity: "high".to_string(),
-                    message: format!("Scene {} translation failed: {}", scene_idx + 1, e),
-                    source_text: scene_entries.first().map(|e| e.text.clone()).unwrap_or_default(),
-                    translation: String::new(),
-                    suggestion: None,
-                });
-                continue;
-            }
-        };
+        let json_value =
+            match translate_scene_json_with_retry(client, &system_prompt, &user_prompt, scene_idx)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    all_issues.push(ValidationIssue {
+                        index: scene.start_index,
+                        issue_type: "translation_error".to_string(),
+                        severity: "high".to_string(),
+                        message: format!("Scene {} translation failed: {}", scene_idx + 1, e),
+                        source_text: scene_entries
+                            .first()
+                            .map(|e| e.text.clone())
+                            .unwrap_or_default(),
+                        translation: String::new(),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            };
 
         // Parse {"translations": [{"index": N, "text": "..."}]}
         let raw_list = match json_value.get("translations").and_then(|v| v.as_array()) {
@@ -169,9 +179,13 @@ pub async fn run_translation_pipeline(
                         "Scene {}: LLM response missing 'translations' array",
                         scene_idx + 1,
                     ),
-                    source_text: scene_entries.first().map(|e| e.text.clone()).unwrap_or_default(),
+                    source_text: scene_entries
+                        .first()
+                        .map(|e| e.text.clone())
+                        .unwrap_or_default(),
                     translation: String::new(),
                     suggestion: None,
+                    ..Default::default()
                 });
                 continue;
             }
@@ -191,10 +205,16 @@ pub async fn run_translation_pipeline(
                 index: scene.start_index,
                 issue_type: "parse_error".to_string(),
                 severity: "high".to_string(),
-                message: format!("Scene {}: no valid translations in LLM response", scene_idx + 1),
-                source_text: scene_entries.first().map(|e| e.text.clone()).unwrap_or_default(),
+                message: format!(
+                    "Scene {}: no valid translations in LLM response",
+                    scene_idx + 1
+                ),
+                source_text: scene_entries
+                    .first()
+                    .map(|e| e.text.clone())
+                    .unwrap_or_default(),
                 translation: String::new(),
-                suggestion: None,
+                ..Default::default()
             });
             continue;
         }
@@ -212,7 +232,7 @@ pub async fn run_translation_pipeline(
             })
             .collect();
 
-        let issues = validate_translations(&scene_entries, &translated_entries, glossary);
+        let issues = validate_translations(&scene_entries, &translated_entries, glossary, Some(scene_idx));
         let has_fatal_structure_error = issues.iter().any(|i| {
             i.issue_type == "structure"
                 && i.severity == "high"
@@ -227,19 +247,22 @@ pub async fn run_translation_pipeline(
             // Fatal structure error (duplicate, unexpected, or timestamp):
             // keep original entries for the whole scene.
             translated_entry_count += scene_entries.len();
-            let _ = app.emit("translation-progress", TranslationProgress {
-                phase: "翻訳中...".to_string(),
-                current_scene: scene_idx + 1,
-                total_scenes,
-                current_entry_count: translated_entry_count,
-                total_entry_count,
-                detail: format!(
-                    "シーン {}/{} 構造エラーのためスキップ ({}行中)",
-                    scene_idx + 1,
+            let _ = app.emit(
+                "translation-progress",
+                TranslationProgress {
+                    phase: "翻訳中...".to_string(),
+                    current_scene: scene_idx + 1,
                     total_scenes,
-                    translated_entry_count,
-                ),
-            });
+                    current_entry_count: translated_entry_count,
+                    total_entry_count,
+                    detail: format!(
+                        "シーン {}/{} 構造エラーのためスキップ ({}行中)",
+                        scene_idx + 1,
+                        total_scenes,
+                        translated_entry_count,
+                    ),
+                },
+            );
             continue;
         }
 
@@ -248,20 +271,23 @@ pub async fn run_translation_pipeline(
         }
         translated_entry_count += scene_entries.len();
 
-        let _ = app.emit("translation-progress", TranslationProgress {
-            phase: "翻訳中...".to_string(),
-            current_scene: scene_idx + 1,
-            total_scenes,
-            current_entry_count: translated_entry_count,
-            total_entry_count,
-            detail: format!(
-                "シーン {}/{} 完了 ({}行翻訳 / {}行中)",
-                scene_idx + 1,
+        let _ = app.emit(
+            "translation-progress",
+            TranslationProgress {
+                phase: "翻訳中...".to_string(),
+                current_scene: scene_idx + 1,
                 total_scenes,
-                translated_entry_count,
+                current_entry_count: translated_entry_count,
                 total_entry_count,
-            ),
-        });
+                detail: format!(
+                    "シーン {}/{} 完了 ({}行翻訳 / {}行中)",
+                    scene_idx + 1,
+                    total_scenes,
+                    translated_entry_count,
+                    total_entry_count,
+                ),
+            },
+        );
     }
 
     // Reassemble in original order; failed scenes retain their original text.
@@ -276,6 +302,80 @@ pub async fn run_translation_pipeline(
             e
         })
         .collect();
+
+    // Log high-severity validation issues with full context.
+    let high_issues: Vec<&ValidationIssue> =
+        all_issues.iter().filter(|i| i.severity == "high").collect();
+    if !high_issues.is_empty() {
+        emit_log(
+            app,
+            "ERROR",
+            "VALIDATION",
+            &format!(
+                "Blocking save: {} high-severity issue(s)",
+                high_issues.len()
+            ),
+        );
+        const MAX_LOGGED: usize = 20;
+        for (n, issue) in high_issues.iter().take(MAX_LOGGED).enumerate() {
+            emit_log(
+                app,
+                "ERROR",
+                "VALIDATION",
+                &format!(
+                    "#{} kind={} scene={} subtitle={} time={} --> {}",
+                    n + 1,
+                    issue.issue_type,
+                    issue.scene_index.map_or("-".into(), |s| s.to_string()),
+                    issue.subtitle_number.map_or("-".into(), |n| n.to_string()),
+                    issue.start_time.as_deref().unwrap_or("-"),
+                    issue.end_time.as_deref().unwrap_or("-"),
+                ),
+            );
+            if !issue.source_text.is_empty() {
+                emit_log(
+                    app,
+                    "ERROR",
+                    "VALIDATION",
+                    &format!("source: {}", preview_chars(&issue.source_text, 120)),
+                );
+            }
+            emit_log(
+                app,
+                "ERROR",
+                "VALIDATION",
+                &format!(
+                    "translated: {}",
+                    preview_chars(&issue.translation, 120)
+                ),
+            );
+            if let Some(ref frag) = issue.detected_fragment {
+                emit_log(
+                    app,
+                    "ERROR",
+                    "VALIDATION",
+                    &format!("detected_fragment: {}", frag),
+                );
+            }
+            emit_log(
+                app,
+                "ERROR",
+                "VALIDATION",
+                &format!("message: {}", issue.message),
+            );
+        }
+        if high_issues.len() > MAX_LOGGED {
+            emit_log(
+                app,
+                "ERROR",
+                "VALIDATION",
+                &format!(
+                    "... and {} more high-severity validation issue(s)",
+                    high_issues.len() - MAX_LOGGED
+                ),
+            );
+        }
+    }
 
     Ok((all_translated, all_issues))
 }
@@ -321,11 +421,7 @@ mod tests {
             },
         ];
 
-        let trans_map: HashMap<u32, String> = [
-            (1, "こんにちは".into()),
-            (2, "世界".into()),
-        ]
-        .into();
+        let trans_map: HashMap<u32, String> = [(1, "こんにちは".into()), (2, "世界".into())].into();
 
         let reconstructed = reconstruct_from_json(&scene_entries, &trans_map);
 
@@ -347,11 +443,15 @@ mod tests {
         // LLM omitted index 2 — it should be missing from the output.
         let scene_entries = vec![
             SubtitleEntry {
-                index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(),
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
                 text: "A".into(),
             },
             SubtitleEntry {
-                index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(),
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
                 text: "B".into(),
             },
         ];
@@ -383,8 +483,7 @@ mod tests {
             },
         ];
 
-        let trans_map: HashMap<u32, String> =
-            [(10, "JP1".into()), (11, "JP2".into())].into();
+        let trans_map: HashMap<u32, String> = [(10, "JP1".into()), (11, "JP2".into())].into();
 
         let reconstructed = reconstruct_from_json(&scene_entries, &trans_map);
 
@@ -403,11 +502,15 @@ mod tests {
 
         let scene_entries = vec![
             SubtitleEntry {
-                index: 10, start: "00:01:00,000".into(), end: "00:01:02,000".into(),
+                index: 10,
+                start: "00:01:00,000".into(),
+                end: "00:01:02,000".into(),
                 text: "EN1".into(),
             },
             SubtitleEntry {
-                index: 11, start: "00:01:03,000".into(), end: "00:01:05,000".into(),
+                index: 11,
+                start: "00:01:03,000".into(),
+                end: "00:01:05,000".into(),
                 text: "EN2".into(),
             },
         ];
@@ -419,7 +522,9 @@ mod tests {
 
         let issues = validate_srt_structure(&scene_entries, &reconstructed);
         assert_eq!(issues.len(), 1); // missing entry 11 (count mismatch suppressed)
-        assert!(issues.iter().any(|i| i.message.contains("Missing translated entry for index 11")));
+        assert!(issues
+            .iter()
+            .any(|i| i.message.contains("Missing translated entry for index 11")));
         assert!(!issues.iter().any(|i| i.message.contains("count mismatch")));
     }
 
@@ -433,31 +538,45 @@ mod tests {
         // Simulated BTreeMap result after translation (index-ordered)
         let entries: Vec<SubtitleEntry> = vec![
             SubtitleEntry {
-                index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(),
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
                 text: "Hello".into(),
             },
             SubtitleEntry {
-                index: 2, start: "00:00:02,000".into(), end: "00:00:03,000".into(),
-                text: "Subtitles by Viki Team".into(),  // removable credit — dropped
+                index: 2,
+                start: "00:00:02,000".into(),
+                end: "00:00:03,000".into(),
+                text: "Subtitles by Viki Team".into(), // removable credit — dropped
             },
             SubtitleEntry {
-                index: 3, start: "00:00:03,000".into(), end: "00:00:04,000".into(),
-                text: "".into(),  // empty subtitle — dropped
+                index: 3,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "".into(), // empty subtitle — dropped
             },
             SubtitleEntry {
-                index: 4, start: "00:00:04,000".into(), end: "00:00:05,000".into(),
+                index: 4,
+                start: "00:00:04,000".into(),
+                end: "00:00:05,000".into(),
                 text: "World".into(),
             },
             SubtitleEntry {
-                index: 5, start: "00:00:05,000".into(), end: "00:00:06,000".into(),
-                text: "Rebirth Team @Viki.com".into(),  // removable credit — dropped
+                index: 5,
+                start: "00:00:05,000".into(),
+                end: "00:00:06,000".into(),
+                text: "Rebirth Team @Viki.com".into(), // removable credit — dropped
             },
             SubtitleEntry {
-                index: 6, start: "00:00:06,000".into(), end: "00:00:07,000".into(),
-                text: "\"Rebirth\" - Curley Gao".into(),  // song credit — KEPT
+                index: 6,
+                start: "00:00:06,000".into(),
+                end: "00:00:07,000".into(),
+                text: "\"Rebirth\" - Curley Gao".into(), // song credit — KEPT
             },
             SubtitleEntry {
-                index: 7, start: "00:00:07,000".into(), end: "00:00:08,000".into(),
+                index: 7,
+                start: "00:00:07,000".into(),
+                end: "00:00:08,000".into(),
                 text: "Goodbye".into(),
             },
         ];

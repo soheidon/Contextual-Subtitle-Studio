@@ -116,7 +116,8 @@ mod tests {
 
     #[test]
     fn test_load_glossary_csv() {
-        let csv = "source,target,type,notes\nHis Majesty,陛下,title,皇帝への呼称\nYanbei,燕北,place,\n";
+        let csv =
+            "source,target,type,notes\nHis Majesty,陛下,title,皇帝への呼称\nYanbei,燕北,place,\n";
 
         let entries = load_glossary_csv(csv).unwrap();
         assert_eq!(entries.len(), 2);

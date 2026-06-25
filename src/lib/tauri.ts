@@ -22,6 +22,7 @@ import type {
   MdlExtractResult,
   MdlPageInfo,
   ServiceSettings,
+  LlmTaskModelSettings,
   ResolvedProviderSettings,
   SearchCandidate,
   DramaSearchQuery,
@@ -37,6 +38,7 @@ import type {
   UnresolvedTerm,
   WebTermResolution,
   BatchTermRequest,
+  TranslationReadiness,
 } from "../types";
 
 // Project
@@ -101,8 +103,8 @@ export const setActiveEnvVar = (name: string | null) =>
 export const getActiveEnvVar = () =>
   invoke<ActiveEnvVarInfo>("get_active_env_var");
 
-export const checkActiveConnection = (name?: string) =>
-  invoke<boolean>("check_active_connection", { name: name ?? null });
+export const checkActiveConnection = (name?: string, modelTier?: "pro" | "flash") =>
+  invoke<boolean>("check_active_connection", { name: name ?? null, modelTier: modelTier ?? null });
 
 export const checkEnvVarKeyExists = (name: string) =>
   invoke<boolean>("check_env_var_key_exists", { name });
@@ -124,8 +126,8 @@ export const listEnvVars = () =>
   invoke<EnvVarInfo[]>("list_env_vars");
 
 // Translation
-export const startTranslation = (entries: SubtitleEntry[], translationConfig: TranslationConfig) =>
-  invoke<TranslationResult>("start_translation", { entries, translationConfig });
+export const startTranslation = (entries: SubtitleEntry[], translationConfig: TranslationConfig, srtPath?: string) =>
+  invoke<TranslationResult>("start_translation", { entries, translationConfig, srtPath: srtPath ?? null });
 
 export const cancelTranslation = () =>
   invoke<void>("cancel_translation");
@@ -234,6 +236,12 @@ export const getServiceSettings = () =>
 export const saveServiceSettings = (settings: ServiceSettings) =>
   invoke<void>("save_service_settings", { settings });
 
+export const getLlmTaskModelSettings = () =>
+  invoke<LlmTaskModelSettings>("get_llm_task_model_settings");
+
+export const saveLlmTaskModelSettings = (settings: LlmTaskModelSettings) =>
+  invoke<void>("save_llm_task_model_settings", { settings });
+
 export const testTmdbConnection = (apiKey: string, baseUrl: string) =>
   invoke<boolean>("test_tmdb_connection", { apiKey, baseUrl });
 
@@ -244,6 +252,10 @@ export const getProviderSettings = (prefix: string) =>
 export const saveProviderSettings = (prefix: string, settings: {
   base_url?: string | null;
   model?: string | null;
+  pro_model?: string | null;
+  flash_model?: string | null;
+  default_tier?: "pro" | "flash" | null;
+  supports_thinking?: boolean | null;
   thinking?: string | null;
 }) =>
   invoke<void>("save_provider_settings", { prefix, settings });
@@ -327,6 +339,9 @@ export const saveSrtAnalysis = (analysis: SrtAnalysisFile) =>
 
 export const loadSrtAnalyses = (srtPaths: string[], baseDir?: string) =>
   invoke<SrtAnalysisFile[]>("load_srt_analyses", { srtPaths, baseDir });
+
+export const getTranslationReadinessForSrt = (srtPath: string, baseDir?: string) =>
+  invoke<TranslationReadiness>("get_translation_readiness_for_srt", { srtPath, baseDir });
 
 export const resolveSynopsisKatakana = (synopsisJa: string, unresolvedTerms: UnresolvedTerm[]) =>
   invoke<KatakanaKanjiMap[]>("resolve_synopsis_katakana", { synopsisJa, unresolvedTerms });

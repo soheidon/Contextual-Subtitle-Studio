@@ -89,7 +89,14 @@ fn mask_value(v: &str) -> String {
         format!("{}{}{}", prefix, "*".repeat(len - 2), suffix)
     } else {
         let prefix: String = v.chars().take(3).collect();
-        let suffix: String = v.chars().rev().take(2).collect::<String>().chars().rev().collect();
+        let suffix: String = v
+            .chars()
+            .rev()
+            .take(2)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         format!("{}{}{}", prefix, "*".repeat(len - 5), suffix)
     }
 }
@@ -138,9 +145,7 @@ pub fn delete_env_var(
 }
 
 #[tauri::command]
-pub fn list_env_vars(
-    state: tauri::State<EnvStoreState>,
-) -> Result<Vec<EnvVarInfo>, String> {
+pub fn list_env_vars(state: tauri::State<EnvStoreState>) -> Result<Vec<EnvVarInfo>, String> {
     let store = state.0.lock().map_err(|e| e.to_string())?;
     let mut entries: Vec<EnvVarInfo> = store
         .0

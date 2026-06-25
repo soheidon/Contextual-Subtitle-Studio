@@ -11,15 +11,15 @@ import {
   saveProviderSettings,
   getServiceSettings,
   saveServiceSettings,
+  getLlmTaskModelSettings,
+  saveLlmTaskModelSettings,
   testOpenaiAiConfirm,
 } from "../../lib/tauri";
-import type { ProviderPreset } from "../../types";
+import type { LlmTaskModelSettings, ModelTier, ProviderPreset } from "../../types";
 import ServiceSettingsPanel from "./ServiceSettings";
 
 // ---- Constants ----
 
-const DEEPSEEK_PRESETS = ["deepseek-v4-flash", "deepseek-v4-pro"];
-const CUSTOM_KEY = "__custom__";
 const THINKING_OPTIONS = [
   { value: "disabled", label: "無効" },
   { value: "enabled", label: "有効" },
@@ -33,17 +33,43 @@ interface ProviderDraft {
   envVarName: string;
   apiKey: string;
   baseUrl: string;
-  model: string;
+  proModel: string;
+  flashModel: string;
+  defaultTier: ModelTier;
+  supportsThinking: boolean;
   thinking: string;
   connState: ConnState;
   testing: boolean;
   message: RowMessage;
 }
 
-const DESC: Record<string, string> = {
-  DEEPSEEK:
-    "DeepSeek V4系モデルは Thinking / Non-Thinking の両モードに対応しています。通常は無効、高精度な推論が必要な場合は有効にしてください。",
+const THINKING_DESC =
+  "このProviderはThinking設定に対応しています。高精度な推論が必要な処理で有効にできます。";
+
+const DEFAULT_TASK_MODEL_SETTINGS: LlmTaskModelSettings = {
+  synopsis_generation: "pro",
+  scene_detection: "pro",
+  scene_context_analysis: "pro",
+  proper_noun_confirmation: "pro",
+  subtitle_translation: "pro",
+  lightweight_cleanup: "flash",
+  kanji_correction: "pro",
+  zh_context_disambiguation: "flash",
 };
+
+const TASK_MODEL_ROWS: Array<{
+  key: keyof LlmTaskModelSettings;
+  label: string;
+}> = [
+  { key: "synopsis_generation", label: "あらすじ生成" },
+  { key: "scene_detection", label: "場面検出" },
+  { key: "scene_context_analysis", label: "場面文脈分析" },
+  { key: "proper_noun_confirmation", label: "固有名詞確認" },
+  { key: "subtitle_translation", label: "通常翻訳" },
+  { key: "lightweight_cleanup", label: "軽い補正・検証" },
+  { key: "kanji_correction", label: "漢字補正" },
+  { key: "zh_context_disambiguation", label: "中文候補の曖昧性判定" },
+];
 
 // ---- Component ----
 
@@ -63,6 +89,7 @@ export default function SettingsPanel() {
   const [hasKey, setHasKey] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, ProviderDraft>>({});
+  const [taskModels, setTaskModels] = useState<LlmTaskModelSettings>(DEFAULT_TASK_MODEL_SETTINGS);
 
   // Load presets on mount, then load per-provider settings
   useEffect(() => {
@@ -71,6 +98,13 @@ export default function SettingsPanel() {
       const p = await listProviderPresets();
       if (cancelled) return;
       setPresets(p);
+
+      try {
+        const savedTaskModels = await getLlmTaskModelSettings();
+        if (!cancelled) setTaskModels(savedTaskModels);
+      } catch {
+        if (!cancelled) setTaskModels(DEFAULT_TASK_MODEL_SETTINGS);
+      }
 
       // Load key existence for each preset
       const results = await Promise.all(
@@ -94,7 +128,10 @@ export default function SettingsPanel() {
             envVarName: `${prefix}_API_KEY`,
             apiKey: "",
             baseUrl: ps.base_url,
-            model: ps.model,
+            proModel: ps.pro_model,
+            flashModel: ps.flash_model,
+            defaultTier: ps.default_tier,
+            supportsThinking: ps.supports_thinking,
             thinking: ps.thinking,
             connState: map[`${prefix}_API_KEY`] ? "configured" : "unset",
             testing: false,
@@ -180,7 +217,7 @@ export default function SettingsPanel() {
     }
   };
 
-  const handleTestConnection = async (prefix: string) => {
+  const handleTestConnection = async (prefix: string, modelTier?: ModelTier) => {
     const d = getDraft(prefix);
     const tag = providerLabelStatic(prefix);
     updateDraft(prefix, { testing: true, message: null });
@@ -189,16 +226,20 @@ export default function SettingsPanel() {
     try {
       await saveProviderSettings(prefix, {
         base_url: d.baseUrl || null,
-        model: d.model || null,
+        pro_model: d.proModel || null,
+        flash_model: d.flashModel || null,
+        default_tier: d.defaultTier || null,
+        supports_thinking: d.supportsThinking,
         thinking: d.thinking || null,
       });
     } catch {
       // save is best-effort for the test
     }
 
-    const extra =
-      prefix === "DEEPSEEK" ? `, thinking=${d.thinking}` : "";
-    addLog("info", tag, `接続テスト開始: model=${d.model}${extra}`);
+    const tier = modelTier ?? d.defaultTier;
+    const model = tier === "pro" ? d.proModel : d.flashModel;
+    const extra = d.supportsThinking ? `, thinking=${d.thinking}` : "";
+    addLog("info", tag, `接続テスト開始: tier=${tier}, model=${model}${extra}`);
 
     try {
       const has = await checkEnvVarKeyExists(d.envVarName);
@@ -208,7 +249,7 @@ export default function SettingsPanel() {
         addLog("warning", tag, "接続テスト: APIキーが未設定です");
         return;
       }
-      await checkActiveConnection(d.envVarName);
+      await checkActiveConnection(d.envVarName, modelTier);
       updateDraft(prefix, { testing: false, connState: "ok" });
       setMsg(prefix, "ok", "接続OK");
       addLog("success", tag, "接続OK");
@@ -228,14 +269,17 @@ export default function SettingsPanel() {
     try {
       await saveProviderSettings(prefix, {
         base_url: d.baseUrl || null,
-        model: d.model || null,
+        pro_model: d.proModel || null,
+        flash_model: d.flashModel || null,
+        default_tier: d.defaultTier || null,
+        supports_thinking: d.supportsThinking,
         thinking: d.thinking || null,
       });
     } catch {
       // save is best-effort for the test
     }
 
-    addLog("info", tag, `AI確認テスト開始: model=${d.model}`);
+    addLog("info", tag, `AI確認テスト開始: model=${d.proModel}`);
 
     try {
       const has = await checkEnvVarKeyExists(d.envVarName);
@@ -258,17 +302,60 @@ export default function SettingsPanel() {
 
   const handleResetDefaults = (prefix: string) => {
     // Reset to preset defaults — save empty overrides so defaults apply
-    saveProviderSettings(prefix, { base_url: null, model: null, thinking: null }).catch(() => {});
+    saveProviderSettings(prefix, {
+      base_url: null,
+      model: null,
+      pro_model: null,
+      flash_model: null,
+      default_tier: null,
+      supports_thinking: null,
+      thinking: null,
+    }).catch(() => {});
     // Show preset defaults immediately in the UI
     const preset = presets.find(([p]) => p === prefix)?.[1];
     const defaults = preset
-      ? { baseUrl: preset.base_url, model: preset.model, thinking: "disabled" }
-      : { baseUrl: "", model: "", thinking: "disabled" };
+      ? {
+          baseUrl: preset.base_url,
+          proModel: preset.pro_model,
+          flashModel: preset.flash_model,
+          defaultTier: preset.default_tier,
+          supportsThinking: preset.supports_thinking,
+          thinking: preset.default_thinking,
+        }
+      : {
+          baseUrl: "",
+          proModel: "",
+          flashModel: "",
+          defaultTier: "pro" as ModelTier,
+          supportsThinking: false,
+          thinking: "disabled",
+        };
     updateDraft(prefix, {
       envVarName: `${prefix}_API_KEY`,
       ...defaults,
     });
     addLog("info", providerLabelStatic(prefix), "デフォルト設定に戻しました");
+  };
+
+  const persistTaskModels = async (models: LlmTaskModelSettings) => {
+    try {
+      await saveLlmTaskModelSettings(models);
+    } catch (e) {
+      addLog("error", "LLM", `作業別モデル設定の保存失敗: ${e}`);
+    }
+  };
+
+  const updateTaskModel = (key: keyof LlmTaskModelSettings, value: ModelTier) => {
+    setTaskModels((current) => {
+      const next = { ...current, [key]: value };
+      persistTaskModels(next);
+      return next;
+    });
+  };
+
+  const resetTaskModels = () => {
+    setTaskModels(DEFAULT_TASK_MODEL_SETTINGS);
+    persistTaskModels(DEFAULT_TASK_MODEL_SETTINGS);
   };
 
   return (
@@ -318,9 +405,6 @@ export default function SettingsPanel() {
                 const isActive = active.name === envName;
                 const d = getDraft(prefix);
                 const msg = d.message;
-                const isDs = prefix === "DEEPSEEK";
-                const isKnownPreset = isDs ? DEEPSEEK_PRESETS.includes(d.model) : false;
-                const modelSelectValue = isDs && !isKnownPreset ? CUSTOM_KEY : d.model;
 
                 return (
                   <Fragment key={prefix}>
@@ -421,59 +505,43 @@ export default function SettingsPanel() {
                             />
                           </FieldGrid2>
 
-                          {/* Model */}
+                          {/* Model tiers */}
                           <FieldGrid2>
-                            <FieldLabel>使用モデル</FieldLabel>
-                            <div style={{ display: "flex", gap: 8 }}>
-                              {isDs ? (
-                                <>
-                                  <select
-                                    className="form-input"
-                                    style={{ flex: 1 }}
-                                    value={modelSelectValue}
-                                    onChange={(e) => {
-                                      const val = e.target.value;
-                                      if (val === CUSTOM_KEY) {
-                                        updateDraft(prefix, { model: d.model || "deepseek-v4-flash" });
-                                      } else {
-                                        updateDraft(prefix, { model: val });
-                                      }
-                                    }}
-                                  >
-                                    {DEEPSEEK_PRESETS.map((m) => (
-                                      <option key={m} value={m}>{m}</option>
-                                    ))}
-                                    <option value={CUSTOM_KEY}>カスタム</option>
-                                  </select>
-                                </>
-                              ) : (
-                                <input
-                                  className="form-input"
-                                  value={d.model}
-                                  onChange={(e) => updateDraft(prefix, { model: e.target.value })}
-                                  placeholder={presets.find(([p]) => p === prefix)?.[1].model || ""}
-                                  style={{ fontFamily: "monospace", fontSize: 12 }}
-                                />
-                              )}
-                            </div>
+                            <FieldLabel>Pro相当モデル</FieldLabel>
+                            <input
+                              className="form-input"
+                              value={d.proModel}
+                              onChange={(e) => updateDraft(prefix, { proModel: e.target.value })}
+                              placeholder={presets.find(([p]) => p === prefix)?.[1].pro_model || ""}
+                              style={{ fontFamily: "monospace", fontSize: 12 }}
+                            />
                           </FieldGrid2>
 
-                          {/* Custom model input (DeepSeek) */}
-                          {isDs && !isKnownPreset && (
-                            <FieldGrid2>
-                              <FieldLabel>カスタムモデル</FieldLabel>
-                              <input
-                                className="form-input"
-                                value={d.model}
-                                onChange={(e) => updateDraft(prefix, { model: e.target.value })}
-                                placeholder="deepseek-v4-flash"
-                                style={{ fontFamily: "monospace", fontSize: 12 }}
-                              />
-                            </FieldGrid2>
-                          )}
+                          <FieldGrid2>
+                            <FieldLabel>Flash相当モデル</FieldLabel>
+                            <input
+                              className="form-input"
+                              value={d.flashModel}
+                              onChange={(e) => updateDraft(prefix, { flashModel: e.target.value })}
+                              placeholder={presets.find(([p]) => p === prefix)?.[1].flash_model || ""}
+                              style={{ fontFamily: "monospace", fontSize: 12 }}
+                            />
+                          </FieldGrid2>
 
-                          {/* Thinking (DeepSeek only) */}
-                          {isDs && (
+                          <FieldGrid2>
+                            <FieldLabel>デフォルト使用</FieldLabel>
+                            <select
+                              className="form-input"
+                              value={d.defaultTier}
+                              onChange={(e) => updateDraft(prefix, { defaultTier: e.target.value as ModelTier })}
+                            >
+                              <option value="pro">Pro相当</option>
+                              <option value="flash">Flash相当</option>
+                            </select>
+                          </FieldGrid2>
+
+                          {/* Thinking */}
+                          {d.supportsThinking && (
                             <>
                               <FieldGrid2>
                                 <FieldLabel>Thinking</FieldLabel>
@@ -487,18 +555,16 @@ export default function SettingsPanel() {
                                   ))}
                                 </select>
                               </FieldGrid2>
-                              {DESC[prefix] && (
-                                <p
-                                  style={{
-                                    fontSize: 11,
-                                    color: "var(--text-muted)",
-                                    margin: "-8px 0 14px 120px",
-                                    lineHeight: 1.4,
-                                  }}
-                                >
-                                  {DESC[prefix]}
-                                </p>
-                              )}
+                              <p
+                                style={{
+                                  fontSize: 11,
+                                  color: "var(--text-muted)",
+                                  margin: "-8px 0 14px 120px",
+                                  lineHeight: 1.4,
+                                }}
+                              >
+                                {THINKING_DESC}
+                              </p>
                             </>
                           )}
 
@@ -508,10 +574,17 @@ export default function SettingsPanel() {
                               <>
                                 <button
                                   className="btn btn-primary"
-                                  onClick={() => handleTestConnection(prefix)}
+                                  onClick={() => handleTestConnection(prefix, "pro")}
                                   disabled={d.testing}
                                 >
-                                  {d.testing ? "テスト中..." : "Chat接続テスト"}
+                                  {d.testing ? "テスト中..." : "Pro接続テスト"}
+                                </button>
+                                <button
+                                  className="btn btn-primary"
+                                  onClick={() => handleTestConnection(prefix, "flash")}
+                                  disabled={d.testing}
+                                >
+                                  {d.testing ? "テスト中..." : "Flash接続テスト"}
                                 </button>
                                 <button
                                   className="btn btn-primary"
@@ -524,23 +597,30 @@ export default function SettingsPanel() {
                                   className="btn btn-secondary"
                                   onClick={() => handleResetDefaults(prefix)}
                                 >
-                                  Defaultに設定
+                                  標準設定に戻す
                                 </button>
                               </>
                             ) : (
                               <>
                                 <button
                                   className="btn btn-primary"
-                                  onClick={() => handleTestConnection(prefix)}
+                                  onClick={() => handleTestConnection(prefix, "pro")}
                                   disabled={d.testing}
                                 >
-                                  {d.testing ? "テスト中..." : "接続テスト"}
+                                  {d.testing ? "テスト中..." : "Pro接続テスト"}
+                                </button>
+                                <button
+                                  className="btn btn-primary"
+                                  onClick={() => handleTestConnection(prefix, "flash")}
+                                  disabled={d.testing}
+                                >
+                                  {d.testing ? "テスト中..." : "Flash接続テスト"}
                                 </button>
                                 <button
                                   className="btn btn-secondary"
                                   onClick={() => handleResetDefaults(prefix)}
                                 >
-                                  Defaultに設定
+                                  標準設定に戻す
                                 </button>
                               </>
                             )}
@@ -558,7 +638,7 @@ export default function SettingsPanel() {
                             >
                               AI確認では OpenAI Responses API + web_search tool を使用します。
                               <code style={{ fontSize: 11 }}>POST https://api.openai.com/v1/responses</code>{" "}
-                              を呼び出し、モデルは上記の「使用モデル」設定が使われます。
+                              を呼び出し、モデルは上記の「Pro相当モデル」設定が使われます。
                               Chat互換APIとは異なるエンドポイントです。
                             </p>
                           )}
@@ -601,6 +681,41 @@ export default function SettingsPanel() {
               })}
             </tbody>
           </table>
+        </div>
+      </div>
+
+      <div className="card">
+        <h2 className="card-title">作業別モデル</h2>
+        <div style={{ display: "grid", gap: 10 }}>
+          {TASK_MODEL_ROWS.map((row) => (
+            <div
+              key={row.key}
+              style={{
+                display: "grid",
+                gridTemplateColumns: "180px minmax(0, 1fr)",
+                gap: 12,
+                alignItems: "center",
+              }}
+            >
+              <label className="form-label" style={{ marginBottom: 0 }}>
+                {row.label}
+              </label>
+              <select
+                className="form-input"
+                value={taskModels[row.key]}
+                onChange={(e) => updateTaskModel(row.key, e.target.value as ModelTier)}
+              >
+                <option value="pro">Pro相当モデル</option>
+                <option value="flash">Flash相当モデル</option>
+              </select>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ marginTop: 16 }}>
+          <button className="btn btn-secondary" onClick={resetTaskModels}>
+            標準値に戻す
+          </button>
         </div>
       </div>
 
@@ -697,7 +812,10 @@ function emptyDraft(prefix: string, configured: boolean): ProviderDraft {
     envVarName: `${prefix}_API_KEY`,
     apiKey: "",
     baseUrl: "",
-    model: "",
+    proModel: "",
+    flashModel: "",
+    defaultTier: "pro",
+    supportsThinking: false,
     thinking: "disabled",
     connState: configured ? "configured" : "unset",
     testing: false,

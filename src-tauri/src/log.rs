@@ -80,7 +80,7 @@ mod tests {
         let s: String = std::iter::repeat('日').take(500).collect();
         let result = preview_chars(&s, 100);
         assert_eq!(result.chars().count(), 103); // 100 + "..."
-        // Verify no replacement characters from broken UTF-8 boundaries
+                                                 // Verify no replacement characters from broken UTF-8 boundaries
         assert!(!result.contains('\u{FFFD}'));
     }
 }

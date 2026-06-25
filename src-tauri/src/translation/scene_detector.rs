@@ -55,7 +55,9 @@ async fn detect_scenes_single(
          各シーンについて、SRT番号の範囲・登場人物・1文の概要をJSONで返してください。",
         compressed
     );
-    let response = client.chat_json(SCENE_DETECTION_SYSTEM_PROMPT, &user_prompt).await?;
+    let response = client
+        .chat_json(SCENE_DETECTION_SYSTEM_PROMPT, &user_prompt)
+        .await?;
     parse_scene_response(&response, entries)
 }
 
@@ -77,7 +79,9 @@ async fn detect_scenes_batched(
              各シーンについて、SRT番号の範囲・登場人物・1文の概要をJSONで返してください。",
             compressed
         );
-        let response = client.chat_json(SCENE_DETECTION_SYSTEM_PROMPT, &user_prompt).await?;
+        let response = client
+            .chat_json(SCENE_DETECTION_SYSTEM_PROMPT, &user_prompt)
+            .await?;
         let scenes = parse_scene_response(&response, window)?;
 
         // Filter scenes that are within this window (drop cross-boundary scenes from the tail
@@ -91,7 +95,10 @@ async fn detect_scenes_batched(
             }
             // Skip scenes that extend into the next window's overlap (next batch handles them).
             if end < entries.len()
-                && scene.end_idx_in_entries(entries).map(|i| i >= end - BATCH_OVERLAP).unwrap_or(false)
+                && scene
+                    .end_idx_in_entries(entries)
+                    .map(|i| i >= end - BATCH_OVERLAP)
+                    .unwrap_or(false)
             {
                 continue;
             }
@@ -192,7 +199,10 @@ fn fill_gaps(scenes: &mut Vec<Scene>, entries: &[SubtitleEntry]) {
             0,
             Scene {
                 start_index: first_idx,
-                end_index: scenes.first().map(|s| s.start_index.saturating_sub(1)).unwrap_or(last_idx),
+                end_index: scenes
+                    .first()
+                    .map(|s| s.start_index.saturating_sub(1))
+                    .unwrap_or(last_idx),
                 characters: vec![],
                 description: "（未分類）".to_string(),
             },
@@ -284,10 +294,7 @@ mod tests {
 
     #[test]
     fn test_compress_keeps_indices_and_text() {
-        let entries = vec![
-            make_entry(1, "Hello"),
-            make_entry(2, "World"),
-        ];
+        let entries = vec![make_entry(1, "Hello"), make_entry(2, "World")];
         let s = compress_for_analysis(&entries);
         assert!(s.contains("1: Hello"));
         assert!(s.contains("2: World"));
@@ -317,8 +324,18 @@ mod tests {
             make_entry(4, "d"),
         ];
         let mut scenes = vec![
-            Scene { start_index: 1, end_index: 1, characters: vec![], description: "a".into() },
-            Scene { start_index: 4, end_index: 4, characters: vec![], description: "d".into() },
+            Scene {
+                start_index: 1,
+                end_index: 1,
+                characters: vec![],
+                description: "a".into(),
+            },
+            Scene {
+                start_index: 4,
+                end_index: 4,
+                characters: vec![],
+                description: "d".into(),
+            },
         ];
         fill_gaps(&mut scenes, &entries);
         assert_eq!(scenes.len(), 3);
@@ -328,11 +345,7 @@ mod tests {
 
     #[test]
     fn test_fill_gaps_adds_trailing_scene() {
-        let entries = vec![
-            make_entry(1, "a"),
-            make_entry(2, "b"),
-            make_entry(3, "c"),
-        ];
+        let entries = vec![make_entry(1, "a"), make_entry(2, "b"), make_entry(3, "c")];
         let mut scenes = vec![Scene {
             start_index: 1,
             end_index: 2,

@@ -2,7 +2,7 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
-use super::{ScrapedCharacter, ScrapeResult, ScrapeSource};
+use super::{ScrapeResult, ScrapeSource, ScrapedCharacter};
 use crate::character_dict::{PasteSource, PastedEntry};
 
 /// Result of extracting data from a WebView-loaded MDL page.
@@ -102,7 +102,10 @@ async fn fetch_mdl(url: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to read response body: {}", e))?;
 
     // Cloudflare challenge ページの検出
-    if body.contains("cf-challenge") || body.contains("Just a moment") || body.contains("Checking if the site connection is secure") {
+    if body.contains("cf-challenge")
+        || body.contains("Just a moment")
+        || body.contains("Checking if the site connection is secure")
+    {
         let snippet: String = body.chars().take(2000).collect();
         return Err(format!(
             "Cloudflare challenge 検出 (HTTP 200 だがチャレンジページ)\n\n--- Body (先頭2000文字) ---\n{}",
@@ -186,8 +189,7 @@ fn extract_synopsis(document: &Html) -> Option<String> {
 fn extract_cast_primary(document: &Html) -> Vec<ScrapedCharacter> {
     let row_sel = Selector::parse(".cast li, .cast-crew li, .list-item, tr.cast").unwrap();
     let name_sel = Selector::parse("h3 a, .text-primary a, .title a, a.text-primary").unwrap();
-    let actor_sel =
-        Selector::parse(".text-muted, small, .actor-name, .muted").unwrap();
+    let actor_sel = Selector::parse(".text-muted, small, .actor-name, .muted").unwrap();
 
     let mut chars = Vec::new();
     for (i, row) in document.select(&row_sel).enumerate() {
@@ -217,8 +219,8 @@ fn extract_cast_primary(document: &Html) -> Vec<ScrapedCharacter> {
 /// Fallback: broader selectors when the primary ones don't match.
 fn extract_cast_fallback(document: &Html) -> Vec<ScrapedCharacter> {
     // Try any <li> inside a container with "cast" or "credit" in class/id
-    let row_sel = Selector::parse("[class*='cast'] li, [id*='cast'] li, [class*='credit'] li")
-        .unwrap();
+    let row_sel =
+        Selector::parse("[class*='cast'] li, [id*='cast'] li, [class*='credit'] li").unwrap();
     let link_sel = Selector::parse("a").unwrap();
 
     let mut chars = Vec::new();
@@ -347,8 +349,15 @@ mod tests {
             let id = el.value().id().unwrap_or("");
             let classes: Vec<_> = el.value().classes().collect();
             let text = el.text().collect::<String>();
-            let short = if text.len() > 200 { crate::log::preview_chars(&text, 200) } else { text };
-            println!("  <{} id={:?} classes={:?}> text={:?}", tag, id, classes, short);
+            let short = if text.len() > 200 {
+                crate::log::preview_chars(&text, 200)
+            } else {
+                text
+            };
+            println!(
+                "  <{} id={:?} classes={:?}> text={:?}",
+                tag, id, classes, short
+            );
         }
 
         // Try current selectors

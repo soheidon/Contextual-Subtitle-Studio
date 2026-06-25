@@ -1,6 +1,7 @@
 use crate::character_dict::MergedCastEntry;
-use crate::commands::llm::resolve_provider;
+use crate::commands::llm::resolve_provider_for_tier;
 use crate::commands::project::AppState;
+use crate::commands::service_settings;
 use crate::envstore::EnvStoreState;
 use crate::llm::LlmClient;
 use crate::web_search;
@@ -73,7 +74,11 @@ pub struct SynopsisSummary {
 
 /// Replace Chinese names in a generated text with their Japanese kanji equivalents
 /// from proper nouns and merged cast entries.
-fn normalize_names_in_context(text: &str, nouns: &[ProperNoun], cast: &[MergedCastEntry]) -> String {
+fn normalize_names_in_context(
+    text: &str,
+    nouns: &[ProperNoun],
+    cast: &[MergedCastEntry],
+) -> String {
     // Collect (chinese, japanese_kanji) pairs where conversion actually changed the text
     let mut pairs: Vec<(&str, &str)> = Vec::new();
 
@@ -137,7 +142,9 @@ pub async fn summarize_synopsis(
     year: Option<String>,
     merged_cast: Option<Vec<MergedCastEntry>>,
 ) -> Result<SynopsisSummary, String> {
-    let provider = resolve_provider(&state, &env_store, &app)?;
+    let task_models = service_settings::read_llm_task_model_settings(&app);
+    let provider =
+        resolve_provider_for_tier(&state, &env_store, &app, task_models.synopsis_generation)?;
     let client = LlmClient::new(provider);
 
     let cast_context = build_cast_context(merged_cast.as_deref().unwrap_or_default());
@@ -223,9 +230,8 @@ pub async fn summarize_synopsis(
         .map_err(|e| format!("翻訳背景JSONのパースに失敗: {}", e))?;
 
     // Parse proper nouns
-    let mut proper_nouns: Vec<ProperNoun> =
-        serde_json::from_value(noun_result?)
-            .map_err(|e| format!("固有名詞JSONのパースに失敗: {}", e))?;
+    let mut proper_nouns: Vec<ProperNoun> = serde_json::from_value(noun_result?)
+        .map_err(|e| format!("固有名詞JSONのパースに失敗: {}", e))?;
 
     // Set pending_llm state with Chinese text as placeholder
     for noun in &mut proper_nouns {
@@ -274,8 +280,7 @@ pub async fn summarize_synopsis(
 
     // Normalize punctuation in all proper noun ja_kanji values
     for noun in &mut proper_nouns {
-        noun.japanese_kanji =
-            ja_kanji_batch::normalize_ja_punctuation(&noun.japanese_kanji);
+        noun.japanese_kanji = ja_kanji_batch::normalize_ja_punctuation(&noun.japanese_kanji);
     }
 
     // Replace Chinese names in the context memo with Japanese kanji
@@ -349,11 +354,26 @@ mod tests {
         ];
 
         let result = normalize_names_in_context(text, &nouns, &cast);
-        assert!(result.contains("楚喬"), "should replace 楚乔→楚喬, got: {}", result);
-        assert!(result.contains("諸葛玥"), "should replace 诸葛玥→諸葛玥, got: {}", result);
-        assert!(result.contains("氷湖"), "should replace 冰湖→氷湖, got: {}", result);
+        assert!(
+            result.contains("楚喬"),
+            "should replace 楚乔→楚喬, got: {}",
+            result
+        );
+        assert!(
+            result.contains("諸葛玥"),
+            "should replace 诸葛玥→諸葛玥, got: {}",
+            result
+        );
+        assert!(
+            result.contains("氷湖"),
+            "should replace 冰湖→氷湖, got: {}",
+            result
+        );
         assert!(!result.contains("楚乔"), "should not contain original 楚乔");
-        assert!(!result.contains("诸葛玥"), "should not contain original 诸葛玥");
+        assert!(
+            !result.contains("诸葛玥"),
+            "should not contain original 诸葛玥"
+        );
     }
 
     #[test]
@@ -378,23 +398,21 @@ mod tests {
     fn normalize_names_longest_first_to_avoid_partial_match() {
         // 燕北世子 should be replaced before 燕北 to avoid partial match issues
         let text = "燕北世子・燕洵と燕北の民。";
-        let cast = vec![
-            MergedCastEntry {
-                actor_zh: "窦骁".into(),
-                actor_en_douban: None,
-                actor_en_matched: "Dou Xiao".into(),
-                character_zh: "燕洵".into(),
-                character_en: Some("Yan Xun".into()),
-                source_en: "Tmdb".into(),
-                character_ja_kanji: "燕洵".into(), // unchanged — won't be replaced
-                character_ja_kanji_source: "rule".into(),
-                character_ja_kanji_confidence: None,
-                character_ja_kanji_note: None,
-                confidence: 0.9,
-                match_reason: "exact".into(),
-                alt_character_en: String::new(),
-            },
-        ];
+        let cast = vec![MergedCastEntry {
+            actor_zh: "窦骁".into(),
+            actor_en_douban: None,
+            actor_en_matched: "Dou Xiao".into(),
+            character_zh: "燕洵".into(),
+            character_en: Some("Yan Xun".into()),
+            source_en: "Tmdb".into(),
+            character_ja_kanji: "燕洵".into(), // unchanged — won't be replaced
+            character_ja_kanji_source: "rule".into(),
+            character_ja_kanji_confidence: None,
+            character_ja_kanji_note: None,
+            confidence: 0.9,
+            match_reason: "exact".into(),
+            alt_character_en: String::new(),
+        }];
         let nouns = vec![
             ProperNoun {
                 chinese: "燕北世子".into(),

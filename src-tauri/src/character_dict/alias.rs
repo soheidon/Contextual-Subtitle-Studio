@@ -49,9 +49,8 @@ pub struct SplitName {
 // ---------------------------------------------------------------------------
 
 const COMPOUND_SURNAMES: &[&str] = &[
-    "诸葛", "欧阳", "司马", "上官", "东方", "慕容", "夏侯",
-    "皇甫", "尉迟", "长孙", "宇文", "令狐", "公孙", "独孤",
-    "南宫", "西门", "太史",
+    "诸葛", "欧阳", "司马", "上官", "东方", "慕容", "夏侯", "皇甫", "尉迟", "长孙", "宇文", "令狐",
+    "公孙", "独孤", "南宫", "西门", "太史",
 ];
 
 const TITLE_WORDS: &[&str] = &[
@@ -176,9 +175,7 @@ pub fn generate_aliases_for_entry(entry: &MergedCastEntry) -> Vec<CharacterAlias
     let mut aliases = Vec::new();
 
     let zh_split = split_chinese_name(zh);
-    let ja_split = zh_split
-        .as_ref()
-        .and_then(|_| split_ja_kanji_name(ja, zh));
+    let ja_split = zh_split.as_ref().and_then(|_| split_ja_kanji_name(ja, zh));
     let en_split = if en.is_empty() {
         None
     } else {
@@ -217,7 +214,11 @@ pub fn generate_aliases_for_entry(entry: &MergedCastEntry) -> Vec<CharacterAlias
     if let (Some(ref zh_s), Some(ref ja_s)) = (&zh_split, &ja_split) {
         // surname_zh
         if zh_s.surname != *zh {
-            push(zh_s.surname.clone(), ja_s.surname.clone(), AliasType::SurnameZh);
+            push(
+                zh_s.surname.clone(),
+                ja_s.surname.clone(),
+                AliasType::SurnameZh,
+            );
         }
         // given_zh
         if zh_s.given != *zh {
@@ -227,7 +228,11 @@ pub fn generate_aliases_for_entry(entry: &MergedCastEntry) -> Vec<CharacterAlias
         // surname_en / given_en
         if let Some(ref en_s) = en_split {
             if en_s.surname != en {
-                push(en_s.surname.clone(), ja_s.surname.clone(), AliasType::SurnameEn);
+                push(
+                    en_s.surname.clone(),
+                    ja_s.surname.clone(),
+                    AliasType::SurnameEn,
+                );
             }
             if en_s.given != en {
                 push(en_s.given.clone(), ja_s.given.clone(), AliasType::GivenEn);
@@ -303,7 +308,11 @@ mod tests {
             actor_en_douban: None,
             actor_en_matched: "Test Actor".to_string(),
             character_zh: zh.to_string(),
-            character_en: if en.is_empty() { None } else { Some(en.to_string()) },
+            character_en: if en.is_empty() {
+                None
+            } else {
+                Some(en.to_string())
+            },
             source_en: "TMDb".to_string(),
             character_ja_kanji: ja.to_string(),
             character_ja_kanji_source: "rule".to_string(),
@@ -451,7 +460,12 @@ mod tests {
         let aliases = generate_aliases_for_entry(&entry);
 
         // Should have 6 aliases
-        assert_eq!(aliases.len(), 6, "expected 6 aliases, got {}", aliases.len());
+        assert_eq!(
+            aliases.len(),
+            6,
+            "expected 6 aliases, got {}",
+            aliases.len()
+        );
 
         // Check each type is present
         let types: HashSet<&AliasType> = aliases.iter().map(|a| &a.alias_type).collect();
@@ -463,38 +477,56 @@ mod tests {
         assert!(types.contains(&AliasType::GivenEn));
 
         // full_zh: 诸葛玥 → 諸葛玥
-        let full_zh = aliases.iter().find(|a| a.alias_type == AliasType::FullZh).unwrap();
+        let full_zh = aliases
+            .iter()
+            .find(|a| a.alias_type == AliasType::FullZh)
+            .unwrap();
         assert_eq!(full_zh.source_text, "诸葛玥");
         assert_eq!(full_zh.target_text, "諸葛玥");
         assert!(full_zh.enabled);
 
         // full_en: Zhuge Yue → 諸葛玥
-        let full_en = aliases.iter().find(|a| a.alias_type == AliasType::FullEn).unwrap();
+        let full_en = aliases
+            .iter()
+            .find(|a| a.alias_type == AliasType::FullEn)
+            .unwrap();
         assert_eq!(full_en.source_text, "Zhuge Yue");
         assert_eq!(full_en.target_text, "諸葛玥");
         assert!(full_en.enabled);
 
         // surname_zh: 诸葛 → 諸葛
-        let surname_zh = aliases.iter().find(|a| a.alias_type == AliasType::SurnameZh).unwrap();
+        let surname_zh = aliases
+            .iter()
+            .find(|a| a.alias_type == AliasType::SurnameZh)
+            .unwrap();
         assert_eq!(surname_zh.source_text, "诸葛");
         assert_eq!(surname_zh.target_text, "諸葛");
         assert!(surname_zh.enabled);
 
         // surname_en: Zhuge → 諸葛
-        let surname_en = aliases.iter().find(|a| a.alias_type == AliasType::SurnameEn).unwrap();
+        let surname_en = aliases
+            .iter()
+            .find(|a| a.alias_type == AliasType::SurnameEn)
+            .unwrap();
         assert_eq!(surname_en.source_text, "Zhuge");
         assert_eq!(surname_en.target_text, "諸葛");
         assert!(surname_en.enabled);
 
         // given_zh: 玥 → 玥 (1-char, disabled)
-        let given_zh = aliases.iter().find(|a| a.alias_type == AliasType::GivenZh).unwrap();
+        let given_zh = aliases
+            .iter()
+            .find(|a| a.alias_type == AliasType::GivenZh)
+            .unwrap();
         assert_eq!(given_zh.source_text, "玥");
         assert_eq!(given_zh.target_text, "玥");
         assert!(!given_zh.enabled);
         assert_eq!(given_zh.note.as_deref(), Some("one-character alias"));
 
         // given_en: Yue → 玥
-        let given_en = aliases.iter().find(|a| a.alias_type == AliasType::GivenEn).unwrap();
+        let given_en = aliases
+            .iter()
+            .find(|a| a.alias_type == AliasType::GivenEn)
+            .unwrap();
         assert_eq!(given_en.source_text, "Yue");
         assert_eq!(given_en.target_text, "玥");
         assert!(given_en.enabled); // 2+ chars, not disabled
@@ -512,10 +544,16 @@ mod tests {
         // given_zh should be 淳儿 (2 chars) → enabled, but 児 is one char
         // Wait: 淳儿 → 淳児 (two chars), so not disabled
         // Let's check: surname 赵 is 1 char → disabled
-        let surname_zh = aliases.iter().find(|a| a.alias_type == AliasType::SurnameZh).unwrap();
+        let surname_zh = aliases
+            .iter()
+            .find(|a| a.alias_type == AliasType::SurnameZh)
+            .unwrap();
         assert_eq!(surname_zh.source_text, "赵");
         assert_eq!(surname_zh.target_text, "趙");
-        assert!(!surname_zh.enabled, "single-char surname should be disabled");
+        assert!(
+            !surname_zh.enabled,
+            "single-char surname should be disabled"
+        );
         assert_eq!(surname_zh.note.as_deref(), Some("one-character alias"));
     }
 
@@ -543,7 +581,10 @@ mod tests {
         // Role name 王策: surname=王 (title word), given=策
         let entry = make_entry("王策", "Wang Ce", "王策");
         let aliases = generate_aliases_for_entry(&entry);
-        let surname_zh = aliases.iter().find(|a| a.alias_type == AliasType::SurnameZh).unwrap();
+        let surname_zh = aliases
+            .iter()
+            .find(|a| a.alias_type == AliasType::SurnameZh)
+            .unwrap();
         assert!(!surname_zh.enabled);
         assert_eq!(surname_zh.note.as_deref(), Some("title word"));
     }

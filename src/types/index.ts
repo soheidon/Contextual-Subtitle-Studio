@@ -38,6 +38,10 @@ export interface ProviderConfig {
   thinking?: string;
 }
 
+export type ModelTier = "pro" | "flash";
+export type TranslationModelTier = "provider_default" | "pro" | "flash";
+export type ThinkingMode = "enabled" | "disabled" | "auto";
+
 export interface EnvVarInfo {
   name: string;
   value: string;
@@ -47,7 +51,11 @@ export interface EnvVarInfo {
 export interface ProviderPreset {
   provider: string;
   base_url: string;
-  model: string;
+  pro_model: string;
+  flash_model: string;
+  default_tier: ModelTier;
+  supports_thinking: boolean;
+  default_thinking: ThinkingMode;
 }
 
 export interface ActiveEnvVarInfo {
@@ -56,6 +64,9 @@ export interface ActiveEnvVarInfo {
   provider: string | null;
   base_url: string | null;
   model: string | null;
+  pro_model?: string | null;
+  flash_model?: string | null;
+  default_tier?: ModelTier | null;
 }
 
 export interface TranslationConfig {
@@ -63,6 +74,18 @@ export interface TranslationConfig {
   max_lines_per_subtitle: number;
   style: string;
   avoid_gendered_speech: boolean;
+  model_tier?: TranslationModelTier;
+}
+
+export interface LlmTaskModelSettings {
+  synopsis_generation: ModelTier;
+  scene_detection: ModelTier;
+  scene_context_analysis: ModelTier;
+  proper_noun_confirmation: ModelTier;
+  subtitle_translation: ModelTier;
+  lightweight_cleanup: ModelTier;
+  kanji_correction: ModelTier;
+  zh_context_disambiguation: ModelTier;
 }
 
 export interface ProjectConfig {
@@ -101,6 +124,12 @@ export interface ValidationIssue {
   source_text: string;
   translation: string;
   suggestion?: string;
+  scene_index?: number;
+  subtitle_index?: number;
+  subtitle_number?: number;
+  start_time?: string;
+  end_time?: string;
+  detected_fragment?: string;
 }
 
 export interface TranslationResult {
@@ -420,8 +449,12 @@ export interface SrtFileEntry {
 // SRT Analysis (LLM-powered: 2.1, 2.2, 2.3)
 // ---------------------------------------------------------------------------
 
+export type CandidateReviewAction = "keep" | "remove" | "replace" | "review";
+
 export interface WebTermResolution {
   source_text: string;
+  action?: CandidateReviewAction;
+  suggested_source_text?: string | null;
   surface_ja: string;
   candidate_zh: string | null;
   candidate_ja: string | null;
@@ -433,6 +466,9 @@ export interface WebTermResolution {
   alternatives?: string[];
   evidence?: EvidenceItem[];
   reason?: string;
+  normalized_source_text?: string | null;
+  is_proper_noun?: boolean;
+  term_type?: string;
   evidence_strength?: "direct" | "indirect" | "none";
   match_judgment?: "exact" | "probable" | "weak" | "not_found";
   needs_human_review?: boolean;
@@ -539,6 +575,14 @@ export interface SrtAnalysisFile {
   translation_prompt?: string | null;
 }
 
+export interface TranslationReadiness {
+  srt_path: string;
+  has_analysis: boolean;
+  has_translation_prompt: boolean;
+  has_jp_srt: boolean;
+  can_translate: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Drama search types
 // ---------------------------------------------------------------------------
@@ -561,6 +605,10 @@ export interface DramaSearchQuery {
 export interface ResolvedProviderSettings {
   base_url: string;
   model: string;
+  pro_model: string;
+  flash_model: string;
+  default_tier: ModelTier;
+  supports_thinking: boolean;
   thinking: string;
 }
 

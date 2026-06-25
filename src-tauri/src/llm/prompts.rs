@@ -25,7 +25,9 @@ pub fn build_system_prompt(
 
     // Append glossary
     if !glossary.is_empty() {
-        prompt.push_str("\n\n【用語表】\n以下の固有名詞は必ず指定された日本語表記に置き換えてください：\n");
+        prompt.push_str(
+            "\n\n【用語表】\n以下の固有名詞は必ず指定された日本語表記に置き換えてください：\n",
+        );
         for entry in glossary {
             prompt.push_str(&format!(
                 "- {} → {} ({})\n",
@@ -89,9 +91,7 @@ pub fn build_scene_translation_user_prompt(
     scene: &super::super::translation::Scene,
     entries: &[SubtitleEntry],
 ) -> String {
-    let mut prompt = String::from(
-        "以下の英語字幕を日本語に翻訳してください。\n\n",
-    );
+    let mut prompt = String::from("以下の英語字幕を日本語に翻訳してください。\n\n");
 
     prompt.push_str("【シーン情報】\n");
     if !scene.description.is_empty() {
@@ -142,7 +142,10 @@ pub fn build_repair_prompt(
     if !characters.is_empty() {
         prompt.push_str("【登場人物の話し方】\n");
         for ch in characters {
-            prompt.push_str(&format!("- {}: {}\n", ch.japanese_name, ch.default_register));
+            prompt.push_str(&format!(
+                "- {}: {}\n",
+                ch.japanese_name, ch.default_register
+            ));
         }
     }
 

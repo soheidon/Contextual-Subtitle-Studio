@@ -1,6 +1,8 @@
 use crate::commands::project::AppState;
-use crate::dictionary::{Character, GlossaryEntry, load_characters_json, load_characters_csv,
-    load_glossary_json, load_glossary_csv, save_characters_json, save_glossary_json};
+use crate::dictionary::{
+    load_characters_csv, load_characters_json, load_glossary_csv, load_glossary_json,
+    save_characters_json, save_glossary_json, Character, GlossaryEntry,
+};
 use tauri::State;
 
 #[tauri::command]
@@ -8,8 +10,8 @@ pub fn load_character_dictionary(
     state: State<AppState>,
     path: String,
 ) -> Result<Vec<Character>, String> {
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))?;
 
     let characters = if path.ends_with(".json") {
         load_characters_json(&content)?
@@ -32,10 +34,7 @@ pub fn get_characters(state: State<AppState>) -> Result<Vec<Character>, String> 
 }
 
 #[tauri::command]
-pub fn save_character_dictionary(
-    path: String,
-    characters: Vec<Character>,
-) -> Result<(), String> {
+pub fn save_character_dictionary(path: String, characters: Vec<Character>) -> Result<(), String> {
     let json = save_characters_json(&characters)?;
     if let Some(parent) = std::path::Path::new(&path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("IO error: {}", e))?;
@@ -49,8 +48,8 @@ pub fn load_glossary_dictionary(
     state: State<AppState>,
     path: String,
 ) -> Result<Vec<GlossaryEntry>, String> {
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))?;
 
     let entries = if path.ends_with(".json") {
         load_glossary_json(&content)?
@@ -73,10 +72,7 @@ pub fn get_glossary(state: State<AppState>) -> Result<Vec<GlossaryEntry>, String
 }
 
 #[tauri::command]
-pub fn save_glossary_dictionary(
-    path: String,
-    entries: Vec<GlossaryEntry>,
-) -> Result<(), String> {
+pub fn save_glossary_dictionary(path: String, entries: Vec<GlossaryEntry>) -> Result<(), String> {
     let json = save_glossary_json(&entries)?;
     if let Some(parent) = std::path::Path::new(&path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("IO error: {}", e))?;

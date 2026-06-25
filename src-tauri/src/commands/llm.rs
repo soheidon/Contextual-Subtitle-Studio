@@ -1,7 +1,9 @@
 use crate::commands::project::AppState;
 use crate::commands::service_settings;
 use crate::envstore::EnvStoreState;
-use crate::llm::{provider_preset, all_presets, LlmClient, ProviderConfig, ProviderPreset};
+use crate::llm::{
+    all_presets, provider_preset, LlmClient, ModelTier, ProviderConfig, ProviderPreset,
+};
 use tauri::{Manager, State};
 
 fn prefix_from_env(name: &str) -> String {
@@ -23,6 +25,20 @@ pub fn build_provider_for(
     env_store: &EnvStoreState,
     app: &tauri::AppHandle,
 ) -> Result<ProviderConfig, String> {
+    let overrides = {
+        let prefix = prefix_from_env(name);
+        service_settings::read_provider_settings(app, &prefix).default_tier
+    };
+    build_provider_for_tier(name, env_store, app, overrides)
+}
+
+/// Build a ProviderConfig for a given env var name and model tier.
+pub fn build_provider_for_tier(
+    name: &str,
+    env_store: &EnvStoreState,
+    app: &tauri::AppHandle,
+    tier: ModelTier,
+) -> Result<ProviderConfig, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("環境変数名が空です。".to_string());
@@ -30,13 +46,7 @@ pub fn build_provider_for(
     let api_key = std::env::var(name)
         .ok()
         .filter(|v| !v.is_empty())
-        .or_else(|| {
-            env_store
-                .0
-                .lock()
-                .ok()
-                .and_then(|s| s.0.get(name).cloned())
-        })
+        .or_else(|| env_store.0.lock().ok().and_then(|s| s.0.get(name).cloned()))
         .ok_or_else(|| format!("環境変数 {} の値が見つかりません。", name))?;
     // Verify the env var name maps to a known preset (but we don't use preset defaults).
     let _ = provider_preset(name).ok_or_else(|| {
@@ -49,20 +59,20 @@ pub fn build_provider_for(
     let prefix = prefix_from_env(name);
     let overrides = service_settings::read_provider_settings(app, &prefix);
 
-    let thinking = (prefix == "DEEPSEEK").then_some(overrides.thinking);
+    let thinking = overrides.supports_thinking.then_some(overrides.thinking);
+    let model = match tier {
+        ModelTier::Pro => overrides.pro_model,
+        ModelTier::Flash => overrides.flash_model,
+    };
 
     // gpt-5.5 rejects temperature; omit for OpenAI, keep 0.3 for others
-    let temperature = if prefix == "OPENAI" {
-        None
-    } else {
-        Some(0.3)
-    };
+    let temperature = if prefix == "OPENAI" { None } else { Some(0.3) };
 
     Ok(ProviderConfig {
         provider: "openai_compatible".to_string(),
         base_url: overrides.base_url,
         api_key,
-        model: overrides.model,
+        model,
         thinking,
         temperature,
     })
@@ -82,20 +92,30 @@ pub fn resolve_provider(
     build_provider_for(&name, env_store, app)
 }
 
+/// Resolve the active env var into a ProviderConfig for the requested model tier.
+pub fn resolve_provider_for_tier(
+    state: &AppState,
+    env_store: &EnvStoreState,
+    app: &tauri::AppHandle,
+    tier: ModelTier,
+) -> Result<ProviderConfig, String> {
+    let active = state.active_env_var.lock().map_err(|e| e.to_string())?;
+    let name = active
+        .clone()
+        .ok_or("LLMが未設定です。設定画面で環境変数名を保存してください。")?;
+    drop(active);
+    build_provider_for_tier(&name, env_store, app, tier)
+}
+
 #[tauri::command]
-pub fn set_provider_config(
-    state: State<AppState>,
-    config: ProviderConfig,
-) -> Result<(), String> {
+pub fn set_provider_config(state: State<AppState>, config: ProviderConfig) -> Result<(), String> {
     let mut stored = state.provider_config.lock().map_err(|e| e.to_string())?;
     *stored = Some(config);
     Ok(())
 }
 
 #[tauri::command]
-pub fn get_provider_config(
-    state: State<AppState>,
-) -> Result<Option<ProviderConfig>, String> {
+pub fn get_provider_config(state: State<AppState>) -> Result<Option<ProviderConfig>, String> {
     let config = state.provider_config.lock().map_err(|e| e.to_string())?;
     Ok(config.clone())
 }
@@ -114,6 +134,7 @@ pub async fn check_active_connection(
     state: State<'_, AppState>,
     env_store: State<'_, EnvStoreState>,
     name: Option<String>,
+    model_tier: Option<ModelTier>,
 ) -> Result<bool, String> {
     let chosen = match name {
         Some(n) if !n.trim().is_empty() => n,
@@ -124,7 +145,10 @@ pub async fn check_active_connection(
             .clone()
             .ok_or("環境変数名を入力してください。")?,
     };
-    let provider = build_provider_for(&chosen, &env_store, &app)?;
+    let provider = match model_tier {
+        Some(tier) => build_provider_for_tier(&chosen, &env_store, &app, tier)?,
+        None => build_provider_for(&chosen, &env_store, &app)?,
+    };
     let client = LlmClient::new(provider);
     client.test_connection().await
 }
@@ -150,8 +174,11 @@ pub fn set_active_env_var(
         serde_json::json!({})
     };
     settings["active_env_var"] = serde_json::Value::String(name.clone().unwrap_or_default());
-    std::fs::write(&path, serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
 
     // Update in-memory
     let mut active = state.active_env_var.lock().map_err(|e| e.to_string())?;
@@ -167,6 +194,9 @@ pub struct ActiveEnvVarInfo {
     pub provider: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub pro_model: Option<String>,
+    pub flash_model: Option<String>,
+    pub default_tier: Option<ModelTier>,
 }
 
 #[tauri::command]
@@ -186,6 +216,9 @@ pub fn get_active_env_var(
             provider: None,
             base_url: None,
             model: None,
+            pro_model: None,
+            flash_model: None,
+            default_tier: None,
         });
     }
     let name_str = name.clone().unwrap();
@@ -206,7 +239,10 @@ pub fn get_active_env_var(
         has_key,
         provider: preset.as_ref().map(|p| p.provider.clone()),
         base_url: Some(overrides.base_url),
-        model: Some(overrides.model),
+        model: Some(overrides.model.clone()),
+        pro_model: Some(overrides.pro_model),
+        flash_model: Some(overrides.flash_model),
+        default_tier: Some(overrides.default_tier),
     })
 }
 

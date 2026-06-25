@@ -1,5 +1,51 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTier {
+    Pro,
+    Flash,
+}
+
+impl Default for ModelTier {
+    fn default() -> Self {
+        Self::Pro
+    }
+}
+
+impl ModelTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pro => "pro",
+            Self::Flash => "flash",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranslationModelTier {
+    ProviderDefault,
+    Pro,
+    Flash,
+}
+
+impl Default for TranslationModelTier {
+    fn default() -> Self {
+        Self::ProviderDefault
+    }
+}
+
+impl TranslationModelTier {
+    pub fn resolve(self, provider_default: ModelTier) -> ModelTier {
+        match self {
+            Self::ProviderDefault => provider_default,
+            Self::Pro => ModelTier::Pro,
+            Self::Flash => ModelTier::Flash,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub provider: String,
@@ -27,6 +73,8 @@ pub struct TranslationConfig {
     pub style: String,
     #[serde(rename = "avoid_gendered_speech")]
     pub avoid_gendered_speech: bool,
+    #[serde(default, rename = "model_tier")]
+    pub model_tier: TranslationModelTier,
 }
 
 impl Default for TranslationConfig {
@@ -36,6 +84,7 @@ impl Default for TranslationConfig {
             max_lines_per_subtitle: 2,
             style: "neutral_subtitle".to_string(),
             avoid_gendered_speech: true,
+            model_tier: TranslationModelTier::ProviderDefault,
         }
     }
 }

@@ -1,5 +1,5 @@
-use crate::character_dict::{CharacterDict, MergedCastEntry, PastedEntry};
 use super::synopsis::SynopsisSummary;
+use crate::character_dict::{CharacterDict, MergedCastEntry, PastedEntry};
 use serde::{Deserialize, Serialize};
 
 /// Metadata about the drama being processed.
@@ -98,13 +98,11 @@ pub fn load_drama_info(dir: String) -> Result<DramaInfoBundle, String> {
 fn write_json<T: Serialize>(path: &std::path::Path, value: &T) -> Result<(), String> {
     let json = serde_json::to_string_pretty(value)
         .map_err(|e| format!("Failed to serialize {}: {}", path.display(), e))?;
-    std::fs::write(path, json)
-        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+    std::fs::write(path, json).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
 }
 
 fn write_text(path: &std::path::Path, text: &str) -> Result<(), String> {
-    std::fs::write(path, text)
-        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+    std::fs::write(path, text).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
 }
 
 fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &std::path::Path) -> Option<T> {

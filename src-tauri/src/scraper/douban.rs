@@ -1,8 +1,10 @@
-use scraper::{Html, Selector};
-use sha2::{Sha512, Digest};
 use regex::Regex;
+use scraper::{Html, Selector};
+use sha2::{Digest, Sha512};
 
-use super::{ScrapedCharacter, ScrapeResult, ScrapeSource, SearchCandidate, score_search_candidate};
+use super::{
+    score_search_candidate, ScrapeResult, ScrapeSource, ScrapedCharacter, SearchCandidate,
+};
 
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
@@ -16,8 +18,7 @@ const USER_AGENT: &str =
 ///
 /// Returns: https://movie.douban.com/subject/{id}/celebrities
 pub fn normalize_douban_celebrities_url(url: &str) -> Result<String, String> {
-    let re = Regex::new(r"douban\.com/subject/(\d+)")
-        .map_err(|e| format!("regex error: {}", e))?;
+    let re = Regex::new(r"douban\.com/subject/(\d+)").map_err(|e| format!("regex error: {}", e))?;
     let caps = re
         .captures(url)
         .ok_or_else(|| format!(
@@ -25,7 +26,10 @@ pub fn normalize_douban_celebrities_url(url: &str) -> Result<String, String> {
             url
         ))?;
     let subject_id = &caps[1];
-    let normalized = format!("https://movie.douban.com/subject/{}/celebrities", subject_id);
+    let normalized = format!(
+        "https://movie.douban.com/subject/{}/celebrities",
+        subject_id
+    );
     Ok(normalized)
 }
 
@@ -160,9 +164,7 @@ fn build_client() -> reqwest::Client {
             );
             h.insert(
                 reqwest::header::ACCEPT_LANGUAGE,
-                "zh-CN,zh;q=0.9,en;q=0.8"
-                    .parse()
-                    .unwrap(),
+                "zh-CN,zh;q=0.9,en;q=0.8".parse().unwrap(),
             );
             h
         })
@@ -214,12 +216,7 @@ fn solve_challenge(cha: &str) -> u64 {
 }
 
 /// Submit the solved challenge and return all cookies as a Cookie header value.
-async fn submit_challenge(
-    tok: &str,
-    cha: &str,
-    nonce: u64,
-    red: &str,
-) -> Result<String, String> {
+async fn submit_challenge(tok: &str, cha: &str, nonce: u64, red: &str) -> Result<String, String> {
     let form = [
         ("tok", tok),
         ("cha", cha),
@@ -242,7 +239,10 @@ async fn submit_challenge(
         .map_err(|e| format!("Challenge submit failed: {}", e))?;
 
     if resp.status().as_u16() != 302 {
-        return Err(format!("Expected 302 after challenge, got {}", resp.status()));
+        return Err(format!(
+            "Expected 302 after challenge, got {}",
+            resp.status()
+        ));
     }
 
     // Collect all cookie name=value pairs
@@ -288,9 +288,10 @@ fn extract_synopsis(document: &Html) -> Option<String> {
 }
 
 fn extract_cast_primary(document: &Html) -> Vec<ScrapedCharacter> {
-    let row_sel =
-        Selector::parse("#celebrities .celebrity, .casting_list li, ul.celebrity-list li, ul.celebrities-list li")
-            .unwrap();
+    let row_sel = Selector::parse(
+        "#celebrities .celebrity, .casting_list li, ul.celebrity-list li, ul.celebrities-list li",
+    )
+    .unwrap();
     let name_sel = Selector::parse(".name a, a[rel='v:starring']").unwrap();
     let role_sel = Selector::parse(".role, em, .character").unwrap();
 
@@ -301,9 +302,10 @@ fn extract_cast_primary(document: &Html) -> Vec<ScrapedCharacter> {
             .next()
             .map(|e| e.text().collect::<String>().trim().to_string());
 
-        let raw_role = row.select(&role_sel).next().map(|e| {
-            e.text().collect::<String>().trim().to_string()
-        });
+        let raw_role = row
+            .select(&role_sel)
+            .next()
+            .map(|e| e.text().collect::<String>().trim().to_string());
 
         // Parse actor name: "黄杨钿甜 Tiantian Huangyang" → (cn="黄杨钿甜", en="Tiantian Huangyang")
         let (actor_cn, actor_en) = raw_actor
@@ -314,9 +316,7 @@ fn extract_cast_primary(document: &Html) -> Vec<ScrapedCharacter> {
         // Parse role: "演员 Actress (饰 楚乔)" → "楚乔", skip non-actors
         let role_type = raw_role.as_deref().map(classify_douban_role);
         let is_actor = matches!(role_type, Some(DoubanRoleType::Actor));
-        let character_name = raw_role
-            .as_deref()
-            .and_then(extract_douban_character_name);
+        let character_name = raw_role.as_deref().and_then(extract_douban_character_name);
 
         // Skip directors, writers, producers, etc.
         if is_actor && (actor_cn.is_some() || actor_en.is_some()) {
@@ -393,8 +393,16 @@ fn split_cn_en_name(raw: &str) -> (Option<String>, Option<String>) {
         // No ASCII found, whole string is Chinese
         return (Some(raw.trim().to_string()), None);
     }
-    let cn = chars[..cn_end].iter().collect::<String>().trim().to_string();
-    let en = chars[cn_end..].iter().collect::<String>().trim().to_string();
+    let cn = chars[..cn_end]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .to_string();
+    let en = chars[cn_end..]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .to_string();
     if cn.is_empty() && en.is_empty() {
         (None, None)
     } else if cn.is_empty() {
@@ -579,8 +587,7 @@ fn parse_douban_search_results(html: &str) -> Result<Vec<DoubanSearchItem>, Stri
     let item_sel = Selector::parse(".item-root, .result, .search-result .item").unwrap();
     let link_sel = Selector::parse("a[href*='/subject/']").unwrap();
     let title_sel = Selector::parse(".title-text, .title a, h3 a, a.title").unwrap();
-    let subject_re = Regex::new(r"/subject/(\d+)")
-        .map_err(|e| format!("regex error: {}", e))?;
+    let subject_re = Regex::new(r"/subject/(\d+)").map_err(|e| format!("regex error: {}", e))?;
 
     let mut items = Vec::new();
 
@@ -720,26 +727,46 @@ mod tests {
     fn test_solve_challenge() {
         // solve_challenge should find a nonce for any input
         let nonce = solve_challenge("test_challenge");
-        let hash = hex::encode(Sha512::digest(format!("test_challenge{}", nonce).as_bytes()));
-        assert!(hash.starts_with("0000"), "hash should start with 0000, got {}", hash);
+        let hash = hex::encode(Sha512::digest(
+            format!("test_challenge{}", nonce).as_bytes(),
+        ));
+        assert!(
+            hash.starts_with("0000"),
+            "hash should start with 0000, got {}",
+            hash
+        );
     }
 
     #[test]
     fn test_normalize_douban_url_full_trailing_slash() {
-        let result = normalize_douban_celebrities_url("https://movie.douban.com/subject/36809858/").unwrap();
-        assert_eq!(result, "https://movie.douban.com/subject/36809858/celebrities");
+        let result =
+            normalize_douban_celebrities_url("https://movie.douban.com/subject/36809858/").unwrap();
+        assert_eq!(
+            result,
+            "https://movie.douban.com/subject/36809858/celebrities"
+        );
     }
 
     #[test]
     fn test_normalize_douban_url_no_trailing_slash() {
-        let result = normalize_douban_celebrities_url("https://movie.douban.com/subject/36809858").unwrap();
-        assert_eq!(result, "https://movie.douban.com/subject/36809858/celebrities");
+        let result =
+            normalize_douban_celebrities_url("https://movie.douban.com/subject/36809858").unwrap();
+        assert_eq!(
+            result,
+            "https://movie.douban.com/subject/36809858/celebrities"
+        );
     }
 
     #[test]
     fn test_normalize_douban_url_already_celebrities() {
-        let result = normalize_douban_celebrities_url("https://movie.douban.com/subject/36809858/celebrities").unwrap();
-        assert_eq!(result, "https://movie.douban.com/subject/36809858/celebrities");
+        let result = normalize_douban_celebrities_url(
+            "https://movie.douban.com/subject/36809858/celebrities",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            "https://movie.douban.com/subject/36809858/celebrities"
+        );
     }
 
     #[test]

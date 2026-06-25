@@ -1,6 +1,7 @@
 [package]
 name = "contextual-subtitle-studio"
-version = "0.1.0"
+version = "0.4.0"
+authors = ["soheidon"]
 edition = "2021"
 
 [lib]

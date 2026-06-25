@@ -193,6 +193,16 @@ export function buildBatchPrompt(params: BuildBatchPromptParams): string {
   prompt += "* drama_title, notes, summary, explanation などのトップレベル項目は禁止する。\n";
   prompt += "* 返答JSONのトップレベルは必ず {\"terms\": [...]} のみにする。\n";
   prompt += "* terms 配列には、入力した source_text と同じ件数・同じ順序で返す。\n";
+  prompt += "* 各 source_text について、まず候補後処理 action を \"keep\" | \"remove\" | \"replace\" | \"review\" のいずれかで判定する。\n";
+  prompt += "* action=\"remove\": source_text 全体が英語の短縮形・代名詞・助動詞・接続詞・文頭語だけ、または一般役職名単独の場合。is_proper_noun=false、candidate_zh/candidate_ja=null、status=\"not_found\" にする。\n";
+  prompt += "  除外例: \"I'll\", \"I'm\", \"You're\", \"We're\", \"They're\", \"They'll\", \"It's\", \"That's\", \"There's\", \"Don't\", \"Can't\", \"When\", \"If\", \"Then\", \"And\", \"But\", \"So\", \"Because\", \"Although\", \"Since\", \"While\", \"Before\", \"After\", \"Shopkeeper\"。\n";
+  prompt += "* action=\"replace\": source_text が文断片 + 固有名詞候補の場合。suggested_source_text に固有名詞候補だけを入れる。\n";
+  prompt += "  例: \"I'm A'Chu\" → suggested_source_text=\"A'Chu\"、\"When Snow Region\" → suggested_source_text=\"Snow Region\"、\"But Yanbei City\" → suggested_source_text=\"Yanbei City\"。\n";
+  prompt += "* And/But/So/When/If/Then/Because/Although/Since/While/Before/After + proper noun phrase は、先頭機能語を除いた候補へ action=\"replace\" にする。\n";
+  prompt += "* action=\"keep\": Web検索で実在確認できる、または明らかに固有名詞候補として妥当な場合。\n";
+  prompt += "* action=\"review\": 判断不能、Web検索で見つからないが字幕内固有名詞の可能性がある場合。\n";
+  prompt += "* normalized_source_text を使う場合でも、返答JSONの source_text は必ず元の入力表記のままにする。\n";
+  prompt += "* 固有名詞候補として残す場合は is_proper_noun=true にする。\n";
   prompt += "* status は \"found\" | \"uncertain\" | \"not_found\" のみを使う。\n";
   prompt += "* confidence は \"high\" | \"medium\" | \"low\" のみを使う。\n";
   prompt += "* term_type は \"person\" | \"place\" | \"organization\" | \"tribe\" | \"army\" | \"object\" | \"other\" のいずれか1つを使う。\n";
@@ -234,6 +244,10 @@ export function buildBatchPrompt(params: BuildBatchPromptParams): string {
   "terms": [
     {
       "source_text": "Song Cheng",
+      "action": "keep",
+      "suggested_source_text": "",
+      "normalized_source_text": "Song Cheng",
+      "is_proper_noun": true,
       "candidate_zh": "",
       "candidate_ja": "",
       "term_type": "person",
@@ -257,6 +271,7 @@ export function buildBatchPrompt(params: BuildBatchPromptParams): string {
   prompt += "\n重要:\n";
   prompt += "* 上記の返答形式は1件分の例です。実際の返答では、source_text の全件を terms 配列に含めてください。\n";
   prompt += "* source_text の文字列は入力と完全一致させ、順序も入力と同じにしてください。\n";
+  prompt += "* 固有名詞ではない候補も terms 配列から省略せず、action=\"remove\", is_proper_noun=false として返してください。\n";
 
   return prompt;
 }
@@ -387,6 +402,8 @@ function mapTermsFromParsed(parsed: any, surfaceJaMap: Map<string, string>): Web
 
     return {
       source_text: sourceText,
+      action: raw.action,
+      suggested_source_text: raw.suggested_source_text ?? null,
       surface_ja: surfaceJaMap.get(sourceText) ?? "",
       candidate_zh: raw.candidate_zh ?? null,
       candidate_ja: raw.candidate_ja ?? null,
@@ -398,6 +415,9 @@ function mapTermsFromParsed(parsed: any, surfaceJaMap: Map<string, string>): Web
       alternatives: Array.isArray(raw.alternatives) ? raw.alternatives : [],
       evidence,
       reason: raw.reason ?? "",
+      normalized_source_text: raw.normalized_source_text ?? null,
+      is_proper_noun: typeof raw.is_proper_noun === "boolean" ? raw.is_proper_noun : undefined,
+      term_type: raw.term_type ?? "",
       evidence_strength: es,
       match_judgment: mj,
       needs_human_review: review,
@@ -455,6 +475,11 @@ function extractTermsFromGarbledText(
 
     const candidateZh = extractStringField(window, "candidate_zh");
     const candidateJa = extractStringField(window, "candidate_ja");
+    const action = extractStringField(window, "action");
+    const suggestedSourceText = extractStringField(window, "suggested_source_text");
+    const normalizedSourceText = extractStringField(window, "normalized_source_text");
+    const isProperNounRaw = extractBooleanField(window, "is_proper_noun");
+    const termType = extractStringField(window, "term_type");
     const statusRaw = extractStringField(window, "status");
     const status = normalizeStatus(statusRaw ?? "");
     const confidenceRaw = extractStringField(window, "confidence");
@@ -464,7 +489,7 @@ function extractTermsFromGarbledText(
 
     const evidenceStrengthRaw = extractStringField(window, "evidence_strength");
     const matchJudgmentRaw = extractStringField(window, "match_judgment");
-    const needsReviewRaw = extractStringField(window, "needs_human_review");
+    const needsReviewRaw = extractBooleanField(window, "needs_human_review") ?? extractStringField(window, "needs_human_review");
     const confidenceReason = extractStringField(window, "confidence_reason");
 
     const es = normalizeEvidenceStrength(evidenceStrengthRaw, status);
@@ -483,6 +508,8 @@ function extractTermsFromGarbledText(
 
     results.push({
       source_text: pos.text,
+      action: action as WebTermResolution["action"],
+      suggested_source_text: suggestedSourceText,
       surface_ja: surfaceJaMap.get(term.source_text) ?? "",
       candidate_zh: candidateZh || null,
       candidate_ja: candidateJa || null,
@@ -494,6 +521,9 @@ function extractTermsFromGarbledText(
       alternatives: [],
       evidence: evidenceItems,
       reason: reason ?? "",
+      normalized_source_text: normalizedSourceText,
+      is_proper_noun: isProperNounRaw === "true" ? true : isProperNounRaw === "false" ? false : undefined,
+      term_type: termType ?? "",
       evidence_strength: es,
       match_judgment: mj,
       needs_human_review: review,
@@ -600,6 +630,13 @@ function extractStringField(segment: string, fieldName: string): string | null {
   const raw = m[1];
   // Unescape JSON escapes
   return unescapeJsonString(raw).trim() || null;
+}
+
+function extractBooleanField(segment: string, fieldName: string): "true" | "false" | null {
+  const re = new RegExp(`"${fieldName}"\\s*:\\s*(true|false)`);
+  const m = re.exec(segment);
+  if (!m) return null;
+  return m[1] as "true" | "false";
 }
 
 /** Extract http/https URLs from a garbled text segment. */

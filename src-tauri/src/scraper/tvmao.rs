@@ -1,6 +1,6 @@
 use scraper::{Html, Selector};
 
-use super::{fetch_html, ScrapedCharacter, ScrapeResult, ScrapeSource};
+use super::{fetch_html, ScrapeResult, ScrapeSource, ScrapedCharacter};
 
 /// Scrape TVMao (电视猫) drama cast page.
 /// URL pattern: https://www.tvmao.com/drama/XXXXX
@@ -65,8 +65,8 @@ fn extract_synopsis(document: &Html) -> Option<String> {
 
 /// Primary cast extraction for TVMao layout.
 fn extract_cast_primary(document: &Html) -> Vec<ScrapedCharacter> {
-    let row_sel = Selector::parse(".cast_item, .actor-item, .performer, li.actor, .role-list li")
-        .unwrap();
+    let row_sel =
+        Selector::parse(".cast_item, .actor-item, .performer, li.actor, .role-list li").unwrap();
     let name_sel = Selector::parse("a, .name, .actor-name").unwrap();
     let role_sel = Selector::parse(".role, .role-name, .char-name, em").unwrap();
 

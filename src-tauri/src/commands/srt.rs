@@ -1,17 +1,17 @@
-use crate::commands::llm::resolve_provider;
+use crate::commands::llm::resolve_provider_for_tier;
 use crate::commands::project::AppState;
 use crate::commands::service_settings;
-use crate::dictionary::GlossaryEntry;
 use crate::dictionary::characters::Character;
-use regex::Regex;
+use crate::dictionary::GlossaryEntry;
 use crate::envstore::EnvStoreState;
 use crate::llm::client::extract_json;
-use crate::llm::LlmClient;
+use crate::llm::{LlmClient, ModelTier};
 use crate::log::{emit_log, preview_chars};
-use crate::srt::SubtitleEntry;
 use crate::srt::parser::parse_srt;
 use crate::srt::writer::write_srt;
+use crate::srt::SubtitleEntry;
 use crate::web_search;
+use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
 use tauri::State;
 
@@ -20,10 +20,7 @@ use tauri::State;
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn parse_srt_file(
-    state: State<AppState>,
-    path: String,
-) -> Result<Vec<SubtitleEntry>, String> {
+pub fn parse_srt_file(state: State<AppState>, path: String) -> Result<Vec<SubtitleEntry>, String> {
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read file {}: {}", path, e))?;
     let entries = parse_srt(&content)?;
@@ -41,10 +38,7 @@ pub fn get_srt_entries(state: State<AppState>) -> Result<Vec<SubtitleEntry>, Str
 }
 
 #[tauri::command]
-pub fn save_srt_file(
-    path: String,
-    entries: Vec<SubtitleEntry>,
-) -> Result<(), String> {
+pub fn save_srt_file(path: String, entries: Vec<SubtitleEntry>) -> Result<(), String> {
     let srt_content = write_srt(&entries);
     std::fs::write(&path, srt_content)
         .map_err(|e| format!("Failed to write SRT file {}: {}", path, e))?;
@@ -75,6 +69,10 @@ pub struct EvidenceItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebTermResolution {
     pub source_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>, // "keep" | "remove" | "replace" | "review"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_source_text: Option<String>,
     pub surface_ja: String,
     pub candidate_zh: Option<String>,
     pub candidate_ja: Option<String>,
@@ -90,6 +88,20 @@ pub struct WebTermResolution {
     pub evidence: Option<Vec<EvidenceItem>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_source_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_proper_noun: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_strength: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_judgment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_human_review: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,13 +112,13 @@ pub struct UnresolvedTerm {
     pub status: String,
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,       // "synopsis" | "srt_body" | "srt_body+synopsis"
+    pub source: Option<String>, // "synopsis" | "srt_body" | "srt_body+synopsis"
     #[serde(default)]
     pub occurrence_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias_candidate: Option<bool>, // true when the term looks like a character alias
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub search_text: Option<String>,  // source_text with generic suffix stripped for search
+    pub search_text: Option<String>, // source_text with generic suffix stripped for search
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generic_suffix: Option<String>, // detected generic English suffix (e.g. "City")
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -258,15 +270,33 @@ pub struct BatchTermRequest {
 struct BatchTermResult {
     pub source_text: String,
     #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub suggested_source_text: Option<String>,
+    #[serde(default)]
+    pub normalized_source_text: Option<String>,
+    #[serde(default)]
+    pub is_proper_noun: Option<bool>,
+    #[serde(default)]
     pub candidate_zh: Option<String>,
     #[serde(default)]
     pub candidate_ja: Option<String>,
+    #[serde(default)]
+    pub term_type: String,
     #[serde(default)]
     pub status: String, // "found" | "uncertain" | "not_found"
     #[serde(default)]
     pub confidence: String, // "high" | "medium" | "low"
     #[serde(default)]
     pub reason: String,
+    #[serde(default)]
+    pub evidence_strength: String, // "direct" | "indirect" | "none"
+    #[serde(default)]
+    pub match_judgment: String, // "exact" | "probable" | "weak" | "not_found"
+    #[serde(default)]
+    pub needs_human_review: Option<bool>,
+    #[serde(default)]
+    pub confidence_reason: String,
     #[serde(default)]
     pub alternatives: Vec<String>,
     #[serde(default)]
@@ -365,7 +395,10 @@ fn build_synopsis_prompt(entries: &[SubtitleEntry], prompt_context: &str) -> (St
 }
 
 /// Build the scene detection prompt.
-fn build_scene_detection_prompt(entries: &[SubtitleEntry], prompt_context: &str) -> (String, String) {
+fn build_scene_detection_prompt(
+    entries: &[SubtitleEntry],
+    prompt_context: &str,
+) -> (String, String) {
     let system = "あなたは中国ドラマの字幕分析アシスタントです。字幕を場面ごとに分割してください。";
 
     let srt_text: String = entries
@@ -383,7 +416,9 @@ fn build_scene_detection_prompt(entries: &[SubtitleEntry], prompt_context: &str)
 
     if !prompt_context.is_empty() {
         user.push_str("\n固有名詞は以下の辞書表記を最優先してください。\n");
-        user.push_str("英語字幕表記やカタカナ読みではなく、日本語字幕用の漢字表記を使ってください。\n");
+        user.push_str(
+            "英語字幕表記やカタカナ読みではなく、日本語字幕用の漢字表記を使ってください。\n",
+        );
         user.push_str(&format!("\n【参考情報】\n{}\n", prompt_context));
     }
 
@@ -428,10 +463,7 @@ fn build_scene_context_prompt(
     );
 
     if !character_names.is_empty() {
-        user.push_str(&format!(
-            "\n【登場人物】\n{}\n",
-            character_names.join(", ")
-        ));
+        user.push_str(&format!("\n【登場人物】\n{}\n", character_names.join(", ")));
     }
 
     if !prompt_context.is_empty() {
@@ -482,7 +514,11 @@ fn extract_episode_from_filename(filename: &str) -> EpisodeInfo {
         let season = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
         let episode = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
         let episode_label = episode.map(|e| format!("第{}話", e));
-        return EpisodeInfo { season, episode, episode_label };
+        return EpisodeInfo {
+            season,
+            episode,
+            episode_label,
+        };
     }
 
     // episode N / ep N / epN (case insensitive)
@@ -490,7 +526,11 @@ fn extract_episode_from_filename(filename: &str) -> EpisodeInfo {
     if let Some(caps) = ep_n.captures(filename) {
         let episode = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
         let episode_label = episode.map(|e| format!("第{}話", e));
-        return EpisodeInfo { season: None, episode, episode_label };
+        return EpisodeInfo {
+            season: None,
+            episode,
+            episode_label,
+        };
     }
 
     // 第N話 / 第N集
@@ -498,10 +538,18 @@ fn extract_episode_from_filename(filename: &str) -> EpisodeInfo {
     if let Some(caps) = jp_ep.captures(filename) {
         let episode = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
         let episode_label = episode.map(|e| format!("第{}話", e));
-        return EpisodeInfo { season: None, episode, episode_label };
+        return EpisodeInfo {
+            season: None,
+            episode,
+            episode_label,
+        };
     }
 
-    EpisodeInfo { season: None, episode: None, episode_label: None }
+    EpisodeInfo {
+        season: None,
+        episode: None,
+        episode_label: None,
+    }
 }
 
 /// Extract a candidate Chinese name from web search snippets.
@@ -514,9 +562,14 @@ fn extract_candidate_from_snippets(
 
         // Find Chinese character sequences (2-6 chars)
         let zh_chars: Vec<&str> = combined
-            .split(|c: char| !('\u{4e00}'..='\u{9fff}').contains(&c) && !('\u{3000}'..='\u{303f}').contains(&c))
+            .split(|c: char| {
+                !('\u{4e00}'..='\u{9fff}').contains(&c) && !('\u{3000}'..='\u{303f}').contains(&c)
+            })
             .filter(|seg| {
-                let cc: Vec<char> = seg.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).collect();
+                let cc: Vec<char> = seg
+                    .chars()
+                    .filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c))
+                    .collect();
                 cc.len() >= 2 && cc.len() <= 6
             })
             .collect();
@@ -538,7 +591,8 @@ fn extract_candidate_from_snippets(
 fn extract_response_text_and_annotations(
     body: &serde_json::Value,
 ) -> Result<(&str, Vec<EvidenceItem>, Vec<String>), String> {
-    let outputs = body["output"].as_array()
+    let outputs = body["output"]
+        .as_array()
         .ok_or_else(|| format!("Missing 'output' array in OpenAI response: {}", body))?;
 
     let mut text: Option<&str> = None;
@@ -549,7 +603,9 @@ fn extract_response_text_and_annotations(
         if output["type"].as_str() != Some("message") {
             continue;
         }
-        let Some(content_items) = output["content"].as_array() else { continue; };
+        let Some(content_items) = output["content"].as_array() else {
+            continue;
+        };
 
         for content in content_items {
             // Collect annotations from every content item
@@ -578,9 +634,8 @@ fn extract_response_text_and_annotations(
         }
     }
 
-    let text = text.ok_or_else(|| {
-        format!("No output_text found in OpenAI response outputs: {}", body)
-    })?;
+    let text =
+        text.ok_or_else(|| format!("No output_text found in OpenAI response outputs: {}", body))?;
     Ok((text, evidence_items, evidence_urls))
 }
 
@@ -599,32 +654,153 @@ fn normalize_en_for_dedup(text: &str) -> String {
 /// Check if a word is a stopword (pronouns, common words, greetings, etc.).
 fn is_stopword(word: &str) -> bool {
     let lower = word.to_lowercase();
-    matches!(lower.as_str(),
-        "i" | "you" | "he" | "she" | "it" | "we" | "they" |
-        "me" | "him" | "her" | "us" | "them" |
-        "my" | "your" | "his" | "hers" | "its" | "our" | "their" |
-        "yes" | "no" | "okay" | "ok" | "thank" | "thanks" | "please" |
-        "sorry" | "hello" | "hi" | "hey" | "well" | "oh" | "ah" |
-        "what" | "who" | "where" | "when" | "why" | "how" |
-        "this" | "that" | "these" | "those" |
-        "is" | "are" | "was" | "were" | "be" | "been" | "will" |
-        "have" | "has" | "had" | "do" | "does" | "did" |
-        "a" | "an" | "the" | "and" | "or" | "but" | "if" | "so" |
-        "to" | "of" | "in" | "on" | "at" | "for" | "with" |
-        "can" | "could" | "would" | "should" | "may" | "might" |
-        "just" | "now" | "then" | "here" | "there" |
-        "all" | "some" | "any" | "very" | "too" | "also" |
-        "go" | "come" | "get" | "know" | "think" | "want" | "need" |
-        "let" | "say" | "see" | "look" | "take" | "make" |
-        "really" | "still" | "even" | "much" | "many" | "more" |
-        "up" | "down" | "out" | "back" | "way" | "right" | "left" |
-        "one" | "two" | "first" | "last" |
-        "sir" | "miss" | "mister" | "madam" | "maam" |
-        "dont" | "cant" | "wont" | "isnt" | "arent" | "thats" |
-        "dear" | "sure" | "maybe" | "perhaps" |
-        "nothing" | "something" | "everything" | "anything" |
-        "everyone" | "someone" | "anyone" | "nobody" |
-        "always" | "never" | "ever" | "again" | "already"
+    matches!(
+        lower.as_str(),
+        "i" | "you"
+            | "he"
+            | "she"
+            | "it"
+            | "we"
+            | "they"
+            | "me"
+            | "him"
+            | "her"
+            | "us"
+            | "them"
+            | "my"
+            | "your"
+            | "his"
+            | "hers"
+            | "its"
+            | "our"
+            | "their"
+            | "yes"
+            | "no"
+            | "okay"
+            | "ok"
+            | "thank"
+            | "thanks"
+            | "please"
+            | "sorry"
+            | "hello"
+            | "hi"
+            | "hey"
+            | "well"
+            | "oh"
+            | "ah"
+            | "what"
+            | "who"
+            | "where"
+            | "when"
+            | "why"
+            | "how"
+            | "this"
+            | "that"
+            | "these"
+            | "those"
+            | "is"
+            | "are"
+            | "was"
+            | "were"
+            | "be"
+            | "been"
+            | "will"
+            | "have"
+            | "has"
+            | "had"
+            | "do"
+            | "does"
+            | "did"
+            | "a"
+            | "an"
+            | "the"
+            | "and"
+            | "or"
+            | "but"
+            | "if"
+            | "so"
+            | "to"
+            | "of"
+            | "in"
+            | "on"
+            | "at"
+            | "for"
+            | "with"
+            | "can"
+            | "could"
+            | "would"
+            | "should"
+            | "may"
+            | "might"
+            | "just"
+            | "now"
+            | "then"
+            | "here"
+            | "there"
+            | "all"
+            | "some"
+            | "any"
+            | "very"
+            | "too"
+            | "also"
+            | "go"
+            | "come"
+            | "get"
+            | "know"
+            | "think"
+            | "want"
+            | "need"
+            | "let"
+            | "say"
+            | "see"
+            | "look"
+            | "take"
+            | "make"
+            | "really"
+            | "still"
+            | "even"
+            | "much"
+            | "many"
+            | "more"
+            | "up"
+            | "down"
+            | "out"
+            | "back"
+            | "way"
+            | "right"
+            | "left"
+            | "one"
+            | "two"
+            | "first"
+            | "last"
+            | "sir"
+            | "miss"
+            | "mister"
+            | "madam"
+            | "maam"
+            | "dont"
+            | "cant"
+            | "wont"
+            | "isnt"
+            | "arent"
+            | "thats"
+            | "dear"
+            | "sure"
+            | "maybe"
+            | "perhaps"
+            | "nothing"
+            | "something"
+            | "everything"
+            | "anything"
+            | "everyone"
+            | "someone"
+            | "anyone"
+            | "nobody"
+            | "always"
+            | "never"
+            | "ever"
+            | "again"
+            | "already"
     )
 }
 
@@ -632,15 +808,67 @@ fn is_stopword(word: &str) -> bool {
 /// (titles, places, organizations, items common in Chinese drama subtitles).
 fn contains_proper_noun_keyword(phrase: &str) -> bool {
     let keywords = [
-        "lady", "lord", "prince", "princess", "king", "queen", "emperor", "empress",
-        "master", "mistress", "grand", "young", "old", "elder",
-        "tribe", "house", "region", "water", "mountain", "river", "city",
-        "palace", "hall", "sect", "clan", "pavilion", "valley", "peak",
-        "island", "sea", "lake", "forest", "garden", "temple", "villa",
-        "castle", "kingdom", "empire", "army", "guard", "bureau", "office",
-        "courtyard", "residence", "manor", "abbey", "monastery",
-        "cave", "spring", "pond", "bridge", "gate", "tower", "wall",
-        "sword", "blade", "pill", "elixir", "poison", "powder", "jade",
+        "lady",
+        "lord",
+        "prince",
+        "princess",
+        "king",
+        "queen",
+        "emperor",
+        "empress",
+        "master",
+        "mistress",
+        "grand",
+        "young",
+        "old",
+        "elder",
+        "tribe",
+        "house",
+        "region",
+        "water",
+        "mountain",
+        "river",
+        "city",
+        "palace",
+        "hall",
+        "sect",
+        "clan",
+        "pavilion",
+        "valley",
+        "peak",
+        "island",
+        "sea",
+        "lake",
+        "forest",
+        "garden",
+        "temple",
+        "villa",
+        "castle",
+        "kingdom",
+        "empire",
+        "army",
+        "guard",
+        "bureau",
+        "office",
+        "courtyard",
+        "residence",
+        "manor",
+        "abbey",
+        "monastery",
+        "cave",
+        "spring",
+        "pond",
+        "bridge",
+        "gate",
+        "tower",
+        "wall",
+        "sword",
+        "blade",
+        "pill",
+        "elixir",
+        "poison",
+        "powder",
+        "jade",
     ];
     let lower = phrase.to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
@@ -650,14 +878,30 @@ fn contains_proper_noun_keyword(phrase: &str) -> bool {
 /// Stop phrases that should be excluded from unresolved term candidates.
 fn is_stop_phrase(phrase: &str) -> bool {
     let lower = phrase.to_lowercase();
-    matches!(lower.as_str(),
-        "your highness" | "his majesty" | "her majesty" | "your majesty" |
-        "older sister" | "older brother" | "younger sister" | "younger brother" |
-        "young master" | "fourth young master" | "second young master" |
-        "third young master" | "fifth young master" |
-        "big sister" | "big brother" | "little sister" | "little brother" |
-        "rebirth team" |
-        "old master" | "old mistress" | "young lady" | "young miss"
+    matches!(
+        lower.as_str(),
+        "your highness"
+            | "his majesty"
+            | "her majesty"
+            | "your majesty"
+            | "older sister"
+            | "older brother"
+            | "younger sister"
+            | "younger brother"
+            | "young master"
+            | "fourth young master"
+            | "second young master"
+            | "third young master"
+            | "fifth young master"
+            | "big sister"
+            | "big brother"
+            | "little sister"
+            | "little brother"
+            | "rebirth team"
+            | "old master"
+            | "old mistress"
+            | "young lady"
+            | "young miss"
     )
 }
 
@@ -668,8 +912,12 @@ fn clean_candidate(phrase: &str) -> Option<String> {
 
     // Strip trailing punctuation
     loop {
-        let trimmed = s.trim_end_matches(|c: char| matches!(c, '.' | ',' | '!' | '?' | ';' | ':')).to_string();
-        if trimmed == s { break; }
+        let trimmed = s
+            .trim_end_matches(|c: char| matches!(c, '.' | ',' | '!' | '?' | ';' | ':'))
+            .to_string();
+        if trimmed == s {
+            break;
+        }
         s = trimmed;
     }
 
@@ -698,16 +946,46 @@ fn clean_candidate(phrase: &str) -> Option<String> {
 
     // Strip leading "And " / "Of "
     let lower = s.to_lowercase();
-    if lower.starts_with("and ") && s.len() > 4 { s = s[4..].to_string(); }
-    if lower.starts_with("of ") && s.len() > 3 { s = s[3..].to_string(); }
+    if lower.starts_with("and ") && s.len() > 4 {
+        s = s[4..].to_string();
+    }
+    if lower.starts_with("of ") && s.len() > 3 {
+        s = s[3..].to_string();
+    }
+    // Strip leading function words (When, If, Then, But, So, Because, etc.)
+    let lower = s.to_lowercase();
+    for prefix in &[
+        "when ",
+        "if ",
+        "then ",
+        "but ",
+        "so ",
+        "because ",
+        "although ",
+        "since ",
+        "while ",
+        "before ",
+        "after ",
+    ] {
+        if lower.starts_with(prefix) && s.len() > prefix.len() {
+            s = s[prefix.len()..].to_string();
+            break;
+        }
+    }
 
     s = s.trim().to_string();
-    if s.is_empty() || is_stopword(&s) { return None; }
+    if s.is_empty() || is_stopword(&s) {
+        return None;
+    }
 
     // Final trailing punct strip
-    s = s.trim_end_matches(|c: char| matches!(c, '.' | ',' | '!' | '?' | ';' | ':')).to_string();
+    s = s
+        .trim_end_matches(|c: char| matches!(c, '.' | ',' | '!' | '?' | ';' | ':'))
+        .to_string();
     s = s.trim().to_string();
-    if s.is_empty() { return None; }
+    if s.is_empty() {
+        return None;
+    }
 
     Some(s)
 }
@@ -734,10 +1012,14 @@ fn build_known_names_set(
     let mut set = std::collections::HashSet::new();
     let mut insert_all = |s: &str| {
         let trimmed = s.trim().to_lowercase();
-        if trimmed.is_empty() { return; }
+        if trimmed.is_empty() {
+            return;
+        }
         // Word parts (for per-word matching)
         for part in trimmed.split_whitespace() {
-            if part.len() > 1 { set.insert(part.to_string()); }
+            if part.len() > 1 {
+                set.insert(part.to_string());
+            }
         }
         // Full lowercase form
         set.insert(trimmed.clone());
@@ -747,21 +1029,32 @@ fn build_known_names_set(
     };
     for c in characters {
         insert_all(&c.english_name);
-        for alias in &c.aliases { insert_all(alias); }
+        for alias in &c.aliases {
+            insert_all(alias);
+        }
     }
     for g in glossary {
         insert_all(&g.source);
-        for alias in &g.aliases { insert_all(alias); }
+        for alias in &g.aliases {
+            insert_all(alias);
+        }
     }
     set
 }
 
 /// Check if all content words in a phrase are covered by known names.
-fn is_covered_by_known_names(phrase: &str, known_names: &std::collections::HashSet<String>) -> bool {
+fn is_covered_by_known_names(
+    phrase: &str,
+    known_names: &std::collections::HashSet<String>,
+) -> bool {
     let words: Vec<&str> = phrase.split_whitespace().collect();
-    if words.is_empty() { return false; }
+    if words.is_empty() {
+        return false;
+    }
     let connectors: std::collections::HashSet<&str> = ["of", "the", "and", "in", "at", "to", "for"]
-        .iter().cloned().collect();
+        .iter()
+        .cloned()
+        .collect();
 
     let per_word_ok = words.iter().all(|w| {
         let lower = w.to_lowercase();
@@ -769,14 +1062,19 @@ fn is_covered_by_known_names(phrase: &str, known_names: &std::collections::HashS
             || known_names.contains(&lower)
             || known_names.contains(&normalize_en_for_dedup(&lower))
     });
-    if per_word_ok { return true; }
+    if per_word_ok {
+        return true;
+    }
 
     // Fallback: "Bian Tang" vs glossary "Biantang"
-    let content: Vec<&str> = words.iter()
+    let content: Vec<&str> = words
+        .iter()
         .filter(|w| !connectors.contains(w.to_lowercase().as_str()))
         .copied()
         .collect();
-    if content.is_empty() { return false; }
+    if content.is_empty() {
+        return false;
+    }
     let combined = content.join(" ");
     let dedup = normalize_en_for_dedup(&combined);
     known_names.contains(&dedup) || known_names.contains(&combined.to_lowercase())
@@ -786,8 +1084,12 @@ fn is_covered_by_known_names(phrase: &str, known_names: &std::collections::HashS
 /// Uses the same multi-form lookup as build_known_names_set.
 fn name_in_known_set(name: &str, known_names: &std::collections::HashSet<String>) -> bool {
     let lower = name.trim().to_lowercase();
-    if lower.is_empty() { return false; }
-    if known_names.contains(&lower) { return true; }
+    if lower.is_empty() {
+        return false;
+    }
+    if known_names.contains(&lower) {
+        return true;
+    }
     let dedup = normalize_en_for_dedup(&lower);
     known_names.contains(&dedup)
 }
@@ -845,24 +1147,59 @@ fn prune_possessive_terms(
 /// Check if a word is a title/rank word commonly used before names.
 fn is_title_word(word: &str) -> bool {
     let lower = word.to_lowercase();
-    matches!(lower.as_str(),
-        "king" | "queen" | "emperor" | "empress" |
-        "prince" | "princess" | "crown" |
-        "general" | "commander" | "marshal" |
-        "lord" | "lady" | "miss" | "mister" | "sir" |
-        "master" | "mistress" |
-        "young" | "old" | "elder" | "big" | "little" |
-        "first" | "second" | "third" | "fourth" | "fifth" |
-        "your" | "his" | "her" | "majesty" | "highness"
+    matches!(
+        lower.as_str(),
+        "king"
+            | "queen"
+            | "emperor"
+            | "empress"
+            | "prince"
+            | "princess"
+            | "crown"
+            | "general"
+            | "commander"
+            | "marshal"
+            | "lord"
+            | "lady"
+            | "miss"
+            | "mister"
+            | "sir"
+            | "master"
+            | "mistress"
+            | "young"
+            | "old"
+            | "elder"
+            | "big"
+            | "little"
+            | "first"
+            | "second"
+            | "third"
+            | "fourth"
+            | "fifth"
+            | "your"
+            | "his"
+            | "her"
+            | "majesty"
+            | "highness"
     )
 }
 
 /// Check if a word is a generic place suffix (City, Palace, etc.).
 fn is_generic_place_suffix(word: &str) -> bool {
-    matches!(word.to_lowercase().as_str(),
-        "city" | "palace" | "house" | "gate" | "pass" |
-        "lake" | "river" | "mountain" | "mountains" |
-        "region" | "tribe" | "army"
+    matches!(
+        word.to_lowercase().as_str(),
+        "city"
+            | "palace"
+            | "house"
+            | "gate"
+            | "pass"
+            | "lake"
+            | "river"
+            | "mountain"
+            | "mountains"
+            | "region"
+            | "tribe"
+            | "army"
     )
 }
 
@@ -874,9 +1211,13 @@ fn is_known_place_with_generic_suffix(
     known_names: &std::collections::HashSet<String>,
 ) -> bool {
     let words: Vec<&str> = phrase.split_whitespace().collect();
-    if words.len() < 2 { return false; }
+    if words.len() < 2 {
+        return false;
+    }
     let last = words.last().unwrap();
-    if !is_generic_place_suffix(last) { return false; }
+    if !is_generic_place_suffix(last) {
+        return false;
+    }
     let prefix = words[..words.len() - 1].join(" ");
     let normalized = normalize_en_for_dedup(&prefix);
     known_names.contains(&normalized) || known_names.contains(&prefix.to_lowercase())
@@ -890,9 +1231,11 @@ fn is_title_phrase_with_known_name(
     known_names: &std::collections::HashSet<String>,
 ) -> bool {
     let words: Vec<&str> = phrase.split_whitespace().collect();
-    if words.len() < 2 { return false; }
-    let connectors: std::collections::HashSet<&str> = ["of", "the", "and", "in", "at"]
-        .iter().cloned().collect();
+    if words.len() < 2 {
+        return false;
+    }
+    let connectors: std::collections::HashSet<&str> =
+        ["of", "the", "and", "in", "at"].iter().cloned().collect();
 
     let known_check = |w: &&str| {
         let lower = w.to_lowercase();
@@ -909,19 +1252,26 @@ fn is_title_phrase_with_known_name(
     });
     let has_title = words.iter().any(|w| is_title_word(w));
 
-    if has_title && content_has_known && content_all_known { return true; }
+    if has_title && content_has_known && content_all_known {
+        return true;
+    }
 
     // Fallback: normalize combined content words to match spaced/despaced variants.
     // "Bian Tang" + glossary "Biantang" → content "Bian Tang" → normalize → "biantang" → match.
-    if !has_title { return false; }
-    let content: Vec<&str> = words.iter()
+    if !has_title {
+        return false;
+    }
+    let content: Vec<&str> = words
+        .iter()
         .filter(|w| {
             let lower = w.to_lowercase();
             !connectors.contains(lower.as_str()) && !is_title_word(w)
         })
         .copied()
         .collect();
-    if content.is_empty() { return false; }
+    if content.is_empty() {
+        return false;
+    }
     let combined = content.join(" ");
     let dedup = normalize_en_for_dedup(&combined);
     known_names.contains(&dedup) || known_names.contains(&combined.to_lowercase())
@@ -929,9 +1279,11 @@ fn is_title_phrase_with_known_name(
 
 /// Split a candidate on commas. Each fragment is trimmed; empty/stopword-only fragments are dropped.
 fn split_on_comma(phrase: &str) -> Vec<String> {
-    phrase.split(',').map(|s| s.trim().to_string()).filter(|s| {
-        !s.is_empty() && !s.split_whitespace().all(|w| is_stopword(w))
-    }).collect()
+    phrase
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.split_whitespace().all(|w| is_stopword(w)))
+        .collect()
 }
 
 /// Split a candidate on " in ". If both sides start with a capital letter and contain at least one
@@ -939,17 +1291,31 @@ fn split_on_comma(phrase: &str) -> Vec<String> {
 fn split_on_in(phrase: &str) -> Vec<String> {
     let lower = phrase.to_lowercase();
     let parts: Vec<&str> = lower.splitn(2, " in ").collect();
-    if parts.len() != 2 { return vec![]; }
+    if parts.len() != 2 {
+        return vec![];
+    }
 
     // Find actual split point in original (preserving case)
     let idx = lower.find(" in ").unwrap();
     let left = &phrase[..idx].trim();
     let right = &phrase[idx + 4..].trim();
 
-    let left_ok = left.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
-        && left.split_whitespace().any(|w| !is_stopword(w) && !is_title_word(w));
-    let right_ok = right.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
-        && right.split_whitespace().any(|w| !is_stopword(w) && !is_title_word(w));
+    let left_ok = left
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
+        && left
+            .split_whitespace()
+            .any(|w| !is_stopword(w) && !is_title_word(w));
+    let right_ok = right
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
+        && right
+            .split_whitespace()
+            .any(|w| !is_stopword(w) && !is_title_word(w));
 
     if left_ok && right_ok {
         vec![left.to_string(), right.to_string()]
@@ -971,17 +1337,22 @@ fn starts_with_verb_and_known_names(
     known_names: &std::collections::HashSet<String>,
 ) -> bool {
     let words: Vec<&str> = phrase.split_whitespace().collect();
-    if words.len() < 2 { return false; }
+    if words.len() < 2 {
+        return false;
+    }
     let first = words[0].to_lowercase();
     const ACTION_VERBS: &[&str] = &[
-        "defend", "kill", "seize", "slay", "save", "bring", "take",
-        "get", "go", "come", "find", "stop", "attack", "protect",
-        "capture", "destroy", "rescue", "follow", "leave", "return",
+        "defend", "kill", "seize", "slay", "save", "bring", "take", "get", "go", "come", "find",
+        "stop", "attack", "protect", "capture", "destroy", "rescue", "follow", "leave", "return",
         "arrest", "execute", "punish", "conquer", "invade",
     ];
-    if !ACTION_VERBS.contains(&first.as_str()) { return false; }
+    if !ACTION_VERBS.contains(&first.as_str()) {
+        return false;
+    }
     let connectors: std::collections::HashSet<&str> = ["of", "the", "and", "in", "at", "to", "for"]
-        .iter().cloned().collect();
+        .iter()
+        .cloned()
+        .collect();
 
     let per_word_ok = words[1..].iter().all(|w| {
         let lower = w.to_lowercase();
@@ -989,14 +1360,19 @@ fn starts_with_verb_and_known_names(
             || known_names.contains(&lower)
             || known_names.contains(&normalize_en_for_dedup(&lower))
     });
-    if per_word_ok { return true; }
+    if per_word_ok {
+        return true;
+    }
 
     // Fallback: "Defend Bian Tang" where Bian Tang (spaced) matches Biantang (dedup)
-    let content: Vec<&str> = words[1..].iter()
+    let content: Vec<&str> = words[1..]
+        .iter()
         .filter(|w| !connectors.contains(w.to_lowercase().as_str()))
         .copied()
         .collect();
-    if content.is_empty() { return false; }
+    if content.is_empty() {
+        return false;
+    }
     let combined = content.join(" ");
     let dedup = normalize_en_for_dedup(&combined);
     known_names.contains(&dedup) || known_names.contains(&combined.to_lowercase())
@@ -1013,7 +1389,9 @@ fn filter_synopsis_terms_by_known_names(
     let before = terms.len();
     terms.retain(|t| {
         let phrase = t.source_text.trim();
-        if phrase.is_empty() { return false; }
+        if phrase.is_empty() {
+            return false;
+        }
 
         if is_title_phrase_with_known_name(phrase, known_names) {
             return false; // e.g. "Crown Prince of Biantang"
@@ -1054,7 +1432,9 @@ fn validate_term_variants(variants: &mut Vec<TermVariantEntry>) {
         if first_key.is_empty() {
             return false;
         }
-        v.variants.iter().all(|var| normalize_en_for_dedup(var) == first_key)
+        v.variants
+            .iter()
+            .all(|var| normalize_en_for_dedup(var) == first_key)
     });
     let removed = before - variants.len();
     if removed > 0 {
@@ -1079,15 +1459,17 @@ struct SrtBodyCandidate {
 /// Heuristic: if the text has 20+ CJK characters but kana is <8% of CJK count,
 /// it's almost certainly Chinese (natural Japanese always has hiragana particles/endings).
 fn is_likely_chinese(text: &str) -> bool {
-    let cjk_count = text.chars().filter(|c| {
-        ('\u{4e00}'..='\u{9fff}').contains(c) || ('\u{3400}'..='\u{4dbf}').contains(c)
-    }).count();
+    let cjk_count = text
+        .chars()
+        .filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c) || ('\u{3400}'..='\u{4dbf}').contains(c))
+        .count();
     if cjk_count < 20 {
         return false; // too short to tell reliably
     }
-    let kana_count = text.chars().filter(|c| {
-        ('\u{3040}'..='\u{309f}').contains(c) || ('\u{30a0}'..='\u{30ff}').contains(c)
-    }).count();
+    let kana_count = text
+        .chars()
+        .filter(|c| ('\u{3040}'..='\u{309f}').contains(c) || ('\u{30a0}'..='\u{30ff}').contains(c))
+        .count();
     let ratio = kana_count as f64 / cjk_count as f64;
     ratio < 0.08
 }
@@ -1123,10 +1505,12 @@ fn replace_guessed_terms_in_synopsis(synopsis_ja: &mut String, terms: &[Unresolv
         if let Some(pos) = synopsis_ja.find(&pattern) {
             if let Some(close) = synopsis_ja[pos..].find('）') {
                 let end = pos + close + '）'.len_utf8();
-                *synopsis_ja = format!("{}{}{}",
+                *synopsis_ja = format!(
+                    "{}{}{}",
                     &synopsis_ja[..pos],
                     term.source_text,
-                    &synopsis_ja[end..]);
+                    &synopsis_ja[end..]
+                );
                 continue;
             }
         }
@@ -1216,6 +1600,202 @@ fn find_possessive_in_text(text: &str) -> Option<(&str, &str)> {
     None
 }
 
+fn is_contraction_word(word: &str) -> bool {
+    let w = normalize_apostrophes(word).to_lowercase();
+    matches!(
+        w.as_str(),
+        "i'm"
+            | "i'll"
+            | "i've"
+            | "i'd"
+            | "you're"
+            | "you'll"
+            | "you'd"
+            | "we're"
+            | "we'll"
+            | "we'd"
+            | "they're"
+            | "they'll"
+            | "they'd"
+            | "he's"
+            | "she's"
+            | "it's"
+            | "that's"
+            | "there's"
+            | "what's"
+            | "who's"
+            | "where's"
+            | "let's"
+            | "don't"
+            | "can't"
+            | "won't"
+            | "isn't"
+            | "aren't"
+            | "wasn't"
+            | "weren't"
+            | "hasn't"
+            | "haven't"
+            | "hadn't"
+            | "doesn't"
+            | "didn't"
+            | "shouldn't"
+            | "wouldn't"
+            | "couldn't"
+    )
+}
+
+fn is_leading_function_word(word: &str) -> bool {
+    matches!(
+        word.to_lowercase().as_str(),
+        "when"
+            | "if"
+            | "then"
+            | "and"
+            | "but"
+            | "so"
+            | "because"
+            | "although"
+            | "since"
+            | "while"
+            | "before"
+            | "after"
+    )
+}
+
+/// If phrase starts with a contraction or function word followed by a space,
+/// return the remainder. Otherwise None.
+fn strip_leading_noise(phrase: &str) -> Option<String> {
+    let normalized = normalize_apostrophes(phrase);
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    if words.len() < 2 {
+        return None;
+    }
+    let first = words[0];
+    if is_contraction_word(first) || is_leading_function_word(first) {
+        let remainder = words[1..].join(" ");
+        if remainder.is_empty() {
+            None
+        } else {
+            Some(remainder)
+        }
+    } else {
+        None
+    }
+}
+
+/// Check that a stripped remainder is a plausible proper noun fragment.
+fn is_valid_replacement_candidate(s: &str) -> bool {
+    let has_capitalized = s
+        .split_whitespace()
+        .any(|w| w.starts_with(|c: char| c.is_uppercase()));
+    if !has_capitalized {
+        return false;
+    }
+    if is_false_positive_unresolved(s) {
+        return false;
+    }
+    if is_stopword(s) {
+        return false;
+    }
+    if clean_candidate(s).is_none() {
+        return false;
+    }
+    true
+}
+
+/// Strip text after the first sentence boundary ('.', '!', '?' followed by whitespace or end-of-text).
+/// Does NOT cut at abbreviations like "Mr. Wang" or "No. 1" (no whitespace after the dot).
+fn strip_after_sentence_boundary(text: &str) -> String {
+    let normalized = normalize_apostrophes(text);
+    let chars: Vec<(usize, char)> = normalized.char_indices().collect();
+
+    for (i, (pos, ch)) in chars.iter().enumerate() {
+        if !matches!(ch, '.' | '!' | '?') {
+            continue;
+        }
+        // Only treat as sentence boundary if followed by whitespace or end-of-text
+        let next_is_space = chars
+            .get(i + 1)
+            .map(|(_, next)| next.is_whitespace())
+            .unwrap_or(true); // end of text counts as boundary
+
+        if next_is_space {
+            return normalized[..*pos].trim().to_string();
+        }
+    }
+
+    normalized.trim().to_string()
+}
+
+/// Clean up a raw candidate string for the unresolved terms list.
+/// Returns:
+/// - None    → drop entirely
+/// - Some(s) → keep with possibly replaced source_text
+fn cleanup_unresolved_candidate(text: &str) -> Option<String> {
+    // Step 1: strip after sentence boundary ("Young Master Huai. Please" → "Young Master Huai")
+    let boundary_stripped = strip_after_sentence_boundary(text);
+    let candidate = boundary_stripped.trim();
+
+    if candidate.is_empty() {
+        return None;
+    }
+
+    // Step 2: strip leading noise ("I'm A'Chu" → "A'Chu", "When Snow Region" → "Snow Region")
+    if let Some(stripped) = strip_leading_noise(candidate) {
+        if is_valid_replacement_candidate(&stripped) {
+            return Some(stripped);
+        }
+        return None;
+    }
+
+    // Step 3: check if standalone false positive ("Crown Prince", "I'll", etc.)
+    if is_false_positive_unresolved(candidate) {
+        return None;
+    }
+
+    // Step 4: keep as-is
+    Some(candidate.to_string())
+}
+
+/// Detect narrative prose phrases with title-like English patterns
+/// (e.g. "Blood on the Snow", "Whispers in the Dark").
+/// Only matches phrases with 4+ words containing "X on/in/under/over/before/after the Y".
+fn looks_like_title_like_prose_phrase(text: &str) -> bool {
+    let normalized = normalize_apostrophes(text);
+    let lower = normalized.trim().to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    if words.len() < 4 {
+        return false;
+    }
+    lower.contains(" on the ")
+        || lower.contains(" in the ")
+        || lower.contains(" under the ")
+        || lower.contains(" over the ")
+        || lower.contains(" before the ")
+        || lower.contains(" after the ")
+}
+
+/// Check if a phrase appears (case-insensitive, apostrophe-normalized) in any subtitle entry text.
+fn phrase_occurs_in_entries_exact(phrase: &str, entries: &[SubtitleEntry]) -> bool {
+    let needle = normalize_apostrophes(phrase).to_lowercase();
+    entries
+        .iter()
+        .any(|e| normalize_apostrophes(&e.text).to_lowercase().contains(&needle))
+}
+
+/// Standalone title/honorific phrases that are not proper nouns when used alone.
+/// Exact match only — "Crown Prince of X" or "Commander Chen" will NOT match.
+fn is_standalone_title_phrase(text: &str) -> bool {
+    let normalized = normalize_apostrophes(text);
+    let lower = normalized.trim().to_lowercase();
+    matches!(lower.as_str(),
+        "crown prince" | "prince" | "princess" |
+        "king" | "queen" | "emperor" | "empress" |
+        "lord" | "lady" | "commander" | "general" |
+        "young master" | "master" | "shopkeeper" | "innkeeper"
+    )
+}
+
 /// Terms that should never appear as unresolved proper nouns.
 /// Includes English contractions and standalone honorifics/titles (without a name).
 fn is_false_positive_unresolved(text: &str) -> bool {
@@ -1223,23 +1803,111 @@ fn is_false_positive_unresolved(text: &str) -> bool {
     let lower = normalized.to_lowercase();
     let lower = lower.trim();
 
-    // English contractions
-    if matches!(lower,
-        "i've" | "i'm" | "you're" | "we're" | "they're" |
-        "he's" | "she's" | "it's" |
-        "don't" | "can't" | "won't" | "isn't" | "aren't" |
-        "wasn't" | "weren't" | "hasn't" | "haven't" | "hadn't" |
-        "doesn't" | "didn't" | "shouldn't" | "wouldn't" | "couldn't"
+    // English contractions (single-word)
+    if matches!(
+        lower,
+        "i've"
+            | "i'll"
+            | "i'm"
+            | "you're"
+            | "we're"
+            | "they're"
+            | "he's"
+            | "she's"
+            | "it's"
+            | "don't"
+            | "can't"
+            | "won't"
+            | "isn't"
+            | "aren't"
+            | "wasn't"
+            | "weren't"
+            | "hasn't"
+            | "haven't"
+            | "hadn't"
+            | "doesn't"
+            | "didn't"
+            | "shouldn't"
+            | "wouldn't"
+            | "couldn't"
+    ) {
+        return true;
+    }
+
+    // Multi-word contraction fragments: conjunction/preposition + contraction
+    // ("But I'm", "And I'll", "So you're", etc.)
+    if matches!(
+        lower,
+        "but i'm"
+            | "and i'm"
+            | "so i'm"
+            | "then i'm"
+            | "well i'm"
+            | "but i'll"
+            | "and i'll"
+            | "so i'll"
+            | "then i'll"
+            | "but you're"
+            | "and you're"
+            | "so you're"
+            | "but it's"
+            | "and it's"
+            | "so it's"
+            | "but that's"
+            | "and that's"
+            | "but he's"
+            | "and he's"
+            | "but she's"
+            | "and she's"
+            | "but we're"
+            | "and we're"
+            | "but they're"
+            | "and they're"
+    ) {
+        return true;
+    }
+
+    // General sentence fragments that happen to be capitalized
+    if matches!(
+        lower,
+        "this is"
+            | "that is"
+            | "there is"
+            | "it is"
+            | "you are"
+            | "we are"
+            | "they are"
+            | "i am"
+            | "he is"
+            | "she is"
+            | "here is"
+            | "here are"
     ) {
         return true;
     }
 
     // Standalone titles/honorifics without a proper name
-    if matches!(lower,
-        "master" | "sir" | "madam" |
-        "my lord" | "your highness" | "your majesty" |
-        "his highness" | "her highness" | "his majesty" | "her majesty"
+    if matches!(
+        lower,
+        "master"
+            | "sir"
+            | "madam"
+            | "shopkeeper"
+            | "innkeeper"
+            | "my lord"
+            | "your highness"
+            | "your majesty"
+            | "his highness"
+            | "her highness"
+            | "his majesty"
+            | "her majesty"
     ) {
+        return true;
+    }
+
+    // Standalone title phrases (Crown Prince, Young Master, Commander, etc.)
+    // Exact match only — "Crown Prince of X" or "Commander Chen" will NOT match.
+    if is_standalone_title_phrase(text) {
         return true;
     }
 
@@ -1248,9 +1916,8 @@ fn is_false_positive_unresolved(text: &str) -> bool {
 
 /// Single generic English words that are too vague to use as search terms alone.
 const GENERIC_ALIAS_WORDS: &[&str] = &[
-    "moon", "sun", "star", "wind", "fire", "water", "earth", "sky",
-    "ice", "snow", "iron", "gold", "silver", "jade", "sea", "storm",
-    "great", "black", "white", "red", "blue", "green", "dark",
+    "moon", "sun", "star", "wind", "fire", "water", "earth", "sky", "ice", "snow", "iron", "gold",
+    "silver", "jade", "sea", "storm", "great", "black", "white", "red", "blue", "green", "dark",
     "east", "west", "north", "south", "young", "old",
 ];
 
@@ -1258,7 +1925,8 @@ const GENERIC_ALIAS_WORDS: &[&str] = &[
 /// Keeps multi-word aliases and non-generic single words like "Zhenhuang".
 /// After filtering, if only the source_text remains, returns empty — no search_aliases output.
 fn sanitize_search_aliases(aliases: &[String]) -> Vec<String> {
-    let filtered: Vec<String> = aliases.iter()
+    let filtered: Vec<String> = aliases
+        .iter()
         .filter(|a| {
             let is_single_word = !a.contains(' ');
             if is_single_word {
@@ -1270,7 +1938,11 @@ fn sanitize_search_aliases(aliases: &[String]) -> Vec<String> {
         .cloned()
         .collect();
     // If only source_text (first entry) remains, return empty — no extra search hints
-    if filtered.len() <= 1 { Vec::new() } else { filtered }
+    if filtered.len() <= 1 {
+        Vec::new()
+    } else {
+        filtered
+    }
 }
 
 /// Detect generic English suffixes on proper nouns and generate search aliases.
@@ -1279,7 +1951,9 @@ fn sanitize_search_aliases(aliases: &[String]) -> Vec<String> {
 ///
 /// Also decomposes possessive phrases ("Yanbei's King of Zhenxiao") and
 /// title-prefixed names ("Emperor Pei Luo") into searchable components.
-fn generate_search_aliases(source_text: &str) -> (Option<String>, Option<String>, Option<Vec<String>>) {
+fn generate_search_aliases(
+    source_text: &str,
+) -> (Option<String>, Option<String>, Option<Vec<String>>) {
     // False positives (contractions, standalone titles) get no aliases
     if is_false_positive_unresolved(source_text) {
         return (None, None, None);
@@ -1287,12 +1961,30 @@ fn generate_search_aliases(source_text: &str) -> (Option<String>, Option<String>
 
     // Longest first so "Ancestral Temple" matches before "Temple"
     let suffixes: &[&str] = &[
-        "Ancestral Temple", "Grand Marshal", "Northwest Army",
-        "Mountains", "Guards", "Emperor", "Princess", "Prince", "General",
-        "Temple", "Palace", "Guard",
-        "City", "River", "Lake", "Mountain", "Pass",
-        "Tribe", "Army", "House", "Lady", "Lord",
-        "King", "Wall",
+        "Ancestral Temple",
+        "Grand Marshal",
+        "Northwest Army",
+        "Mountains",
+        "Guards",
+        "Emperor",
+        "Princess",
+        "Prince",
+        "General",
+        "Temple",
+        "Palace",
+        "Guard",
+        "City",
+        "River",
+        "Lake",
+        "Mountain",
+        "Pass",
+        "Tribe",
+        "Army",
+        "House",
+        "Lady",
+        "Lord",
+        "King",
+        "Wall",
     ];
 
     let mut search_text: Option<String> = None;
@@ -1304,10 +1996,10 @@ fn generate_search_aliases(source_text: &str) -> (Option<String>, Option<String>
 
     // Strip trailing possessive for suffix-matching purposes:
     // "Emperor Pei Luo's" → work on "Emperor Pei Luo"
-    let has_trailing_ps = normalized.len() > 2
-        && normalized[normalized.len()-2..].eq_ignore_ascii_case("'s");
+    let has_trailing_ps =
+        normalized.len() > 2 && normalized[normalized.len() - 2..].eq_ignore_ascii_case("'s");
     let work = if has_trailing_ps {
-        let stripped = normalized[..normalized.len()-2].trim().to_string();
+        let stripped = normalized[..normalized.len() - 2].trim().to_string();
         if !stripped.is_empty() && stripped != source_text {
             aliases.push(stripped.clone());
         }
@@ -1319,9 +2011,7 @@ fn generate_search_aliases(source_text: &str) -> (Option<String>, Option<String>
     // Single suffix match (longest first) — on the work text (without trailing 's)
     for suffix in suffixes {
         let pat = format!(" {}", suffix);
-        if work.len() > pat.len()
-            && work[work.len() - pat.len()..].eq_ignore_ascii_case(&pat)
-        {
+        if work.len() > pat.len() && work[work.len() - pat.len()..].eq_ignore_ascii_case(&pat) {
             let stripped = work[..work.len() - pat.len()].trim().to_string();
             if !stripped.is_empty() {
                 let is_single_word = !stripped.contains(' ');
@@ -1363,7 +2053,15 @@ fn generate_search_aliases(source_text: &str) -> (Option<String>, Option<String>
     aliases.dedup();
     let sanitized = sanitize_search_aliases(&aliases);
 
-    (search_text, generic_suffix, if sanitized.is_empty() { None } else { Some(sanitized) })
+    (
+        search_text,
+        generic_suffix,
+        if sanitized.is_empty() {
+            None
+        } else {
+            Some(sanitized)
+        },
+    )
 }
 
 /// Split possessive and title-prefixed proper noun phrases into searchable components.
@@ -1390,9 +2088,17 @@ fn decompose_possessive_phrase(phrase: &str) -> Vec<String> {
 
             // Strip "X of Y" title prefix from target: "King of Zhenxiao" → "Zhenxiao"
             let of_prefixes = [
-                "King of ", "Queen of ", "Emperor of ", "Empress of ",
-                "Prince of ", "Princess of ", "General of ", "Lord of ",
-                "Lady of ", "Commander of ", "Grand Marshal of ",
+                "King of ",
+                "Queen of ",
+                "Emperor of ",
+                "Empress of ",
+                "Prince of ",
+                "Princess of ",
+                "General of ",
+                "Lord of ",
+                "Lady of ",
+                "Commander of ",
+                "Grand Marshal of ",
             ];
             for prefix in &of_prefixes {
                 if target.len() > prefix.len()
@@ -1409,10 +2115,23 @@ fn decompose_possessive_phrase(phrase: &str) -> Vec<String> {
             // Strip generic suffix from target: "Xun Lie Wall" → "Xun Lie"
             // Also emit multi-word suffixes as supplementary aliases (e.g. "Grand Marshal")
             let gen_suffixes: &[&str] = &[
-                "Ancestral Temple", "Grand Marshal",
-                "Northwest Army", "Army", "Temple", "Palace", "Wall",
-                "Guard", "Guards", "City", "River", "Lake", "Mountain",
-                "Mountains", "Pass", "Tribe", "House",
+                "Ancestral Temple",
+                "Grand Marshal",
+                "Northwest Army",
+                "Army",
+                "Temple",
+                "Palace",
+                "Wall",
+                "Guard",
+                "Guards",
+                "City",
+                "River",
+                "Lake",
+                "Mountain",
+                "Mountains",
+                "Pass",
+                "Tribe",
+                "House",
             ];
             for suffix in gen_suffixes {
                 let pat = format!(" {}", suffix);
@@ -1441,23 +2160,29 @@ fn decompose_possessive_phrase(phrase: &str) -> Vec<String> {
     // 2. Strip leading title without possessive: "Emperor Pei Luo" → "Pei Luo"
     if !phrase.contains("'s ") && !phrase.to_lowercase().contains(" of ") {
         // Strip trailing possessive first: "Emperor Pei Luo's" → "Emperor Pei Luo"
-        let work = if phrase.len() > 2 && phrase[phrase.len()-2..].eq_ignore_ascii_case("'s")
-            && !phrase[..phrase.len()-2].ends_with(' ')
+        let work = if phrase.len() > 2
+            && phrase[phrase.len() - 2..].eq_ignore_ascii_case("'s")
+            && !phrase[..phrase.len() - 2].ends_with(' ')
         {
-            phrase[..phrase.len()-2].trim().to_string()
+            phrase[..phrase.len() - 2].trim().to_string()
         } else {
             phrase.clone()
         };
 
         let lead_titles = [
-            "Emperor ", "Empress ", "King ", "Queen ",
-            "General ", "Prince ", "Princess ", "Lord ", "Lady ",
+            "Emperor ",
+            "Empress ",
+            "King ",
+            "Queen ",
+            "General ",
+            "Prince ",
+            "Princess ",
+            "Lord ",
+            "Lady ",
             "Grand Marshal ",
         ];
         for title in &lead_titles {
-            if work.len() > title.len()
-                && work[..title.len()].eq_ignore_ascii_case(title)
-            {
+            if work.len() > title.len() && work[..title.len()].eq_ignore_ascii_case(title) {
                 let remainder = work[title.len()..].trim().to_string();
                 // Only strip if remainder is a multi-word name
                 if remainder.split_whitespace().count() >= 2 {
@@ -1485,9 +2210,17 @@ fn decompose_title_of_phrase(text: &str) -> Vec<String> {
     let mut result = Vec::new();
     let lower = text.to_lowercase();
     let of_prefixes: &[&str] = &[
-        "King of ", "Queen of ", "Emperor of ", "Empress of ",
-        "Prince of ", "Princess of ", "General of ", "Lord of ",
-        "Lady of ", "Commander of ", "Grand Marshal of ",
+        "King of ",
+        "Queen of ",
+        "Emperor of ",
+        "Empress of ",
+        "Prince of ",
+        "Princess of ",
+        "General of ",
+        "Lord of ",
+        "Lady of ",
+        "Commander of ",
+        "Grand Marshal of ",
         "Marshal of ",
     ];
     for prefix in of_prefixes {
@@ -1516,14 +2249,19 @@ pub fn extract_srt_body_candidates(
 
     for entry in &entries {
         let text = entry.text.trim();
-        if text.is_empty() { continue; }
+        if text.is_empty() {
+            continue;
+        }
 
         let words: Vec<&str> = text.split_whitespace().collect();
         let mut i = 0;
         while i < words.len() {
             let word = words[i];
-            let starts_upper = word.chars().next()
-                .map(|c| c.is_uppercase()).unwrap_or(false);
+            let starts_upper = word
+                .chars()
+                .next()
+                .map(|c| c.is_uppercase())
+                .unwrap_or(false);
             // Skip all-caps words (likely emphasis/shouting, not proper nouns)
             let all_caps = word.chars().all(|c| !c.is_alphabetic() || c.is_uppercase());
             if !starts_upper || all_caps {
@@ -1535,15 +2273,21 @@ pub fn extract_srt_body_candidates(
             let mut seq_end = i + 1;
             while seq_end < words.len() {
                 let next = words[seq_end];
-                let next_upper = next.chars().next()
-                    .map(|c| c.is_uppercase()).unwrap_or(false);
+                let next_upper = next
+                    .chars()
+                    .next()
+                    .map(|c| c.is_uppercase())
+                    .unwrap_or(false);
                 let next_all_caps = next.chars().all(|c| !c.is_alphabetic() || c.is_uppercase());
                 if next_upper && !next_all_caps {
                     seq_end += 1;
                     // Absorb short connecting words (of, the, and, in, at)
                     if seq_end < words.len() {
                         let after = words[seq_end];
-                        if matches!(after.to_lowercase().as_str(), "of" | "the" | "and" | "in" | "at") {
+                        if matches!(
+                            after.to_lowercase().as_str(),
+                            "of" | "the" | "and" | "in" | "at"
+                        ) {
                             seq_end += 1;
                         }
                     }
@@ -1558,22 +2302,48 @@ pub fn extract_srt_body_candidates(
 
             if word_count >= 2 || has_keyword {
                 // Apply filters to a single cleaned candidate, pushing if valid
-                let try_push = |raw: &mut Vec<(String, bool, String)>, cand: &str, kn: &std::collections::HashSet<String>| {
-                    let cleaned = match clean_candidate(cand) {
-                        Some(c) => c,
-                        None => return,
-                    };
-                    if cleaned.split_whitespace().all(|w| is_stopword(w)) { return; }
-                    if contains_dialogue_punctuation(&cleaned) { return; }
-                    if is_stop_phrase(&cleaned) { return; }
-                    if is_title_phrase_with_known_name(&cleaned, kn) { return; }
-                    if is_known_place_with_generic_suffix(&cleaned, kn) { return; }
-                    if starts_with_verb_and_known_names(&cleaned, kn) { return; }
-                    if is_covered_by_known_names(&cleaned, kn) { return; }
+                let try_push =
+                    |raw: &mut Vec<(String, bool, String)>,
+                     cand: &str,
+                     kn: &std::collections::HashSet<String>| {
+                        // First pass: unified cleanup (sentence boundary, noise strip, false positive)
+                        let cleaned = match cleanup_unresolved_candidate(cand) {
+                            Some(s) => s,
+                            None => return,
+                        };
+                        // Second pass: traditional clean (trailing punct, leading The, etc.)
+                        let cleaned = match clean_candidate(&cleaned) {
+                            Some(c) => c,
+                            None => return,
+                        };
+                        if cleaned.split_whitespace().all(|w| is_stopword(w)) {
+                            return;
+                        }
+                        if contains_dialogue_punctuation(&cleaned) {
+                            return;
+                        }
+                        if is_stop_phrase(&cleaned) {
+                            return;
+                        }
+                        if is_title_phrase_with_known_name(&cleaned, kn) {
+                            return;
+                        }
+                        if is_known_place_with_generic_suffix(&cleaned, kn) {
+                            return;
+                        }
+                        if starts_with_verb_and_known_names(&cleaned, kn) {
+                            return;
+                        }
+                        if is_covered_by_known_names(&cleaned, kn) {
+                            return;
+                        }
+                        if is_false_positive_unresolved(&cleaned) {
+                            return;
+                        }
 
-                    let is_alias = looks_like_repeated_alias(&cleaned);
-                    raw.push((cleaned, is_alias, entry.start.clone()));
-                };
+                        let is_alias = looks_like_repeated_alias(&cleaned);
+                        raw.push((cleaned, is_alias, entry.start.clone()));
+                    };
 
                 // Dialogue punctuation → skip (check raw phrase BEFORE cleaning,
                 // because clean_candidate strips trailing ! and ?)
@@ -1598,10 +2368,24 @@ pub fn extract_srt_body_candidates(
                     continue;
                 }
 
+                // Contraction / function-word decomposition:
+                // "I'm A'Chu" → push "A'Chu", "When Snow Region" → push "Snow Region"
+                if let Some(stripped) = strip_leading_noise(&phrase) {
+                    if is_valid_replacement_candidate(&stripped) {
+                        try_push(&mut raw_candidates, &stripped, &known_names);
+                    }
+                    // Always skip the original noisy phrase
+                    i = seq_end;
+                    continue;
+                }
+
                 // Clean the raw phrase
                 let cleaned = match clean_candidate(&phrase) {
                     Some(c) => c,
-                    None => { i = seq_end; continue; }
+                    None => {
+                        i = seq_end;
+                        continue;
+                    }
                 };
 
                 // Stopword-only check
@@ -1683,14 +2467,22 @@ pub fn extract_srt_body_candidates(
     sorted_keys.sort_by_key(|k| -(k.len() as i32));
     let mut to_remove: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut to_bump: Vec<(String, u32)> = Vec::new();
-    let mut short_to_long: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut short_to_long: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for i in 0..sorted_keys.len() {
-        if to_remove.contains(&sorted_keys[i]) { continue; }
+        if to_remove.contains(&sorted_keys[i]) {
+            continue;
+        }
         for j in (i + 1)..sorted_keys.len() {
-            if to_remove.contains(&sorted_keys[j]) { continue; }
+            if to_remove.contains(&sorted_keys[j]) {
+                continue;
+            }
             if sorted_keys[i].contains(&sorted_keys[j]) {
-                let shorter_count = candidate_map.get(&sorted_keys[j]).map(|c| c.count).unwrap_or(0);
+                let shorter_count = candidate_map
+                    .get(&sorted_keys[j])
+                    .map(|c| c.count)
+                    .unwrap_or(0);
                 to_remove.insert(sorted_keys[j].clone());
                 to_bump.push((sorted_keys[i].clone(), shorter_count));
                 short_to_long.insert(sorted_keys[j].clone(), sorted_keys[i].clone());
@@ -1738,7 +2530,11 @@ pub fn extract_srt_body_candidates(
             UnresolvedTerm {
                 source_text: c.original_text,
                 surface_ja: String::new(),
-                term_type: if c.is_alias { "alias_candidate".to_string() } else { "proper_noun".to_string() },
+                term_type: if c.is_alias {
+                    "alias_candidate".to_string()
+                } else {
+                    "proper_noun".to_string()
+                },
                 status: "unresolved".to_string(),
                 reason: format!("SRT本文から抽出 ({}回出現)", c.count),
                 source: Some("srt_body".to_string()),
@@ -1792,7 +2588,8 @@ pub fn list_srt_in_dir(
 ) -> Result<Vec<SrtFileEntry>, String> {
     let en_pattern = service_settings::read_srt_en_pattern(&app);
     let en_re = regex::Regex::new(&en_pattern).map_err(|e| format!("Invalid regex: {}", e))?;
-    let zh_pattern = derive_zh_pattern(&en_pattern).unwrap_or_else(|| DEFAULT_SRT_ZH_PATTERN.to_string());
+    let zh_pattern =
+        derive_zh_pattern(&en_pattern).unwrap_or_else(|| DEFAULT_SRT_ZH_PATTERN.to_string());
     let zh_re = regex::Regex::new(&zh_pattern).map_err(|e| format!("Invalid zh regex: {}", e))?;
 
     let dir = std::path::Path::new(&dir_path);
@@ -1824,19 +2621,23 @@ pub fn list_srt_in_dir(
     }
 
     // Build a set of zh file paths for quick lookup
-    let zh_names: std::collections::HashSet<String> = zh_files.iter()
-        .map(|(n, _)| n.clone())
-        .collect();
+    let zh_names: std::collections::HashSet<String> =
+        zh_files.iter().map(|(n, _)| n.clone()).collect();
 
     // For each en file, try to find its zh pair by replacing the en pattern match with zh
     let mut results: Vec<SrtFileEntry> = Vec::new();
     for (en_name, en_path) in &en_files {
-        let zh_candidate = en_re.replace(en_name, |caps: &regex::Captures| {
-            caps.get(0).unwrap().as_str().replace("en", "zh")
-        }).to_string();
+        let zh_candidate = en_re
+            .replace(en_name, |caps: &regex::Captures| {
+                caps.get(0).unwrap().as_str().replace("en", "zh")
+            })
+            .to_string();
         let (zh_path, zh_name) = if zh_names.contains(&zh_candidate) {
             let zh_full = dir.join(&zh_candidate);
-            (Some(zh_full.to_string_lossy().to_string()), Some(zh_candidate))
+            (
+                Some(zh_full.to_string_lossy().to_string()),
+                Some(zh_candidate),
+            )
         } else {
             (None, None)
         };
@@ -1850,10 +2651,17 @@ pub fn list_srt_in_dir(
 
     results.sort_by(|a, b| a.name.cmp(&b.name));
     let paired = results.iter().filter(|r| r.zh_path.is_some()).count();
-    emit_log(&app, "info", "SRT", &format!(
-        "list_srt_in_dir: {} en files found ({} with zh pair) in {}",
-        results.len(), paired, dir_path
-    ));
+    emit_log(
+        &app,
+        "info",
+        "SRT",
+        &format!(
+            "list_srt_in_dir: {} en files found ({} with zh pair) in {}",
+            results.len(),
+            paired,
+            dir_path
+        ),
+    );
     Ok(results)
 }
 
@@ -1867,9 +2675,16 @@ pub async fn generate_srt_synopsis(
     prompt_context: Option<String>,
 ) -> Result<SrtSynopsisResult, String> {
     let ctx = prompt_context.unwrap_or_default();
-    emit_log(&app, "info", "SRT", &format!("あらすじ生成開始: {} entries", entries.len()));
+    emit_log(
+        &app,
+        "info",
+        "SRT",
+        &format!("あらすじ生成開始: {} entries", entries.len()),
+    );
 
-    let provider = resolve_provider(&state, &env_store, &app)?;
+    let task_models = service_settings::read_llm_task_model_settings(&app);
+    let provider =
+        resolve_provider_for_tier(&state, &env_store, &app, task_models.synopsis_generation)?;
     let client = LlmClient::new(provider);
 
     let (system, user) = build_synopsis_prompt(&entries, &ctx);
@@ -1880,8 +2695,12 @@ pub async fn generate_srt_synopsis(
 
     // Detect Chinese-output and retry once with explicit Japanese instruction
     if is_likely_chinese(&result.synopsis_ja) {
-        emit_log(&app, "warn", "SRT",
-            "synopsis_ja が日本語ではない可能性があるため再生成します");
+        emit_log(
+            &app,
+            "warn",
+            "SRT",
+            "synopsis_ja が日本語ではない可能性があるため再生成します",
+        );
         let retry_user = format!(
             "{}\n\n【重要：再出力指示】\n\
              あなたの前回の出力は日本語ではありませんでした。\n\
@@ -1895,10 +2714,19 @@ pub async fn generate_srt_synopsis(
         result = serde_json::from_value(retry_value)
             .map_err(|e| format!("Failed to parse retry synopsis JSON: {}", e))?;
         if is_likely_chinese(&result.synopsis_ja) {
-            emit_log(&app, "warn", "SRT",
-                "再生成後も日本語判定に失敗しましたが、そのまま処理を続行します");
+            emit_log(
+                &app,
+                "warn",
+                "SRT",
+                "再生成後も日本語判定に失敗しましたが、そのまま処理を続行します",
+            );
         } else {
-            emit_log(&app, "success", "SRT", "再生成で日本語あらすじを取得しました");
+            emit_log(
+                &app,
+                "success",
+                "SRT",
+                "再生成で日本語あらすじを取得しました",
+            );
         }
     }
 
@@ -1911,20 +2739,34 @@ pub async fn generate_srt_synopsis(
         filter_synopsis_terms_by_known_names(&mut result.unresolved_terms, &known_names);
         let after_filter = result.unresolved_terms.len();
         if before_filter != after_filter {
-            emit_log(&app, "info", "SRT", &format!(
-                "synopsis known-name filter: {} → {} terms ({} removed)",
-                before_filter, after_filter, before_filter - after_filter
-            ));
+            emit_log(
+                &app,
+                "info",
+                "SRT",
+                &format!(
+                    "synopsis known-name filter: {} → {} terms ({} removed)",
+                    before_filter,
+                    after_filter,
+                    before_filter - after_filter
+                ),
+            );
         }
         // Validate term_variants: remove false variant groups
         let before_variants = result.term_variants.len();
         validate_term_variants(&mut result.term_variants);
         let after_variants = result.term_variants.len();
         if before_variants != after_variants {
-            emit_log(&app, "info", "SRT", &format!(
-                "term_variants validation: {} → {} groups ({} removed)",
-                before_variants, after_variants, before_variants - after_variants
-            ));
+            emit_log(
+                &app,
+                "info",
+                "SRT",
+                &format!(
+                    "term_variants validation: {} → {} groups ({} removed)",
+                    before_variants,
+                    after_variants,
+                    before_variants - after_variants
+                ),
+            );
         }
     }
 
@@ -1934,12 +2776,46 @@ pub async fn generate_srt_synopsis(
         let before = result.synopsis_ja.clone();
         replace_guessed_terms_in_synopsis(&mut result.synopsis_ja, &result.unresolved_terms);
         if before != result.synopsis_ja {
-            emit_log(&app, "info", "SRT", "synopsis_ja 内の推測表記を英語原文に置換しました");
+            emit_log(
+                &app,
+                "info",
+                "SRT",
+                "synopsis_ja 内の推測表記を英語原文に置換しました",
+            );
         }
     }
 
-    // Filter false positives (contractions, standalone titles) before processing
-    result.unresolved_terms.retain(|t| !is_false_positive_unresolved(&t.source_text));
+    // Clean up unresolved terms: drop false positives, replace noisy fragments
+    // Order matters: cleanup (which may replace "I'm A'Chu" → "A'Chu") before drop
+    {
+        let mut cleaned_terms: Vec<UnresolvedTerm> = Vec::new();
+        for term in &result.unresolved_terms {
+            let cleaned_source = match cleanup_unresolved_candidate(&term.source_text) {
+                None => continue,
+                Some(s) => s,
+            };
+            // Synopsis-only narrative prose phrases (e.g. "Blood on the Snow"):
+            // drop if not actually present in the SRT body text.
+            if looks_like_title_like_prose_phrase(&cleaned_source)
+                && !phrase_occurs_in_entries_exact(&cleaned_source, &entries)
+            {
+                continue;
+            }
+            if cleaned_source != term.source_text {
+                let mut new_term = term.clone();
+                new_term.source_text = cleaned_source;
+                let (search_text, generic_suffix, aliases) =
+                    generate_search_aliases(&new_term.source_text);
+                new_term.search_text = search_text;
+                new_term.generic_suffix = generic_suffix;
+                new_term.aliases = aliases;
+                cleaned_terms.push(new_term);
+            } else {
+                cleaned_terms.push(term.clone());
+            }
+        }
+        result.unresolved_terms = cleaned_terms;
+    }
 
     // Normalize synopsis-produced terms:
     // - surface_ja is always cleared (kanji resolution happens later via AI確認)
@@ -1968,10 +2844,17 @@ pub async fn generate_srt_synopsis(
         prune_possessive_terms(&mut result.unresolved_terms, &known_names);
         let after_prune = result.unresolved_terms.len();
         if before_prune != after_prune {
-            emit_log(&app, "info", "SRT", &format!(
-                "possessive prune: {} → {} terms ({} removed/narrowed)",
-                before_prune, after_prune, before_prune - after_prune
-            ));
+            emit_log(
+                &app,
+                "info",
+                "SRT",
+                &format!(
+                    "possessive prune: {} → {} terms ({} removed/narrowed)",
+                    before_prune,
+                    after_prune,
+                    before_prune - after_prune
+                ),
+            );
         }
     }
 
@@ -1990,17 +2873,27 @@ pub async fn generate_srt_synopsis(
     });
     let chars_removed = chars_before - result.detected_characters.len();
     if chars_removed > 0 {
-        emit_log(&app, "info", "SRT", &format!(
-            "detected_characters からローマ字表記 {} 件を除外しました",
-            chars_removed
-        ));
+        emit_log(
+            &app,
+            "info",
+            "SRT",
+            &format!(
+                "detected_characters からローマ字表記 {} 件を除外しました",
+                chars_removed
+            ),
+        );
     }
 
-    emit_log(&app, "success", "SRT", &format!(
-        "あらすじ生成完了: chars={} unresolved={}",
-        result.detected_characters.len(),
-        result.unresolved_terms.len()
-    ));
+    emit_log(
+        &app,
+        "success",
+        "SRT",
+        &format!(
+            "あらすじ生成完了: chars={} unresolved={}",
+            result.detected_characters.len(),
+            result.unresolved_terms.len()
+        ),
+    );
     Ok(result)
 }
 
@@ -2014,9 +2907,16 @@ pub async fn detect_srt_scenes(
     prompt_context: Option<String>,
 ) -> Result<SceneDetectionResult, String> {
     let ctx = prompt_context.unwrap_or_default();
-    emit_log(&app, "info", "SRT", &format!("場面検出開始: {} entries", entries.len()));
+    emit_log(
+        &app,
+        "info",
+        "SRT",
+        &format!("場面検出開始: {} entries", entries.len()),
+    );
 
-    let provider = resolve_provider(&state, &env_store, &app)?;
+    let task_models = service_settings::read_llm_task_model_settings(&app);
+    let provider =
+        resolve_provider_for_tier(&state, &env_store, &app, task_models.scene_detection)?;
     let client = LlmClient::new(provider);
 
     let (system, user) = build_scene_detection_prompt(&entries, &ctx);
@@ -2027,7 +2927,10 @@ pub async fn detect_srt_scenes(
 
     // Fix entry_count if LLM computed it wrong
     for scene in &mut result.scenes {
-        let computed = (scene.end_entry_index.saturating_sub(scene.start_entry_index)) as usize + 1;
+        let computed = (scene
+            .end_entry_index
+            .saturating_sub(scene.start_entry_index)) as usize
+            + 1;
         if scene.entry_count == 0 || scene.entry_count > entries.len() {
             scene.entry_count = computed;
         }
@@ -2043,7 +2946,12 @@ pub async fn detect_srt_scenes(
         }
     }
 
-    emit_log(&app, "success", "SRT", &format!("場面検出完了: {} scenes", result.scenes.len()));
+    emit_log(
+        &app,
+        "success",
+        "SRT",
+        &format!("場面検出完了: {} scenes", result.scenes.len()),
+    );
     Ok(result)
 }
 
@@ -2059,9 +2967,16 @@ pub async fn analyze_scene_context(
 ) -> Result<SceneContextResult, String> {
     let ctx = prompt_context.unwrap_or_default();
     let names = character_names.unwrap_or_default();
-    emit_log(&app, "info", "SRT", &format!("状況分析開始: {} entries", entries.len()));
+    emit_log(
+        &app,
+        "info",
+        "SRT",
+        &format!("状況分析開始: {} entries", entries.len()),
+    );
 
-    let provider = resolve_provider(&state, &env_store, &app)?;
+    let task_models = service_settings::read_llm_task_model_settings(&app);
+    let provider =
+        resolve_provider_for_tier(&state, &env_store, &app, task_models.scene_context_analysis)?;
     let client = LlmClient::new(provider);
 
     let (system, user) = build_scene_context_prompt(&entries, &names, &ctx);
@@ -2072,8 +2987,12 @@ pub async fn analyze_scene_context(
 
     // Detect Chinese-output and retry once with explicit Japanese instruction
     if scene_context_has_chinese_prose(&result) {
-        emit_log(&app, "warn", "SRT",
-            "2.3 context_ja/hierarchy/gender_notes に中国語が疑われるため再生成します");
+        emit_log(
+            &app,
+            "warn",
+            "SRT",
+            "2.3 context_ja/hierarchy/gender_notes に中国語が疑われるため再生成します",
+        );
         let retry_user = format!(
             "{}\n\n【重要：再出力指示】\n\
              あなたの前回の出力は日本語ではありませんでした。\n\
@@ -2087,10 +3006,19 @@ pub async fn analyze_scene_context(
         result = serde_json::from_value(retry_value)
             .map_err(|e| format!("Failed to parse retry scene context JSON: {}", e))?;
         if scene_context_has_chinese_prose(&result) {
-            emit_log(&app, "warn", "SRT",
-                "再生成後も中国語判定に失敗しましたが、そのまま処理を続行します");
+            emit_log(
+                &app,
+                "warn",
+                "SRT",
+                "再生成後も中国語判定に失敗しましたが、そのまま処理を続行します",
+            );
         } else {
-            emit_log(&app, "success", "SRT", "再生成で日本語の状況設定を取得しました");
+            emit_log(
+                &app,
+                "success",
+                "SRT",
+                "再生成で日本語の状況設定を取得しました",
+            );
         }
     }
 
@@ -2100,15 +3028,9 @@ pub async fn analyze_scene_context(
 
 /// Save analysis results for one SRT file.
 #[tauri::command]
-pub fn save_srt_analysis(
-    app: tauri::AppHandle,
-    analysis: SrtAnalysisFile,
-) -> Result<(), String> {
+pub fn save_srt_analysis(app: tauri::AppHandle, analysis: SrtAnalysisFile) -> Result<(), String> {
     let srt_path = std::path::Path::new(&analysis.srt_path);
-    let stem = srt_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let stem = srt_path.file_stem().unwrap_or_default().to_string_lossy();
 
     let analysis_path = if let Some(ref base_dir) = analysis.base_dir {
         let dir = std::path::Path::new(base_dir).join(".srt_analysis");
@@ -2117,16 +3039,22 @@ pub fn save_srt_analysis(
         dir.join(format!("{}.analysis.json", stem))
     } else {
         // Fallback: save next to the SRT file (legacy behavior)
-        let parent = srt_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let parent = srt_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
         parent.join(format!("{}.analysis.json", stem))
     };
 
     let json = serde_json::to_string_pretty(&analysis)
         .map_err(|e| format!("Failed to serialize analysis: {}", e))?;
-    std::fs::write(&analysis_path, json)
-        .map_err(|e| format!("Failed to write analysis: {}", e))?;
+    std::fs::write(&analysis_path, json).map_err(|e| format!("Failed to write analysis: {}", e))?;
 
-    emit_log(&app, "info", "SRT", &format!("分析結果保存: {}", analysis_path.display()));
+    emit_log(
+        &app,
+        "info",
+        "SRT",
+        &format!("分析結果保存: {}", analysis_path.display()),
+    );
     Ok(())
 }
 
@@ -2148,7 +3076,9 @@ pub fn load_srt_analyses(
         // Try new .srt_analysis/ path first, then legacy sibling path
         let candidates: Vec<std::path::PathBuf> = if let Some(ref bd) = base_dir {
             vec![
-                std::path::Path::new(bd).join(".srt_analysis").join(format!("{}.analysis.json", stem)),
+                std::path::Path::new(bd)
+                    .join(".srt_analysis")
+                    .join(format!("{}.analysis.json", stem)),
                 parent.join(format!("{}.analysis.json", stem)),
             ]
         } else {
@@ -2176,25 +3106,111 @@ pub fn load_srt_analyses(
                                 results.push(a);
                             }
                             Err(e) => {
-                                emit_log(&app, "warn", "SRT", &format!(
-                                    "Failed to parse analysis: {} — {}",
-                                    analysis_path.display(), e
-                                ));
+                                emit_log(
+                                    &app,
+                                    "warn",
+                                    "SRT",
+                                    &format!(
+                                        "Failed to parse analysis: {} — {}",
+                                        analysis_path.display(),
+                                        e
+                                    ),
+                                );
                             }
                         }
                         break; // found one, stop checking candidates
                     }
                     Err(e) => {
-                        emit_log(&app, "debug", "SRT", &format!(
-                            "Failed to read analysis: {} — {}",
-                            analysis_path.display(), e
-                        ));
+                        emit_log(
+                            &app,
+                            "debug",
+                            "SRT",
+                            &format!(
+                                "Failed to read analysis: {} — {}",
+                                analysis_path.display(),
+                                e
+                            ),
+                        );
                     }
                 }
             }
         }
     }
     Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// Translation readiness
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranslationReadiness {
+    pub srt_path: String,
+    pub has_analysis: bool,
+    pub has_translation_prompt: bool,
+    pub has_jp_srt: bool,
+    pub can_translate: bool,
+}
+
+/// Check whether an SRT file is ready for translation.
+/// Reads the analysis.json and checks for _jp.srt existence.
+#[tauri::command]
+pub fn get_translation_readiness_for_srt(
+    srt_path: String,
+    base_dir: Option<String>,
+) -> Result<TranslationReadiness, String> {
+    let p = std::path::Path::new(&srt_path);
+    let stem = p.file_stem().unwrap_or_default().to_string_lossy();
+    let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+    // Resolve analysis.json path (same logic as load_srt_analyses)
+    let candidates: Vec<std::path::PathBuf> = if let Some(ref bd) = base_dir {
+        vec![
+            std::path::Path::new(bd)
+                .join(".srt_analysis")
+                .join(format!("{}.analysis.json", stem)),
+            parent.join(format!("{}.analysis.json", stem)),
+        ]
+    } else {
+        vec![parent.join(format!("{}.analysis.json", stem))]
+    };
+
+    let has_analysis = candidates.iter().any(|c| c.exists());
+    let mut has_translation_prompt = false;
+
+    if has_analysis {
+        for analysis_path in &candidates {
+            if analysis_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(analysis_path) {
+                    if let Ok(a) = serde_json::from_str::<SrtAnalysisFile>(&content) {
+                        has_translation_prompt =
+                            a.translation_prompt.is_some()
+                                && !a.translation_prompt.as_ref().unwrap().is_empty();
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // Check _jp.srt: replace _en.srt suffix, or fall back to appending _jp
+    let jp_path = if srt_path.to_lowercase().ends_with("_en.srt") {
+        srt_path.replace("_en.srt", "_jp.srt").replace("_en.SRT", "_jp.SRT")
+    } else {
+        let dot = srt_path.rfind('.').unwrap_or(srt_path.len());
+        format!("{}_jp{}", &srt_path[..dot], &srt_path[dot..])
+    };
+    let has_jp_srt = std::path::Path::new(&jp_path).exists();
+
+    let can_translate = has_analysis && has_translation_prompt;
+
+    Ok(TranslationReadiness {
+        srt_path,
+        has_analysis,
+        has_translation_prompt,
+        has_jp_srt,
+        can_translate,
+    })
 }
 
 /// Resolve katakana proper nouns in the synopsis against the character dictionary.
@@ -2252,7 +3268,10 @@ pub fn resolve_synopsis_katakana(
     // Also include unresolved terms that contain katakana
     for t in &unresolved_terms {
         if !seen.contains(&t.surface_ja) && !t.surface_ja.is_empty() {
-            let has_kana = t.surface_ja.chars().any(|c| ('\u{30A0}'..='\u{30FF}').contains(&c));
+            let has_kana = t
+                .surface_ja
+                .chars()
+                .any(|c| ('\u{30A0}'..='\u{30FF}').contains(&c));
             if has_kana {
                 seen.insert(t.surface_ja.clone());
                 if let Some(kanji) = reading_to_kanji.get(&t.surface_ja) {
@@ -2301,44 +3320,136 @@ fn hiragana_to_katakana(s: &str) -> String {
 fn romanized_to_katakana_candidates(source: &str) -> Vec<String> {
     let mapping: Vec<(&str, &str)> = vec![
         // Chinese pinyin overrides (match before generic romaji)
-        ("qian", "チェン"), ("cheng", "チェン"), ("zhang", "ジャン"),
-        ("chang", "チャン"), ("chun", "チュン"), ("xian", "シエン"),
-        ("jian", "ジエン"), ("yuan", "ユエン"), ("hui", "フイ"),
-        ("song", "ソン"), ("tong", "トン"), ("dong", "ドン"),
-        ("zhen", "ジェン"), ("zheng", "ジェン"), ("shan", "シャン"),
-        ("shen", "シェン"), ("jing", "ジン"), ("yong", "ヨン"),
-        ("tuo", "トウ"), ("jin", "ジン"), ("er", "アル"),
-        ("lun", "ルン"), ("run", "ルン"), ("jun", "ジュン"),
+        ("qian", "チェン"),
+        ("cheng", "チェン"),
+        ("zhang", "ジャン"),
+        ("chang", "チャン"),
+        ("chun", "チュン"),
+        ("xian", "シエン"),
+        ("jian", "ジエン"),
+        ("yuan", "ユエン"),
+        ("hui", "フイ"),
+        ("song", "ソン"),
+        ("tong", "トン"),
+        ("dong", "ドン"),
+        ("zhen", "ジェン"),
+        ("zheng", "ジェン"),
+        ("shan", "シャン"),
+        ("shen", "シェン"),
+        ("jing", "ジン"),
+        ("yong", "ヨン"),
+        ("tuo", "トウ"),
+        ("jin", "ジン"),
+        ("er", "アル"),
+        ("lun", "ルン"),
+        ("run", "ルン"),
+        ("jun", "ジュン"),
         // Palatalized clusters (match before simple CV pairs)
-        ("kya", "キャ"), ("kyu", "キュ"), ("kyo", "キョ"),
-        ("sha", "シャ"), ("shu", "シュ"), ("sho", "ショ"),
-        ("cha", "チャ"), ("chu", "チュ"), ("cho", "チョ"),
-        ("nya", "ニャ"), ("nyu", "ニュ"), ("nyo", "ニョ"),
-        ("hya", "ヒャ"), ("hyu", "ヒュ"), ("hyo", "ヒョ"),
-        ("mya", "ミャ"), ("myu", "ミュ"), ("myo", "ミョ"),
-        ("rya", "リャ"), ("ryu", "リュ"), ("ryo", "リョ"),
-        ("gya", "ギャ"), ("gyu", "ギュ"), ("gyo", "ギョ"),
-        ("ja", "ジャ"), ("ju", "ジュ"), ("jo", "ジョ"),
-        ("bya", "ビャ"), ("byu", "ビュ"), ("byo", "ビョ"),
-        ("pya", "ピャ"), ("pyu", "ピュ"), ("pyo", "ピョ"),
+        ("kya", "キャ"),
+        ("kyu", "キュ"),
+        ("kyo", "キョ"),
+        ("sha", "シャ"),
+        ("shu", "シュ"),
+        ("sho", "ショ"),
+        ("cha", "チャ"),
+        ("chu", "チュ"),
+        ("cho", "チョ"),
+        ("nya", "ニャ"),
+        ("nyu", "ニュ"),
+        ("nyo", "ニョ"),
+        ("hya", "ヒャ"),
+        ("hyu", "ヒュ"),
+        ("hyo", "ヒョ"),
+        ("mya", "ミャ"),
+        ("myu", "ミュ"),
+        ("myo", "ミョ"),
+        ("rya", "リャ"),
+        ("ryu", "リュ"),
+        ("ryo", "リョ"),
+        ("gya", "ギャ"),
+        ("gyu", "ギュ"),
+        ("gyo", "ギョ"),
+        ("ja", "ジャ"),
+        ("ju", "ジュ"),
+        ("jo", "ジョ"),
+        ("bya", "ビャ"),
+        ("byu", "ビュ"),
+        ("byo", "ビョ"),
+        ("pya", "ピャ"),
+        ("pyu", "ピュ"),
+        ("pyo", "ピョ"),
         // Voiced consonant+vowel
-        ("ga", "ガ"), ("gi", "ギ"), ("gu", "グ"), ("ge", "ゲ"), ("go", "ゴ"),
-        ("za", "ザ"), ("ji", "ジ"), ("zu", "ズ"), ("ze", "ゼ"), ("zo", "ゾ"),
-        ("da", "ダ"), ("de", "デ"), ("do", "ド"),
-        ("ba", "バ"), ("bi", "ビ"), ("bu", "ブ"), ("be", "ベ"), ("bo", "ボ"),
-        ("pa", "パ"), ("pi", "ピ"), ("pu", "プ"), ("pe", "ペ"), ("po", "ポ"),
+        ("ga", "ガ"),
+        ("gi", "ギ"),
+        ("gu", "グ"),
+        ("ge", "ゲ"),
+        ("go", "ゴ"),
+        ("za", "ザ"),
+        ("ji", "ジ"),
+        ("zu", "ズ"),
+        ("ze", "ゼ"),
+        ("zo", "ゾ"),
+        ("da", "ダ"),
+        ("de", "デ"),
+        ("do", "ド"),
+        ("ba", "バ"),
+        ("bi", "ビ"),
+        ("bu", "ブ"),
+        ("be", "ベ"),
+        ("bo", "ボ"),
+        ("pa", "パ"),
+        ("pi", "ピ"),
+        ("pu", "プ"),
+        ("pe", "ペ"),
+        ("po", "ポ"),
         // Basic consonant+vowel
-        ("ka", "カ"), ("ki", "キ"), ("ku", "ク"), ("ke", "ケ"), ("ko", "コ"),
-        ("sa", "サ"), ("shi", "シ"), ("su", "ス"), ("se", "セ"), ("so", "ソ"),
-        ("ta", "タ"), ("chi", "チ"), ("tu", "トゥ"), ("tsu", "ツ"), ("te", "テ"), ("to", "ト"),
-        ("na", "ナ"), ("ni", "ニ"), ("nu", "ヌ"), ("ne", "ネ"), ("no", "ノ"),
-        ("ha", "ハ"), ("hi", "ヒ"), ("fu", "フ"), ("he", "ヘ"), ("ho", "ホ"),
-        ("ma", "マ"), ("mi", "ミ"), ("mu", "ム"), ("me", "メ"), ("mo", "モ"),
-        ("ya", "ヤ"), ("yu", "ユ"), ("yo", "ヨ"),
-        ("ra", "ラ"), ("ri", "リ"), ("ru", "ル"), ("re", "レ"), ("ro", "ロ"),
-        ("wa", "ワ"), ("wo", "ヲ"),
+        ("ka", "カ"),
+        ("ki", "キ"),
+        ("ku", "ク"),
+        ("ke", "ケ"),
+        ("ko", "コ"),
+        ("sa", "サ"),
+        ("shi", "シ"),
+        ("su", "ス"),
+        ("se", "セ"),
+        ("so", "ソ"),
+        ("ta", "タ"),
+        ("chi", "チ"),
+        ("tu", "トゥ"),
+        ("tsu", "ツ"),
+        ("te", "テ"),
+        ("to", "ト"),
+        ("na", "ナ"),
+        ("ni", "ニ"),
+        ("nu", "ヌ"),
+        ("ne", "ネ"),
+        ("no", "ノ"),
+        ("ha", "ハ"),
+        ("hi", "ヒ"),
+        ("fu", "フ"),
+        ("he", "ヘ"),
+        ("ho", "ホ"),
+        ("ma", "マ"),
+        ("mi", "ミ"),
+        ("mu", "ム"),
+        ("me", "メ"),
+        ("mo", "モ"),
+        ("ya", "ヤ"),
+        ("yu", "ユ"),
+        ("yo", "ヨ"),
+        ("ra", "ラ"),
+        ("ri", "リ"),
+        ("ru", "ル"),
+        ("re", "レ"),
+        ("ro", "ロ"),
+        ("wa", "ワ"),
+        ("wo", "ヲ"),
         // Standalone vowels + syllabic n
-        ("a", "ア"), ("i", "イ"), ("u", "ウ"), ("e", "エ"), ("o", "オ"),
+        ("a", "ア"),
+        ("i", "イ"),
+        ("u", "ウ"),
+        ("e", "エ"),
+        ("o", "オ"),
         ("n", "ン"),
     ];
 
@@ -2360,7 +3471,9 @@ fn romanized_to_katakana_candidates(source: &str) -> Vec<String> {
                         break;
                     }
                 }
-                if matched { break; }
+                if matched {
+                    break;
+                }
             }
             if !matched {
                 // Skip non-romaji characters (spaces handled by caller)
@@ -2390,9 +3503,13 @@ fn romanized_to_katakana_candidates(source: &str) -> Vec<String> {
     }
 
     // Pass B: word-separated form with middle dots
-    let words: Vec<&str> = source.split_whitespace().filter(|w| !w.is_empty()).collect();
+    let words: Vec<&str> = source
+        .split_whitespace()
+        .filter(|w| !w.is_empty())
+        .collect();
     if words.len() >= 2 {
-        let dot_form: Vec<String> = words.iter()
+        let dot_form: Vec<String> = words
+            .iter()
             .map(|w| romanize_word(w, &mapping))
             .filter(|s| !s.is_empty())
             .collect();
@@ -2413,7 +3530,8 @@ fn romanized_to_katakana_candidates(source: &str) -> Vec<String> {
             candidates.push(concat_alt);
         }
         if words.len() >= 2 {
-            let dot_alt: Vec<String> = words.iter()
+            let dot_alt: Vec<String> = words
+                .iter()
                 .map(|w| romanize_word(w, &alt_mapping))
                 .filter(|s| !s.is_empty())
                 .collect();
@@ -2459,7 +3577,9 @@ fn build_dictionary_replacement_map(
 
     // 2b. Characters: English name variants (space-stripped, underscored) → japanese_name
     for c in characters.iter() {
-        if c.english_name.is_empty() { continue; }
+        if c.english_name.is_empty() {
+            continue;
+        }
         let en = c.english_name.trim();
         // Space-stripped: "Qiao Qiao" → "QiaoQiao"
         let no_space: String = en.chars().filter(|ch| !ch.is_whitespace()).collect();
@@ -2549,9 +3669,16 @@ pub async fn resolve_unresolved_term_web(
             if let Some((candidate, summary, urls)) =
                 extract_candidate_from_snippets(&snippets, &source_text)
             {
-                emit_log(&app, "success", "SRT", &format!("Web候補: {} → {}", source_text, candidate));
+                emit_log(
+                    &app,
+                    "success",
+                    "SRT",
+                    &format!("Web候補: {} → {}", source_text, candidate),
+                );
                 Ok(WebTermResolution {
                     source_text,
+                    action: None,
+                    suggested_source_text: None,
                     surface_ja,
                     candidate_zh: Some(candidate.clone()),
                     candidate_ja: Some(candidate),
@@ -2563,11 +3690,25 @@ pub async fn resolve_unresolved_term_web(
                     alternatives: None,
                     evidence: None,
                     reason: None,
+                    normalized_source_text: None,
+                    is_proper_noun: None,
+                    term_type: None,
+                    evidence_strength: None,
+                    match_judgment: None,
+                    needs_human_review: None,
+                    confidence_reason: None,
                 })
             } else {
-                emit_log(&app, "warn", "SRT", &format!("Web候補なし: {}", source_text));
+                emit_log(
+                    &app,
+                    "warn",
+                    "SRT",
+                    &format!("Web候補なし: {}", source_text),
+                );
                 Ok(WebTermResolution {
                     source_text,
+                    action: None,
+                    suggested_source_text: None,
                     surface_ja,
                     candidate_zh: None,
                     candidate_ja: None,
@@ -2579,13 +3720,27 @@ pub async fn resolve_unresolved_term_web(
                     alternatives: None,
                     evidence: None,
                     reason: None,
+                    normalized_source_text: None,
+                    is_proper_noun: None,
+                    term_type: None,
+                    evidence_strength: None,
+                    match_judgment: None,
+                    needs_human_review: None,
+                    confidence_reason: None,
                 })
             }
         }
         Err(e) => {
-            emit_log(&app, "error", "SRT", &format!("Web検索エラー: {} — {}", source_text, e));
+            emit_log(
+                &app,
+                "error",
+                "SRT",
+                &format!("Web検索エラー: {} — {}", source_text, e),
+            );
             Ok(WebTermResolution {
                 source_text,
+                action: None,
+                suggested_source_text: None,
                 surface_ja,
                 candidate_zh: None,
                 candidate_ja: None,
@@ -2597,6 +3752,13 @@ pub async fn resolve_unresolved_term_web(
                 alternatives: None,
                 evidence: None,
                 reason: None,
+                normalized_source_text: None,
+                is_proper_noun: None,
+                term_type: None,
+                evidence_strength: None,
+                match_judgment: None,
+                needs_human_review: None,
+                confidence_reason: None,
             })
         }
     }
@@ -2613,9 +3775,20 @@ pub async fn resolve_unresolved_term_ai(
     drama_title: Option<String>,
     prompt_context: Option<String>,
 ) -> Result<WebTermResolution, String> {
-    emit_log(&app, "info", "SRT", &format!("AI確認(Gemini): {}", source_text));
+    emit_log(
+        &app,
+        "info",
+        "SRT",
+        &format!("AI確認(Gemini): {}", source_text),
+    );
 
-    let provider = resolve_provider(&state, &env_store, &app)?;
+    let task_models = service_settings::read_llm_task_model_settings(&app);
+    let provider = resolve_provider_for_tier(
+        &state,
+        &env_store,
+        &app,
+        task_models.proper_noun_confirmation,
+    )?;
     let client = LlmClient::new(provider);
 
     let title = drama_title.unwrap_or_default();
@@ -2655,19 +3828,33 @@ pub async fn resolve_unresolved_term_ai(
                 .to_string();
             let urls: Vec<String> = value["evidence_urls"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default();
-            let status = value["status"].as_str().unwrap_or("candidate_found").to_string();
+            let status = value["status"]
+                .as_str()
+                .unwrap_or("candidate_found")
+                .to_string();
 
-            emit_log(&app, "success", "SRT", &format!(
-                "AI候補(Gemini): {} → {} confidence={}",
-                source_text,
-                zh.as_deref().unwrap_or("なし"),
-                conf
-            ));
+            emit_log(
+                &app,
+                "success",
+                "SRT",
+                &format!(
+                    "AI候補(Gemini): {} → {} confidence={}",
+                    source_text,
+                    zh.as_deref().unwrap_or("なし"),
+                    conf
+                ),
+            );
 
             Ok(WebTermResolution {
                 source_text,
+                action: None,
+                suggested_source_text: None,
                 surface_ja,
                 candidate_zh: zh,
                 candidate_ja: ja,
@@ -2679,12 +3866,26 @@ pub async fn resolve_unresolved_term_ai(
                 alternatives: None,
                 evidence: None,
                 reason: None,
+                normalized_source_text: None,
+                is_proper_noun: None,
+                term_type: None,
+                evidence_strength: None,
+                match_judgment: None,
+                needs_human_review: None,
+                confidence_reason: None,
             })
         }
         Err(e) => {
-            emit_log(&app, "error", "SRT", &format!("AI確認エラー(Gemini): {} — {}", source_text, e));
+            emit_log(
+                &app,
+                "error",
+                "SRT",
+                &format!("AI確認エラー(Gemini): {} — {}", source_text, e),
+            );
             Ok(WebTermResolution {
                 source_text,
+                action: None,
+                suggested_source_text: None,
                 surface_ja,
                 candidate_zh: None,
                 candidate_ja: None,
@@ -2696,6 +3897,13 @@ pub async fn resolve_unresolved_term_ai(
                 alternatives: None,
                 evidence: None,
                 reason: None,
+                normalized_source_text: None,
+                is_proper_noun: None,
+                term_type: None,
+                evidence_strength: None,
+                match_judgment: None,
+                needs_human_review: None,
+                confidence_reason: None,
             })
         }
     }
@@ -2746,23 +3954,41 @@ async fn send_openai_responses_with_retry(
         if status.as_u16() == 429 && attempt < 3 {
             let body = response.text().await.unwrap_or_default();
             let api_wait = parse_retry_after_seconds(&body);
-            let wait_secs = if api_wait > 0 { api_wait } else { RETRY_BACKOFF_SECS[attempt] };
-            emit_log(app, "info", "SRT", &format!(
-                "Rate limit (429): {}秒待機して再試行 (attempt {}/3)",
-                wait_secs,
-                attempt + 1
-            ));
+            let wait_secs = if api_wait > 0 {
+                api_wait
+            } else {
+                RETRY_BACKOFF_SECS[attempt]
+            };
+            emit_log(
+                app,
+                "info",
+                "SRT",
+                &format!(
+                    "Rate limit (429): {}秒待機して再試行 (attempt {}/3)",
+                    wait_secs,
+                    attempt + 1
+                ),
+            );
             tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
             continue;
         }
 
         let body = response.text().await.unwrap_or_default();
-        emit_log(app, "error", "SRT", &format!(
-            "OpenAI Responses API HTTP {}: {}",
-            status.as_u16(),
+        emit_log(
+            app,
+            "error",
+            "SRT",
+            &format!(
+                "OpenAI Responses API HTTP {}: {}",
+                status.as_u16(),
+                preview_chars(&body, 500)
+            ),
+        );
+        return Err(format!(
+            "OpenAI API error ({}): {}",
+            status,
             preview_chars(&body, 500)
         ));
-        return Err(format!("OpenAI API error ({}): {}", status, preview_chars(&body, 500)));
     }
 
     Err("OpenAI API error: 429 retry上限(3回)に達しました".to_string())
@@ -2782,23 +4008,51 @@ pub async fn resolve_unresolved_term_ai_openai(
     let ep_info = srt_filename
         .as_deref()
         .map(|f| extract_episode_from_filename(f))
-        .unwrap_or(EpisodeInfo { season: None, episode: None, episode_label: None });
+        .unwrap_or(EpisodeInfo {
+            season: None,
+            episode: None,
+            episode_label: None,
+        });
     let episode_num = ep_info.episode;
     let episode_label = ep_info.episode_label.as_deref().unwrap_or("");
 
     if let Some(ep) = episode_num {
-        emit_log(&app, "info", "SRT", &format!("AI確認(OpenAI): episode={}, {}", ep, source_text));
+        emit_log(
+            &app,
+            "info",
+            "SRT",
+            &format!("AI確認(OpenAI): episode={}, {}", ep, source_text),
+        );
     } else {
-        emit_log(&app, "info", "SRT", &format!("AI確認(OpenAI): {}", source_text));
+        emit_log(
+            &app,
+            "info",
+            "SRT",
+            &format!("AI確認(OpenAI): {}", source_text),
+        );
     }
 
     let api_key = resolve_openai_api_key(&env_store)?;
     let overrides = service_settings::read_provider_settings(&app, "OPENAI");
-    let model = overrides.model;
+    let task_models = service_settings::read_llm_task_model_settings(&app);
+    let model = match task_models.proper_noun_confirmation {
+        ModelTier::Pro => overrides.pro_model,
+        ModelTier::Flash => overrides.flash_model,
+    };
 
-    emit_log(&app, "debug", "SRT", &format!("OpenAI model: {}, web_search=on", model));
+    emit_log(
+        &app,
+        "debug",
+        "SRT",
+        &format!("OpenAI model: {}, web_search=on", model),
+    );
     if let Some(ep) = episode_num {
-        emit_log(&app, "debug", "SRT", &format!("OpenAI prompt episode={}", ep));
+        emit_log(
+            &app,
+            "debug",
+            "SRT",
+            &format!("OpenAI prompt episode={}", ep),
+        );
     }
 
     let title = drama_title.unwrap_or_default();
@@ -2859,6 +4113,16 @@ pub async fn resolve_unresolved_term_ai_openai(
 
     // Rules (in Japanese, per user specification)
     input.push_str("\n\n\
+        - 最初に source_text を後処理し、action を \"keep\" | \"remove\" | \"replace\" | \"review\" のいずれかで返す。\n\
+        - action=\"remove\": source_text 全体が英語の短縮形・代名詞・助動詞・接続詞・文頭語だけ、または一般役職名単独の場合。is_proper_noun=false、candidate_zh/candidate_ja=null、status=\"not_found\" にする。\n\
+          例: \"I'll\", \"I'm\", \"You're\", \"We're\", \"They're\", \"They'll\", \"It's\", \"That's\", \"There's\", \"Don't\", \"Can't\", \"When\", \"If\", \"Then\", \"And\", \"But\", \"So\", \"Because\", \"Although\", \"Since\", \"While\", \"Before\", \"After\", \"Shopkeeper\"。\n\
+        - action=\"replace\": source_text が文断片 + 固有名詞候補の場合。suggested_source_text に固有名詞候補だけを入れる。\n\
+          例: \"I'm A'Chu\" → suggested_source_text=\"A'Chu\"、\"When Snow Region\" → suggested_source_text=\"Snow Region\"、\"But Yanbei City\" → suggested_source_text=\"Yanbei City\"。\n\
+        - And/But/So/When/If/Then/Because/Although/Since/While/Before/After + proper noun phrase は、先頭機能語を除いた候補へ action=\"replace\" にする。\n\
+        - action=\"keep\": Web検索で実在確認できる、または明らかに固有名詞候補として妥当な場合。\n\
+        - action=\"review\": 判断不能、Web検索で見つからないが字幕内固有名詞の可能性がある場合。\n\
+        - normalized_source_text を使う場合でも source_text は元の入力表記のまま返す。\n\
+        - 返答には is_proper_noun, normalized_source_text, term_type, evidence_strength, match_judgment, needs_human_review, confidence_reason を含める。\n\
         - 推論で漢字候補を作らない。\n\
         - 英語字幕表記 source_text はソース由来なので、誤字・聞き間違いとは仮定しない。\n\
         - Web検索結果、配信元ページ、あらすじ、人物関係解説などに直接出ている漢字表記だけを採用する。\n\
@@ -2877,7 +4141,25 @@ pub async fn resolve_unresolved_term_ai_openai(
         input.push_str(&format!("\n{}", ctx));
     }
 
-    input.push_str("\n\nJSONのみで返してください。");
+    input.push_str("\n\n返答形式（JSONのみ）:\n\
+        {\"source_text\":\"元の入力表記\",\
+        \"action\":\"keep|remove|replace|review\",\
+        \"suggested_source_text\":\"replace時の修正後表記。不要なら空文字\",\
+        \"normalized_source_text\":\"先頭文頭語を除いた表記。不要なら空文字\",\
+        \"is_proper_noun\":true,\
+        \"candidate_zh\":\"漢字表記 または null\",\
+        \"candidate_ja\":\"日本語表記 または null\",\
+        \"term_type\":\"person|place|organization|tribe|army|object|other\",\
+        \"status\":\"found|uncertain|not_found\",\
+        \"confidence\":\"high|medium|low\",\
+        \"evidence_strength\":\"direct|indirect|none\",\
+        \"match_judgment\":\"exact|probable|weak|not_found\",\
+        \"needs_human_review\":true,\
+        \"confidence_reason\":\"短い理由\",\
+        \"reason\":\"根拠の説明\",\
+        \"alternatives\":[],\
+        \"evidence\":[{\"title\":\"\",\"url\":\"\",\"quote\":\"\"}]}\n\
+        ※ 固有名詞ではない場合は action=\"remove\", is_proper_noun=false, suggested_source_text=\"\", normalized_source_text=\"\", candidate_zh=null, candidate_ja=null, status=\"not_found\"。");
 
     emit_log(&app, "debug", "SRT", &format!(
         "OpenAI Responses API: model={} endpoint=https://api.openai.com/v1/responses temperature=omitted json_mode=omitted web_search=on",
@@ -2893,43 +4175,72 @@ pub async fn resolve_unresolved_term_ai_openai(
 
     let response = send_openai_responses_with_retry(&app, &api_key, &request_body).await?;
 
-    let body: serde_json::Value = response.json().await
+    let body: serde_json::Value = response
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse OpenAI response: {}", e))?;
 
-    let (text, evidence_items, evidence_urls) =
-        extract_response_text_and_annotations(&body)?;
+    let (text, evidence_items, evidence_urls) = extract_response_text_and_annotations(&body)?;
 
-    emit_log(&app, "debug", "SRT", &format!(
-        "OpenAI annotations: {} url_citations", evidence_urls.len()));
+    emit_log(
+        &app,
+        "debug",
+        "SRT",
+        &format!("OpenAI annotations: {} url_citations", evidence_urls.len()),
+    );
     for ev in &evidence_items {
-        emit_log(&app, "debug", "SRT", &format!(
-            "OpenAI evidence URL: {} ({})", ev.url, ev.title));
+        emit_log(
+            &app,
+            "debug",
+            "SRT",
+            &format!("OpenAI evidence URL: {} ({})", ev.url, ev.title),
+        );
     }
 
     // Parse the JSON response
     let cleaned = extract_json(text);
-    let parsed: BatchTermResult = serde_json::from_str(cleaned)
-        .map_err(|e| {
-            emit_log(&app, "error", "SRT", &format!(
+    let parsed: BatchTermResult = serde_json::from_str(cleaned).map_err(|e| {
+        emit_log(
+            &app,
+            "error",
+            "SRT",
+            &format!(
                 "JSON parse failure (individual): {} | raw: {}",
-                e, preview_chars(text, 500)
-            ));
-            format!("Failed to parse OpenAI term result: {} (raw: {})", e, preview_chars(text, 300))
-        })?;
+                e,
+                preview_chars(text, 500)
+            ),
+        );
+        format!(
+            "Failed to parse OpenAI term result: {} (raw: {})",
+            e,
+            preview_chars(text, 300)
+        )
+    })?;
 
     // Map status: "found" stays, "uncertain" stays, "not_found" stays
-    let status = if parsed.status.is_empty() { "not_found".to_string() } else { parsed.status.clone() };
+    let status = if parsed.status.is_empty() {
+        "not_found".to_string()
+    } else {
+        parsed.status.clone()
+    };
 
-    emit_log(&app, "success", "SRT", &format!(
-        "AI候補(OpenAI): {} → {} confidence={} status={}",
-        source_text,
-        parsed.candidate_zh.as_deref().unwrap_or("なし"),
-        parsed.confidence,
-        status
-    ));
+    emit_log(
+        &app,
+        "success",
+        "SRT",
+        &format!(
+            "AI候補(OpenAI): {} → {} confidence={} status={}",
+            source_text,
+            parsed.candidate_zh.as_deref().unwrap_or("なし"),
+            parsed.confidence,
+            status
+        ),
+    );
 
     Ok(WebTermResolution {
         source_text,
+        action: parsed.action,
+        suggested_source_text: parsed.suggested_source_text.filter(|s| !s.trim().is_empty()),
         surface_ja,
         candidate_zh: parsed.candidate_zh,
         candidate_ja: parsed.candidate_ja,
@@ -2938,9 +4249,46 @@ pub async fn resolve_unresolved_term_ai_openai(
         evidence_urls,
         status,
         source: Some("openai".into()),
-        alternatives: if parsed.alternatives.is_empty() { None } else { Some(parsed.alternatives) },
-        evidence: if evidence_items.is_empty() { None } else { Some(evidence_items) },
-        reason: if parsed.reason.is_empty() { None } else { Some(parsed.reason) },
+        alternatives: if parsed.alternatives.is_empty() {
+            None
+        } else {
+            Some(parsed.alternatives)
+        },
+        evidence: if evidence_items.is_empty() {
+            None
+        } else {
+            Some(evidence_items)
+        },
+        reason: if parsed.reason.is_empty() {
+            None
+        } else {
+            Some(parsed.reason)
+        },
+        normalized_source_text: parsed
+            .normalized_source_text
+            .filter(|s| !s.trim().is_empty()),
+        is_proper_noun: parsed.is_proper_noun,
+        term_type: if parsed.term_type.is_empty() {
+            None
+        } else {
+            Some(parsed.term_type)
+        },
+        evidence_strength: if parsed.evidence_strength.is_empty() {
+            None
+        } else {
+            Some(parsed.evidence_strength)
+        },
+        match_judgment: if parsed.match_judgment.is_empty() {
+            None
+        } else {
+            Some(parsed.match_judgment)
+        },
+        needs_human_review: parsed.needs_human_review,
+        confidence_reason: if parsed.confidence_reason.is_empty() {
+            None
+        } else {
+            Some(parsed.confidence_reason)
+        },
     })
 }
 
@@ -2961,14 +4309,28 @@ pub async fn resolve_unresolved_terms_batch_openai(
     let ep_info = srt_filename
         .as_deref()
         .map(|f| extract_episode_from_filename(f))
-        .unwrap_or(EpisodeInfo { season: None, episode: None, episode_label: None });
+        .unwrap_or(EpisodeInfo {
+            season: None,
+            episode: None,
+            episode_label: None,
+        });
     let episode_num = ep_info.episode;
     let episode_label = ep_info.episode_label.as_deref().unwrap_or("");
 
     if let Some(ep) = episode_num {
-        emit_log(&app, "info", "SRT", &format!("一括AI確認開始(OpenAI): episode={}, terms={}", ep, n));
+        emit_log(
+            &app,
+            "info",
+            "SRT",
+            &format!("一括AI確認開始(OpenAI): episode={}, terms={}", ep, n),
+        );
     } else {
-        emit_log(&app, "info", "SRT", &format!("一括AI確認開始(OpenAI): {} terms", n));
+        emit_log(
+            &app,
+            "info",
+            "SRT",
+            &format!("一括AI確認開始(OpenAI): {} terms", n),
+        );
     }
 
     if terms.is_empty() {
@@ -2977,9 +4339,18 @@ pub async fn resolve_unresolved_terms_batch_openai(
 
     let api_key = resolve_openai_api_key(&env_store)?;
     let overrides = service_settings::read_provider_settings(&app, "OPENAI");
-    let model = overrides.model;
+    let task_models = service_settings::read_llm_task_model_settings(&app);
+    let model = match task_models.proper_noun_confirmation {
+        ModelTier::Pro => overrides.pro_model,
+        ModelTier::Flash => overrides.flash_model,
+    };
 
-    emit_log(&app, "debug", "SRT", &format!("OpenAI model: {}, web_search=on (chunked)", model));
+    emit_log(
+        &app,
+        "debug",
+        "SRT",
+        &format!("OpenAI model: {}, web_search=on (chunked)", model),
+    );
 
     let zh_title = drama_title_zh.as_deref().filter(|s| !s.is_empty());
     let en_title = drama_title_en.as_deref().filter(|s| !s.is_empty());
@@ -2987,8 +4358,11 @@ pub async fn resolve_unresolved_terms_batch_openai(
     let ja_official = (!drama_title_ja.is_empty()).then(|| drama_title_ja.as_str());
 
     // The primary search key is always zh. en is auxiliary, folderLabel is context, ja is official-title only.
-    let search_primary = zh_title.or(en_title).or(folder)
-        .map(|s| s.to_string()).unwrap_or_default();
+    let search_primary = zh_title
+        .or(en_title)
+        .or(folder)
+        .map(|s| s.to_string())
+        .unwrap_or_default();
 
     // Build prompt title block: zh primary, en auxiliary, folder/ja as context
     let mut title_block = String::new();
@@ -2997,7 +4371,10 @@ pub async fn resolve_unresolved_terms_batch_openai(
     }
     if let Some(en) = en_title {
         if zh_title.is_some() {
-            title_block.push_str(&format!("\n英語題: {}（補助情報。一般語で混同しやすいため検索では中文名と併用）", en));
+            title_block.push_str(&format!(
+                "\n英語題: {}（補助情報。一般語で混同しやすいため検索では中文名と併用）",
+                en
+            ));
         } else {
             title_block.push_str(&format!("\n作品英語名: {}", en));
         }
@@ -3025,16 +4402,24 @@ pub async fn resolve_unresolved_terms_batch_openai(
         .or_else(|| folder.map(|f| format!("作業フォルダ「{}」", f)))
         .unwrap_or_default();
 
-    emit_log(&app, "debug", "SRT", &format!(
-        "Batch title source: ja=\"{}\" zh=\"{}\" en=\"{}\" folderLabel=\"{}\"",
-        drama_title_ja,
-        zh_title.unwrap_or(""),
-        en_title.unwrap_or(""),
-        folder.unwrap_or("")
-    ));
-    emit_log(&app, "debug", "SRT", &format!(
-        "Search primary title: {}", search_primary
-    ));
+    emit_log(
+        &app,
+        "debug",
+        "SRT",
+        &format!(
+            "Batch title source: ja=\"{}\" zh=\"{}\" en=\"{}\" folderLabel=\"{}\"",
+            drama_title_ja,
+            zh_title.unwrap_or(""),
+            en_title.unwrap_or(""),
+            folder.unwrap_or("")
+        ),
+    );
+    emit_log(
+        &app,
+        "debug",
+        "SRT",
+        &format!("Search primary title: {}", search_primary),
+    );
 
     let instructions = "You are a Chinese drama proper noun identification assistant.\
         Use web_search to find the correct Chinese/Japanese kanji forms \
@@ -3050,11 +4435,18 @@ pub async fn resolve_unresolved_terms_batch_openai(
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
         let chunk_num = chunk_idx + 1;
         let chunk_terms: Vec<String> = chunk.iter().map(|t| t.source_text.clone()).collect();
-        emit_log(&app, "info", "SRT", &format!(
-            "Batch {}/{}: {} terms: {}",
-            chunk_num, total_chunks, chunk.len(),
-            chunk_terms.join(", ")
-        ));
+        emit_log(
+            &app,
+            "info",
+            "SRT",
+            &format!(
+                "Batch {}/{}: {} terms: {}",
+                chunk_num,
+                total_chunks,
+                chunk.len(),
+                chunk_terms.join(", ")
+            ),
+        );
 
         // Build prompt for this chunk
         let source_list: String = chunk
@@ -3114,6 +4506,16 @@ pub async fn resolve_unresolved_terms_batch_openai(
             - 作品名を確認・出力しない。drama_title や notes, summary, explanation などのトップレベル項目は禁止する。\n\
             - 返答JSONのトップレベルは必ず {\"terms\": [...]} のみにする。terms 以外のキーは一切含めないこと。\n\
             - terms 配列には、入力した source_text と同じ件数・同じ順序で返す。\n\
+            - 各 source_text について、まず候補後処理 action を \"keep\" | \"remove\" | \"replace\" | \"review\" のいずれかで判定する。\n\
+            - action=\"remove\": source_text 全体が英語の短縮形・代名詞・助動詞・接続詞・文頭語だけ、または一般役職名単独の場合。is_proper_noun=false、candidate_zh/candidate_ja=null、status=\"not_found\"、evidence_strength=\"none\"、match_judgment=\"not_found\" にする。\n\
+              除外例: \"I'll\", \"I'm\", \"You're\", \"We're\", \"They're\", \"They'll\", \"It's\", \"That's\", \"There's\", \"Don't\", \"Can't\", \"When\", \"If\", \"Then\", \"And\", \"But\", \"So\", \"Because\", \"Although\", \"Since\", \"While\", \"Before\", \"After\", \"Shopkeeper\"。\n\
+            - action=\"replace\": source_text が文断片 + 固有名詞候補の場合。suggested_source_text に固有名詞候補だけを入れる。\n\
+              例: \"I'm A'Chu\" → suggested_source_text=\"A'Chu\"、\"When Snow Region\" → suggested_source_text=\"Snow Region\"、\"But Yanbei City\" → suggested_source_text=\"Yanbei City\"。\n\
+            - And/But/So/When/If/Then/Because/Although/Since/While/Before/After + proper noun phrase は、先頭機能語を除いた候補へ action=\"replace\" にする。\n\
+            - action=\"keep\": Web検索で実在確認できる、または明らかに固有名詞候補として妥当な場合。\n\
+            - action=\"review\": 判断不能、Web検索で見つからないが字幕内固有名詞の可能性がある場合。\n\
+            - normalized_source_text を使う場合でも、返答JSONの source_text は必ず元の入力表記のままにする。\n\
+            - 固有名詞候補として残す場合は is_proper_noun=true にする。\n\
             - 推論で漢字候補を作らない。\n\
             - 英語字幕表記 source_text はソース由来なので、誤字・聞き間違いとは仮定しない。\n\
             - Web検索結果、配信元ページ、あらすじ、人物関係解説などに直接出ている漢字表記だけを採用する。\n\
@@ -3124,6 +4526,11 @@ pub async fn resolve_unresolved_terms_batch_openai(
             - confidence は \"high\" | \"medium\" | \"low\" のみを使う。\n\
             - evidence には、根拠ページの title, url, quote または短い要約を入れる。\n\
             - 根拠ページに直接出ている表記だけを candidate_zh / candidate_ja に入れる。\n\
+            - term_type は \"person\" | \"place\" | \"organization\" | \"tribe\" | \"army\" | \"object\" | \"other\" のいずれか1つを使う。\n\
+            - evidence_strength は \"direct\" | \"indirect\" | \"none\" のいずれか1つを使う。\n\
+            - match_judgment は \"exact\" | \"probable\" | \"weak\" | \"not_found\" のいずれか1つを使う。\n\
+            - needs_human_review は、人間が確認すべき場合 true にする。not_found/uncertain/low/indirect/none は true。\n\
+            - confidence_reason には、なぜその確度と判断したかを短く書く。\n\
             - search_aliases は検索補助語です。返答JSONの source_text には必ず元の入力表記を使ってください。\n\
               例: Zhenhuang で検索して候補を見つけた場合でも、source_text は \"Zhenhuang City\" のままにする。\n\
             - search_aliases が一般語すぎる場合（例: \"Moon\", \"Great\", \"Black\"）、\n\
@@ -3138,7 +4545,25 @@ pub async fn resolve_unresolved_terms_batch_openai(
             }
         }
 
-        input.push_str("\n\nJSONのみで返してください。");
+        input.push_str("\n\n返答形式（JSONのみ）:\n\
+            {\"terms\":[{\"source_text\":\"元の入力表記\",\
+            \"action\":\"keep|remove|replace|review\",\
+            \"suggested_source_text\":\"replace時の修正後表記。不要なら空文字\",\
+            \"normalized_source_text\":\"先頭文頭語を除いた表記。不要なら空文字\",\
+            \"is_proper_noun\":true,\
+            \"candidate_zh\":\"漢字表記 または null\",\
+            \"candidate_ja\":\"日本語表記 または null\",\
+            \"term_type\":\"person|place|organization|tribe|army|object|other\",\
+            \"status\":\"found|uncertain|not_found\",\
+            \"confidence\":\"high|medium|low\",\
+            \"evidence_strength\":\"direct|indirect|none\",\
+            \"match_judgment\":\"exact|probable|weak|not_found\",\
+            \"needs_human_review\":true,\
+            \"confidence_reason\":\"短い理由\",\
+            \"reason\":\"根拠の説明\",\
+            \"alternatives\":[],\
+            \"evidence\":[{\"title\":\"\",\"url\":\"\",\"quote\":\"\"}]}]}\n\
+            ※ 固有名詞ではない候補も省略せず、action=\"remove\", is_proper_noun=false, suggested_source_text=\"\", normalized_source_text=\"\", candidate_zh=null, candidate_ja=null, status=\"not_found\" で返す。");
 
         emit_log(&app, "debug", "SRT", &format!(
             "OpenAI Responses API: model={} endpoint=https://api.openai.com/v1/responses temperature=omitted json_mode=omitted web_search=on",
@@ -3157,7 +4582,10 @@ pub async fn resolve_unresolved_terms_batch_openai(
                 let body: serde_json::Value = match response.json().await {
                     Ok(b) => b,
                     Err(e) => {
-                        let msg = format!("Failed to parse OpenAI response for chunk {}/{}: {}", chunk_num, total_chunks, e);
+                        let msg = format!(
+                            "Failed to parse OpenAI response for chunk {}/{}: {}",
+                            chunk_num, total_chunks, e
+                        );
                         emit_log(&app, "error", "SRT", &msg);
                         chunk_failures.extend(chunk_terms.iter().map(|s| format!("{} (parse)", s)));
                         continue;
@@ -3168,20 +4596,36 @@ pub async fn resolve_unresolved_terms_batch_openai(
                     match extract_response_text_and_annotations(&body) {
                         Ok(v) => v,
                         Err(e) => {
-                            emit_log(&app, "error", "SRT", &format!(
-                                "Failed to extract text from batch response: {}", e));
-                            chunk_failures.extend(chunk_terms.iter().map(|s| format!("{} (extract)", s)));
+                            emit_log(
+                                &app,
+                                "error",
+                                "SRT",
+                                &format!("Failed to extract text from batch response: {}", e),
+                            );
+                            chunk_failures
+                                .extend(chunk_terms.iter().map(|s| format!("{} (extract)", s)));
                             continue;
                         }
                     };
 
-                emit_log(&app, "debug", "SRT", &format!(
-                    "OpenAI annotations (chunk {}): {} url_citations", chunk_num, evidence_urls.len()));
+                emit_log(
+                    &app,
+                    "debug",
+                    "SRT",
+                    &format!(
+                        "OpenAI annotations (chunk {}): {} url_citations",
+                        chunk_num,
+                        evidence_urls.len()
+                    ),
+                );
 
                 let cleaned = extract_json(text);
                 // Robust parse: try strict BatchTermsResponse first; if missing "terms",
                 // extract it from any JSON object (model may add drama_title etc.)
-                let terms_array: Vec<BatchTermResult> = match serde_json::from_str::<BatchTermsResponse>(cleaned) {
+                let terms_array: Vec<BatchTermResult> = match serde_json::from_str::<
+                    BatchTermsResponse,
+                >(cleaned)
+                {
                     Ok(batch) => batch.terms,
                     Err(e) => {
                         emit_log(&app, "warn", "SRT", &format!(
@@ -3191,28 +4635,53 @@ pub async fn resolve_unresolved_terms_batch_openai(
                         // Try to extract from raw JSON value (handles extra top-level keys like drama_title)
                         match serde_json::from_str::<serde_json::Value>(cleaned) {
                             Ok(v) => {
-                                if let Some(arr) = v.get("terms").and_then(|t| t.as_array()).cloned() {
-                                    serde_json::from_value::<Vec<BatchTermResult>>(serde_json::Value::Array(arr))
-                                        .unwrap_or_else(|e2| {
-                                            emit_log(&app, "error", "SRT", &format!(
-                                                "terms array parse also failed: {}", e2));
-                                            vec![]
-                                        })
-                                } else if let Some(arr) = v.get("results").and_then(|r| r.as_array()).cloned() {
-                                    serde_json::from_value::<Vec<BatchTermResult>>(serde_json::Value::Array(arr))
-                                        .unwrap_or_else(|e2| {
-                                            emit_log(&app, "error", "SRT", &format!(
-                                                "results array parse also failed: {}", e2));
-                                            vec![]
-                                        })
+                                if let Some(arr) =
+                                    v.get("terms").and_then(|t| t.as_array()).cloned()
+                                {
+                                    serde_json::from_value::<Vec<BatchTermResult>>(
+                                        serde_json::Value::Array(arr),
+                                    )
+                                    .unwrap_or_else(|e2| {
+                                        emit_log(
+                                            &app,
+                                            "error",
+                                            "SRT",
+                                            &format!("terms array parse also failed: {}", e2),
+                                        );
+                                        vec![]
+                                    })
+                                } else if let Some(arr) =
+                                    v.get("results").and_then(|r| r.as_array()).cloned()
+                                {
+                                    serde_json::from_value::<Vec<BatchTermResult>>(
+                                        serde_json::Value::Array(arr),
+                                    )
+                                    .unwrap_or_else(|e2| {
+                                        emit_log(
+                                            &app,
+                                            "error",
+                                            "SRT",
+                                            &format!("results array parse also failed: {}", e2),
+                                        );
+                                        vec![]
+                                    })
                                 } else {
-                                    emit_log(&app, "error", "SRT", "No 'terms' or 'results' array in batch response");
+                                    emit_log(
+                                        &app,
+                                        "error",
+                                        "SRT",
+                                        "No 'terms' or 'results' array in batch response",
+                                    );
                                     vec![]
                                 }
                             }
                             Err(e2) => {
-                                emit_log(&app, "error", "SRT", &format!(
-                                    "Generic JSON parse also failed: {}", e2));
+                                emit_log(
+                                    &app,
+                                    "error",
+                                    "SRT",
+                                    &format!("Generic JSON parse also failed: {}", e2),
+                                );
                                 vec![]
                             }
                         }
@@ -3220,68 +4689,150 @@ pub async fn resolve_unresolved_terms_batch_openai(
                 };
 
                 if terms_array.is_empty() {
-                    emit_log(&app, "warn", "SRT", &format!(
-                        "Batch chunk {}/{}: got 0 terms after parse, marking all as failures",
-                        chunk_num, total_chunks
-                    ));
+                    emit_log(
+                        &app,
+                        "warn",
+                        "SRT",
+                        &format!(
+                            "Batch chunk {}/{}: got 0 terms after parse, marking all as failures",
+                            chunk_num, total_chunks
+                        ),
+                    );
                     chunk_failures.extend(chunk_terms.iter().map(|s| format!("{} (empty)", s)));
                 } else {
                     // Process term results
                     let batch = BatchTermsResponse { terms: terms_array };
                     {
                         for input_term in chunk.iter() {
-                            let matched = batch.terms.iter().find(|r| r.source_text == input_term.source_text);
+                            let matched = batch
+                                .terms
+                                .iter()
+                                .find(|r| r.source_text == input_term.source_text);
                             if let Some(r) = matched {
-                                let status = if r.status.is_empty() { "not_found".to_string() } else { r.status.clone() };
+                                let status = if r.status.is_empty() {
+                                    "not_found".to_string()
+                                } else {
+                                    r.status.clone()
+                                };
                                 let mut term_evidence: Vec<EvidenceItem> = r.evidence.clone();
-                                let mut term_urls: Vec<String> = r.evidence.iter().map(|e| e.url.clone()).collect();
+                                let mut term_urls: Vec<String> =
+                                    r.evidence.iter().map(|e| e.url.clone()).collect();
                                 for url in &evidence_urls {
-                                    if !term_urls.contains(url) { term_urls.push(url.clone()); }
+                                    if !term_urls.contains(url) {
+                                        term_urls.push(url.clone());
+                                    }
                                 }
                                 for ev in &evidence_items {
                                     if !term_evidence.iter().any(|e| e.url == ev.url) {
                                         term_evidence.push(ev.clone());
                                     }
                                 }
-                                emit_log(&app, "info", "SRT", &format!(
-                                    "AI確認候補: {} → {} confidence={} status={}",
-                                    r.source_text,
-                                    r.candidate_zh.as_deref().unwrap_or("なし"),
-                                    r.confidence,
-                                    status
-                                ));
+                                emit_log(
+                                    &app,
+                                    "info",
+                                    "SRT",
+                                    &format!(
+                                        "AI確認候補: {} → {} confidence={} status={}",
+                                        r.source_text,
+                                        r.candidate_zh.as_deref().unwrap_or("なし"),
+                                        r.confidence,
+                                        status
+                                    ),
+                                );
                                 all_results.push(WebTermResolution {
                                     source_text: input_term.source_text.clone(),
+                                    action: r.action.clone(),
+                                    suggested_source_text: r
+                                        .suggested_source_text
+                                        .clone()
+                                        .filter(|s| !s.trim().is_empty()),
                                     surface_ja: input_term.surface_ja.clone(),
                                     candidate_zh: r.candidate_zh.clone(),
                                     candidate_ja: r.candidate_ja.clone(),
-                                    confidence: if r.confidence.is_empty() { "low".to_string() } else { r.confidence.clone() },
+                                    confidence: if r.confidence.is_empty() {
+                                        "low".to_string()
+                                    } else {
+                                        r.confidence.clone()
+                                    },
                                     evidence_summary: r.reason.clone(),
                                     evidence_urls: term_urls,
                                     status,
                                     source: Some("openai".into()),
-                                    alternatives: if r.alternatives.is_empty() { None } else { Some(r.alternatives.clone()) },
-                                    evidence: if term_evidence.is_empty() { None } else { Some(term_evidence) },
-                                    reason: if r.reason.is_empty() { None } else { Some(r.reason.clone()) },
+                                    alternatives: if r.alternatives.is_empty() {
+                                        None
+                                    } else {
+                                        Some(r.alternatives.clone())
+                                    },
+                                    evidence: if term_evidence.is_empty() {
+                                        None
+                                    } else {
+                                        Some(term_evidence)
+                                    },
+                                    reason: if r.reason.is_empty() {
+                                        None
+                                    } else {
+                                        Some(r.reason.clone())
+                                    },
+                                    normalized_source_text: r
+                                        .normalized_source_text
+                                        .clone()
+                                        .filter(|s| !s.trim().is_empty()),
+                                    is_proper_noun: r.is_proper_noun,
+                                    term_type: if r.term_type.is_empty() {
+                                        None
+                                    } else {
+                                        Some(r.term_type.clone())
+                                    },
+                                    evidence_strength: if r.evidence_strength.is_empty() {
+                                        None
+                                    } else {
+                                        Some(r.evidence_strength.clone())
+                                    },
+                                    match_judgment: if r.match_judgment.is_empty() {
+                                        None
+                                    } else {
+                                        Some(r.match_judgment.clone())
+                                    },
+                                    needs_human_review: r.needs_human_review,
+                                    confidence_reason: if r.confidence_reason.is_empty() {
+                                        None
+                                    } else {
+                                        Some(r.confidence_reason.clone())
+                                    },
                                 });
                             } else {
-                                emit_log(&app, "warn", "SRT", &format!(
-                                    "AI確認: no match for {} in batch chunk {}",
-                                    input_term.source_text, chunk_num
-                                ));
+                                emit_log(
+                                    &app,
+                                    "warn",
+                                    "SRT",
+                                    &format!(
+                                        "AI確認: no match for {} in batch chunk {}",
+                                        input_term.source_text, chunk_num
+                                    ),
+                                );
                                 all_results.push(WebTermResolution {
                                     source_text: input_term.source_text.clone(),
+                                    action: Some("review".to_string()),
+                                    suggested_source_text: None,
                                     surface_ja: input_term.surface_ja.clone(),
                                     candidate_zh: None,
                                     candidate_ja: None,
                                     confidence: "none".to_string(),
-                                    evidence_summary: "バッチ応答に対応する結果がありませんでした。".to_string(),
+                                    evidence_summary:
+                                        "バッチ応答に対応する結果がありませんでした。".to_string(),
                                     evidence_urls: vec![],
                                     status: "not_found".to_string(),
                                     source: Some("openai".into()),
                                     alternatives: None,
                                     evidence: None,
                                     reason: None,
+                                    normalized_source_text: None,
+                                    is_proper_noun: None,
+                                    term_type: None,
+                                    evidence_strength: None,
+                                    match_judgment: None,
+                                    needs_human_review: None,
+                                    confidence_reason: None,
                                 });
                             }
                         }
@@ -3289,9 +4840,12 @@ pub async fn resolve_unresolved_terms_batch_openai(
                 } // end if terms_array non-empty
             }
             Err(e) => {
-                emit_log(&app, "error", "SRT", &format!(
-                    "Batch chunk {}/{} failed: {}", chunk_num, total_chunks, e
-                ));
+                emit_log(
+                    &app,
+                    "error",
+                    "SRT",
+                    &format!("Batch chunk {}/{} failed: {}", chunk_num, total_chunks, e),
+                );
                 chunk_failures.extend(chunk_terms.iter().map(|s| format!("{} (http)", s)));
             }
         }
@@ -3303,24 +4857,47 @@ pub async fn resolve_unresolved_terms_batch_openai(
     }
 
     if !chunk_failures.is_empty() {
-        emit_log(&app, "warn", "SRT", &format!(
-            "一括AI確認: {}件のバッチが失敗しました: {}",
-            chunk_failures.len(),
-            chunk_failures.join(", ")
-        ));
+        emit_log(
+            &app,
+            "warn",
+            "SRT",
+            &format!(
+                "一括AI確認: {}件のバッチが失敗しました: {}",
+                chunk_failures.len(),
+                chunk_failures.join(", ")
+            ),
+        );
     }
 
-    let resolved_count = all_results.iter().filter(|r| r.status == "found" || r.status == "candidate_found").count();
+    let resolved_count = all_results
+        .iter()
+        .filter(|r| r.status == "found" || r.status == "candidate_found")
+        .count();
     if let Some(ep) = episode_num {
-        emit_log(&app, "success", "SRT", &format!(
-            "一括AI確認完了: episode={}, {}/{} terms resolved ({} chunks)",
-            ep, resolved_count, all_results.len(), total_chunks
-        ));
+        emit_log(
+            &app,
+            "success",
+            "SRT",
+            &format!(
+                "一括AI確認完了: episode={}, {}/{} terms resolved ({} chunks)",
+                ep,
+                resolved_count,
+                all_results.len(),
+                total_chunks
+            ),
+        );
     } else {
-        emit_log(&app, "success", "SRT", &format!(
-            "一括AI確認完了: {}/{} terms resolved ({} chunks)",
-            resolved_count, all_results.len(), total_chunks
-        ));
+        emit_log(
+            &app,
+            "success",
+            "SRT",
+            &format!(
+                "一括AI確認完了: {}/{} terms resolved ({} chunks)",
+                resolved_count,
+                all_results.len(),
+                total_chunks
+            ),
+        );
     }
 
     Ok(all_results)
@@ -3340,12 +4917,23 @@ pub async fn disambiguate_zh_context(
         return Ok(vec![]);
     }
 
-    emit_log(&app, "info", "SRT", &format!(
-        "LLM曖昧性解消開始: {}件の複数行zh_contextを判定",
-        requests.len()
-    ));
+    emit_log(
+        &app,
+        "info",
+        "SRT",
+        &format!(
+            "LLM曖昧性解消開始: {}件の複数行zh_contextを判定",
+            requests.len()
+        ),
+    );
 
-    let provider = resolve_provider(&state, &env_store, &app)?;
+    let task_models = service_settings::read_llm_task_model_settings(&app);
+    let provider = resolve_provider_for_tier(
+        &state,
+        &env_store,
+        &app,
+        task_models.zh_context_disambiguation,
+    )?;
     let client = LlmClient::new(provider);
 
     let system = "\
@@ -3367,10 +4955,21 @@ selected行から固有名詞を抽出（extracted）:\
 - 対応する部分表現を安全に切り出せない場合はextractedをnullにしてください\
 - extractedは必ずselectedの部分文字列でなければなりません（推測表記を作らないでください）\
 \
+カテゴリ語の扱い:\
+- source_textが「<Name> tribe」「<Name> Tribe」「<Name> Tribes」の形の場合、\
+  tribeは音写対象ではなくカテゴリ語です\
+- <Name> に対応する中国語固有名詞 + 部 を extracted に返してください\
+- 文全体を返してはいけません。対応する最小の固有名詞句だけを extracted に返してください\
+- 「X部」全体をextractedとして返してください（後続処理で日本語の「X族」に変換されます）\
+- source_text と zh_context が対応しない場合は extracted=null にしてください\
+\
 出力例:\
-[{\"source_text\":\"Emperor Pei Luo\",\"selected\":\"效忠雍皇\",\"extracted\":\"雍皇\"}]";
+[{\"source_text\":\"Emperor Pei Luo\",\"selected\":\"效忠雍皇\",\"extracted\":\"雍皇\"},\
+{\"source_text\":\"Gelin tribe\",\"selected\":\"今日不仅我哥林部不会出兵\",\"extracted\":\"哥林部\"},\
+{\"source_text\":\"Lanchuan Tribes\",\"selected\":\"在座的蓝川部\",\"extracted\":\"蓝川部\"}]";
 
-    let mut user = String::from("以下の各用語について、対応する中国語字幕の行を選んでください:\n\n");
+    let mut user =
+        String::from("以下の各用語について、対応する中国語字幕の行を選んでください:\n\n");
     for (i, req) in requests.iter().enumerate() {
         user.push_str(&format!(
             "--- 用語 {} ---\nsource_text: {}\nzh_context:\n{}\n\n",
@@ -3384,10 +4983,12 @@ selected行から固有名詞を抽出（extracted）:\
     let results: Vec<ZhDisambiguationResponse> = serde_json::from_value(value)
         .map_err(|e| format!("Failed to parse disambiguation JSON: {}", e))?;
 
-    emit_log(&app, "success", "SRT", &format!(
-        "LLM曖昧性解消完了: {}件判定",
-        results.len()
-    ));
+    emit_log(
+        &app,
+        "success",
+        "SRT",
+        &format!("LLM曖昧性解消完了: {}件判定", results.len()),
+    );
 
     Ok(results)
 }
@@ -3465,10 +5066,30 @@ mod tests {
     #[test]
     fn test_extract_body_candidates_basic() {
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "Lady Helian arrives at the Palace.".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Lady Helian greets the elders.".into() },
-            SubtitleEntry { index: 3, start: "00:00:05,000".into(), end: "00:00:06,000".into(), text: "This is Qingshan House.".into() },
-            SubtitleEntry { index: 4, start: "00:00:07,000".into(), end: "00:00:08,000".into(), text: "This is Qingshan House again.".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "Lady Helian arrives at the Palace.".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "Lady Helian greets the elders.".into(),
+            },
+            SubtitleEntry {
+                index: 3,
+                start: "00:00:05,000".into(),
+                end: "00:00:06,000".into(),
+                text: "This is Qingshan House.".into(),
+            },
+            SubtitleEntry {
+                index: 4,
+                start: "00:00:07,000".into(),
+                end: "00:00:08,000".into(),
+                text: "This is Qingshan House again.".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, vec![], vec![]).unwrap();
         let helian = result.iter().find(|r| r.source_text.contains("Helian"));
@@ -3484,35 +5105,78 @@ mod tests {
     #[test]
     fn test_extract_body_candidates_filters_stopwords() {
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "I am here.".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "You are there.".into() },
-            SubtitleEntry { index: 3, start: "00:00:05,000".into(), end: "00:00:06,000".into(), text: "She walks alone.".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "I am here.".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "You are there.".into(),
+            },
+            SubtitleEntry {
+                index: 3,
+                start: "00:00:05,000".into(),
+                end: "00:00:06,000".into(),
+                text: "She walks alone.".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, vec![], vec![]).unwrap();
         for r in &result {
-            assert!(!is_stopword(&r.source_text), "Stopword phrase should not appear: {}", r.source_text);
+            assert!(
+                !is_stopword(&r.source_text),
+                "Stopword phrase should not appear: {}",
+                r.source_text
+            );
         }
     }
 
     #[test]
     fn test_extract_body_candidates_keyword_single_occurrence() {
-        let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "The Jade Pendant glowed brightly.".into() },
-        ];
+        let entries = vec![SubtitleEntry {
+            index: 1,
+            start: "00:00:01,000".into(),
+            end: "00:00:02,000".into(),
+            text: "The Jade Pendant glowed brightly.".into(),
+        }];
         let result = extract_srt_body_candidates(entries, vec![], vec![]).unwrap();
         let jade = result.iter().find(|r| r.source_text.contains("Jade"));
-        assert!(jade.is_some(), "Jade Pendant should be extracted (keyword match)");
+        assert!(
+            jade.is_some(),
+            "Jade Pendant should be extracted (keyword match)"
+        );
     }
 
     #[test]
     fn test_extract_body_candidates_dedup_variants() {
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "Huotu Water is dangerous.".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Bring the Huotu Water here.".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "Huotu Water is dangerous.".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "Bring the Huotu Water here.".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, vec![], vec![]).unwrap();
-        let huotu: Vec<_> = result.iter().filter(|r| normalize_en_for_dedup(&r.source_text) == "huotuwater").collect();
-        assert_eq!(huotu.len(), 1, "Huotu Water variants should be deduped, got {:?}", huotu);
+        let huotu: Vec<_> = result
+            .iter()
+            .filter(|r| normalize_en_for_dedup(&r.source_text) == "huotuwater")
+            .collect();
+        assert_eq!(
+            huotu.len(),
+            1,
+            "Huotu Water variants should be deduped, got {:?}",
+            huotu
+        );
         if let Some(h) = huotu.first() {
             assert_eq!(h.occurrence_count, 2);
         }
@@ -3521,14 +5185,32 @@ mod tests {
     #[test]
     fn test_extract_body_candidates_sorted_by_count() {
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "Rare item.".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Common Thing but common Thing again.".into() },
-            SubtitleEntry { index: 3, start: "00:00:05,000".into(), end: "00:00:06,000".into(), text: "Common Thing appears Common Thing everywhere Common Thing.".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "Rare item.".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "Common Thing but common Thing again.".into(),
+            },
+            SubtitleEntry {
+                index: 3,
+                start: "00:00:05,000".into(),
+                end: "00:00:06,000".into(),
+                text: "Common Thing appears Common Thing everywhere Common Thing.".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, vec![], vec![]).unwrap();
         for i in 1..result.len() {
-            assert!(result[i - 1].occurrence_count >= result[i].occurrence_count,
-                "Results not sorted by count: {:?}", result);
+            assert!(
+                result[i - 1].occurrence_count >= result[i].occurrence_count,
+                "Results not sorted by count: {:?}",
+                result
+            );
         }
     }
 
@@ -3543,141 +5225,356 @@ mod tests {
     #[test]
     fn test_exclude_dialogue_punctuation() {
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "Defend Yanbei! Defend Yanbei".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Seize Yanbei! Slay Yan Xun".into() },
-            SubtitleEntry { index: 3, start: "00:00:05,000".into(), end: "00:00:06,000".into(), text: "What? Knockout".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "Defend Yanbei! Defend Yanbei".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "Seize Yanbei! Slay Yan Xun".into(),
+            },
+            SubtitleEntry {
+                index: 3,
+                start: "00:00:05,000".into(),
+                end: "00:00:06,000".into(),
+                text: "What? Knockout".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, vec![], vec![]).unwrap();
         let texts = candidates_texts(&result);
-        assert!(!texts.iter().any(|t| t.contains('!') || t.contains('?')),
-            "Dialogue fragments with !/? should be excluded, got: {:?}", texts);
+        assert!(
+            !texts.iter().any(|t| t.contains('!') || t.contains('?')),
+            "Dialogue fragments with !/? should be excluded, got: {:?}",
+            texts
+        );
     }
 
     #[test]
     fn test_exclude_title_phrase_with_known_name() {
         let characters = vec![
             Character {
-                id: "yan_xun".into(), english_name: "Yan Xun".into(),
-                chinese_name: None, japanese_name: "燕洵".into(),
-                aliases: vec![], role: None, status: None, gender: None,
-                default_register: "".into(), speech_style: None, notes: None,
+                id: "yan_xun".into(),
+                english_name: "Yan Xun".into(),
+                chinese_name: None,
+                japanese_name: "燕洵".into(),
+                aliases: vec![],
+                role: None,
+                status: None,
+                gender: None,
+                default_register: "".into(),
+                speech_style: None,
+                notes: None,
             },
             Character {
-                id: "chu_qiao".into(), english_name: "Chu Qiao".into(),
-                chinese_name: None, japanese_name: "楚喬".into(),
-                aliases: vec!["Chu".into()], role: None, status: None, gender: None,
-                default_register: "".into(), speech_style: None, notes: None,
+                id: "chu_qiao".into(),
+                english_name: "Chu Qiao".into(),
+                chinese_name: None,
+                japanese_name: "楚喬".into(),
+                aliases: vec!["Chu".into()],
+                role: None,
+                status: None,
+                gender: None,
+                default_register: "".into(),
+                speech_style: None,
+                notes: None,
             },
         ];
-        let glossary = vec![
-            GlossaryEntry {
-                source: "Biantang".into(), target: "卞唐".into(), entry_type: "place".into(),
-                notes: None, aliases: vec![], status: None, confidence: None, evidence_urls: None,
-            },
-        ];
+        let glossary = vec![GlossaryEntry {
+            source: "Biantang".into(),
+            target: "卞唐".into(),
+            entry_type: "place".into(),
+            notes: None,
+            aliases: vec![],
+            status: None,
+            confidence: None,
+            evidence_urls: None,
+        }];
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "King Yan Xun".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "King Yan Xun arrives.".into() },
-            SubtitleEntry { index: 3, start: "00:00:05,000".into(), end: "00:00:06,000".into(), text: "Crown Prince of Biantang".into() },
-            SubtitleEntry { index: 4, start: "00:00:07,000".into(), end: "00:00:08,000".into(), text: "Miss Chu".into() },
-            SubtitleEntry { index: 5, start: "00:00:09,000".into(), end: "00:00:10,000".into(), text: "Miss Chu again.".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "King Yan Xun".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "King Yan Xun arrives.".into(),
+            },
+            SubtitleEntry {
+                index: 3,
+                start: "00:00:05,000".into(),
+                end: "00:00:06,000".into(),
+                text: "Crown Prince of Biantang".into(),
+            },
+            SubtitleEntry {
+                index: 4,
+                start: "00:00:07,000".into(),
+                end: "00:00:08,000".into(),
+                text: "Miss Chu".into(),
+            },
+            SubtitleEntry {
+                index: 5,
+                start: "00:00:09,000".into(),
+                end: "00:00:10,000".into(),
+                text: "Miss Chu again.".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, characters, glossary).unwrap();
         let texts = candidates_texts(&result);
         // These should be excluded (title + known name)
-        assert!(!texts.iter().any(|t| t.contains("King Yan Xun")), "Excluded: {:?}", texts);
-        assert!(!texts.iter().any(|t| t.contains("Crown Prince of Biantang")), "Excluded: {:?}", texts);
-        assert!(!texts.iter().any(|t| t.contains("Miss Chu")), "Excluded: {:?}", texts);
+        assert!(
+            !texts.iter().any(|t| t.contains("King Yan Xun")),
+            "Excluded: {:?}",
+            texts
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("Crown Prince of Biantang")),
+            "Excluded: {:?}",
+            texts
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("Miss Chu")),
+            "Excluded: {:?}",
+            texts
+        );
     }
 
     #[test]
     fn test_keep_title_phrase_with_unknown_name() {
         // Lady Helian — "Helian" is NOT in character/glossary → should be kept
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "Lady Helian arrives.".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Lady Helian greets.".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "Lady Helian arrives.".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "Lady Helian greets.".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, vec![], vec![]).unwrap();
         let helian = result.iter().find(|r| r.source_text.contains("Helian"));
-        assert!(helian.is_some(), "Lady Helian should be kept (Helian unknown): {:?}", candidates_texts(&result));
+        assert!(
+            helian.is_some(),
+            "Lady Helian should be kept (Helian unknown): {:?}",
+            candidates_texts(&result)
+        );
     }
 
     #[test]
     fn test_comma_splitting() {
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "General Huan, Ka Tuo".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "General Huan, Ka Tuo arrive.".into() },
-            SubtitleEntry { index: 3, start: "00:00:05,000".into(), end: "00:00:06,000".into(), text: "Great Yong, Yanbei".into() },
-            SubtitleEntry { index: 4, start: "00:00:07,000".into(), end: "00:00:08,000".into(), text: "Great Yong, Yanbei war.".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "General Huan, Ka Tuo".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "General Huan, Ka Tuo arrive.".into(),
+            },
+            SubtitleEntry {
+                index: 3,
+                start: "00:00:05,000".into(),
+                end: "00:00:06,000".into(),
+                text: "Great Yong, Yanbei".into(),
+            },
+            SubtitleEntry {
+                index: 4,
+                start: "00:00:07,000".into(),
+                end: "00:00:08,000".into(),
+                text: "Great Yong, Yanbei war.".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, vec![], vec![]).unwrap();
         let texts = candidates_texts(&result);
         // Should be split; "General Huan" and "Ka Tuo" as separate candidates
         let general_huan = result.iter().find(|r| r.source_text == "General Huan");
         let ka_tuo = result.iter().find(|r| r.source_text == "Ka Tuo");
-        assert!(general_huan.is_some(), "General Huan should exist after split: {:?}", texts);
-        assert!(ka_tuo.is_some(), "Ka Tuo should exist after split: {:?}", texts);
+        assert!(
+            general_huan.is_some(),
+            "General Huan should exist after split: {:?}",
+            texts
+        );
+        assert!(
+            ka_tuo.is_some(),
+            "Ka Tuo should exist after split: {:?}",
+            texts
+        );
         // Should NOT contain the un-split form
-        assert!(!texts.iter().any(|t| t.contains(',')), "No comma-containing phrases: {:?}", texts);
+        assert!(
+            !texts.iter().any(|t| t.contains(',')),
+            "No comma-containing phrases: {:?}",
+            texts
+        );
     }
 
     #[test]
     fn test_in_splitting() {
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "Yong Army in Ximin Mountains".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Yong Army in Ximin Mountains again.".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "Yong Army in Ximin Mountains".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "Yong Army in Ximin Mountains again.".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, vec![], vec![]).unwrap();
         let texts = candidates_texts(&result);
         let yong = result.iter().find(|r| r.source_text == "Yong Army");
         let ximin = result.iter().find(|r| r.source_text == "Ximin Mountains");
-        assert!(yong.is_some(), "Yong Army should exist after 'in' split: {:?}", texts);
-        assert!(ximin.is_some(), "Ximin Mountains should exist after 'in' split: {:?}", texts);
+        assert!(
+            yong.is_some(),
+            "Yong Army should exist after 'in' split: {:?}",
+            texts
+        );
+        assert!(
+            ximin.is_some(),
+            "Ximin Mountains should exist after 'in' split: {:?}",
+            texts
+        );
         // Should NOT contain the original "in" phrase
-        assert!(!texts.iter().any(|t| t.to_lowercase().contains(" in ")), "No 'in' phrases: {:?}", texts);
+        assert!(
+            !texts.iter().any(|t| t.to_lowercase().contains(" in ")),
+            "No 'in' phrases: {:?}",
+            texts
+        );
     }
 
     #[test]
     fn test_keep_valuable_terms() {
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "Huotu Water is dangerous.".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Huotu Water flows fast.".into() },
-            SubtitleEntry { index: 3, start: "00:00:05,000".into(), end: "00:00:06,000".into(), text: "Qingshan House stands tall.".into() },
-            SubtitleEntry { index: 4, start: "00:00:07,000".into(), end: "00:00:08,000".into(), text: "Qingshan House is old.".into() },
-            SubtitleEntry { index: 5, start: "00:00:09,000".into(), end: "00:00:10,000".into(), text: "The Black Eagle Army marches.".into() },
-            SubtitleEntry { index: 6, start: "00:00:11,000".into(), end: "00:00:12,000".into(), text: "Black Eagle Army returns.".into() },
-            SubtitleEntry { index: 7, start: "00:00:13,000".into(), end: "00:00:14,000".into(), text: "Snow Region Tribe gathers.".into() },
-            SubtitleEntry { index: 8, start: "00:00:15,000".into(), end: "00:00:16,000".into(), text: "Snow Region Tribe moves.".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "Huotu Water is dangerous.".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "Huotu Water flows fast.".into(),
+            },
+            SubtitleEntry {
+                index: 3,
+                start: "00:00:05,000".into(),
+                end: "00:00:06,000".into(),
+                text: "Qingshan House stands tall.".into(),
+            },
+            SubtitleEntry {
+                index: 4,
+                start: "00:00:07,000".into(),
+                end: "00:00:08,000".into(),
+                text: "Qingshan House is old.".into(),
+            },
+            SubtitleEntry {
+                index: 5,
+                start: "00:00:09,000".into(),
+                end: "00:00:10,000".into(),
+                text: "The Black Eagle Army marches.".into(),
+            },
+            SubtitleEntry {
+                index: 6,
+                start: "00:00:11,000".into(),
+                end: "00:00:12,000".into(),
+                text: "Black Eagle Army returns.".into(),
+            },
+            SubtitleEntry {
+                index: 7,
+                start: "00:00:13,000".into(),
+                end: "00:00:14,000".into(),
+                text: "Snow Region Tribe gathers.".into(),
+            },
+            SubtitleEntry {
+                index: 8,
+                start: "00:00:15,000".into(),
+                end: "00:00:16,000".into(),
+                text: "Snow Region Tribe moves.".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, vec![], vec![]).unwrap();
         let texts = candidates_texts(&result);
         // These should all be kept
-        let huotu = result.iter().find(|r| normalize_en_for_dedup(&r.source_text) == "huotuwater");
+        let huotu = result
+            .iter()
+            .find(|r| normalize_en_for_dedup(&r.source_text) == "huotuwater");
         assert!(huotu.is_some(), "Huotu Water should be kept: {:?}", texts);
-        let qingshan = result.iter().find(|r| normalize_en_for_dedup(&r.source_text) == "qingshanhouse");
-        assert!(qingshan.is_some(), "Qingshan House should be kept: {:?}", texts);
-        let bea = result.iter().find(|r| normalize_en_for_dedup(&r.source_text) == "blackeaglearmy");
-        assert!(bea.is_some(), "Black Eagle Army should be kept: {:?}", texts);
-        let srt = result.iter().find(|r| normalize_en_for_dedup(&r.source_text) == "snowregiontribe");
-        assert!(srt.is_some(), "Snow Region Tribe should be kept: {:?}", texts);
+        let qingshan = result
+            .iter()
+            .find(|r| normalize_en_for_dedup(&r.source_text) == "qingshanhouse");
+        assert!(
+            qingshan.is_some(),
+            "Qingshan House should be kept: {:?}",
+            texts
+        );
+        let bea = result
+            .iter()
+            .find(|r| normalize_en_for_dedup(&r.source_text) == "blackeaglearmy");
+        assert!(
+            bea.is_some(),
+            "Black Eagle Army should be kept: {:?}",
+            texts
+        );
+        let srt = result
+            .iter()
+            .find(|r| normalize_en_for_dedup(&r.source_text) == "snowregiontribe");
+        assert!(
+            srt.is_some(),
+            "Snow Region Tribe should be kept: {:?}",
+            texts
+        );
     }
 
     #[test]
     fn test_exclude_honorific_phrases() {
         // These should be excluded via stop_phrase or title_phrase_with_known_name
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "His Majesty arrives.".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "His Majesty speaks.".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "His Majesty arrives.".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "His Majesty speaks.".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, vec![], vec![]).unwrap();
         let texts = candidates_texts(&result);
-        assert!(!texts.iter().any(|t| t.to_lowercase().contains("majesty")),
-            "Honorific phrases should be excluded: {:?}", texts);
+        assert!(
+            !texts.iter().any(|t| t.to_lowercase().contains("majesty")),
+            "Honorific phrases should be excluded: {:?}",
+            texts
+        );
     }
 
     #[test]
     fn test_unresolved_term_source_default() {
-        let json = r#"{"source_text":"Test","surface_ja":"","term_type":"","status":"","reason":""}"#;
+        let json =
+            r#"{"source_text":"Test","surface_ja":"","term_type":"","status":"","reason":""}"#;
         let t: UnresolvedTerm = serde_json::from_str(json).unwrap();
         assert_eq!(t.source, None);
         assert_eq!(t.occurrence_count, 0);
@@ -3686,132 +5583,320 @@ mod tests {
     #[test]
     fn test_exclude_verb_known_name() {
         // "Defend Yanbei" and "Kill Yan Xun" with known names should be excluded
-        let characters = vec![
-            Character {
-                id: "yan_xun".into(), english_name: "Yan Xun".into(),
-                chinese_name: None, japanese_name: "燕洵".into(),
-                aliases: vec![], role: None, status: None, gender: None,
-                default_register: "".into(), speech_style: None, notes: None,
-            },
-        ];
-        let glossary = vec![
-            GlossaryEntry {
-                source: "Yanbei".into(), target: "燕北".into(), entry_type: "place".into(),
-                notes: None, aliases: vec![], status: None, confidence: None, evidence_urls: None,
-            },
-        ];
+        let characters = vec![Character {
+            id: "yan_xun".into(),
+            english_name: "Yan Xun".into(),
+            chinese_name: None,
+            japanese_name: "燕洵".into(),
+            aliases: vec![],
+            role: None,
+            status: None,
+            gender: None,
+            default_register: "".into(),
+            speech_style: None,
+            notes: None,
+        }];
+        let glossary = vec![GlossaryEntry {
+            source: "Yanbei".into(),
+            target: "燕北".into(),
+            entry_type: "place".into(),
+            notes: None,
+            aliases: vec![],
+            status: None,
+            confidence: None,
+            evidence_urls: None,
+        }];
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "Defend Yanbei".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Kill Yan Xun".into() },
-            SubtitleEntry { index: 3, start: "00:00:05,000".into(), end: "00:00:06,000".into(), text: "Defend Yanbei, protect the city.".into() },
-            SubtitleEntry { index: 4, start: "00:00:07,000".into(), end: "00:00:08,000".into(), text: "Kill Yan Xun and escape.".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "Defend Yanbei".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "Kill Yan Xun".into(),
+            },
+            SubtitleEntry {
+                index: 3,
+                start: "00:00:05,000".into(),
+                end: "00:00:06,000".into(),
+                text: "Defend Yanbei, protect the city.".into(),
+            },
+            SubtitleEntry {
+                index: 4,
+                start: "00:00:07,000".into(),
+                end: "00:00:08,000".into(),
+                text: "Kill Yan Xun and escape.".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, characters, glossary).unwrap();
         let texts = candidates_texts(&result);
-        assert!(!texts.iter().any(|t| t.to_lowercase().contains("defend yanbei")),
-            "Defend Yanbei (verb+known) should be excluded: {:?}", texts);
-        assert!(!texts.iter().any(|t| t.to_lowercase().contains("kill yan xun")),
-            "Kill Yan Xun (verb+known) should be excluded: {:?}", texts);
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.to_lowercase().contains("defend yanbei")),
+            "Defend Yanbei (verb+known) should be excluded: {:?}",
+            texts
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.to_lowercase().contains("kill yan xun")),
+            "Kill Yan Xun (verb+known) should be excluded: {:?}",
+            texts
+        );
     }
 
     #[test]
     fn test_strip_trailing_cjk_parenthetical() {
-        assert_eq!(strip_trailing_cjk_parenthetical("Huotu Water (火屠水)"), "Huotu Water");
-        assert_eq!(strip_trailing_cjk_parenthetical("Black Eagle Army (黒鷹軍)"), "Black Eagle Army");
-        assert_eq!(strip_trailing_cjk_parenthetical("Qingshan House (青山荘)"), "Qingshan House");
+        assert_eq!(
+            strip_trailing_cjk_parenthetical("Huotu Water (火屠水)"),
+            "Huotu Water"
+        );
+        assert_eq!(
+            strip_trailing_cjk_parenthetical("Black Eagle Army (黒鷹軍)"),
+            "Black Eagle Army"
+        );
+        assert_eq!(
+            strip_trailing_cjk_parenthetical("Qingshan House (青山荘)"),
+            "Qingshan House"
+        );
         // No CJK inside parens → keep as-is
-        assert_eq!(strip_trailing_cjk_parenthetical("Huotu Water (Fire Water)"), "Huotu Water (Fire Water)");
+        assert_eq!(
+            strip_trailing_cjk_parenthetical("Huotu Water (Fire Water)"),
+            "Huotu Water (Fire Water)"
+        );
         // No parens → unchanged
-        assert_eq!(strip_trailing_cjk_parenthetical("Huotu Water"), "Huotu Water");
+        assert_eq!(
+            strip_trailing_cjk_parenthetical("Huotu Water"),
+            "Huotu Water"
+        );
         // Single kanji
         assert_eq!(strip_trailing_cjk_parenthetical("Fire (火)"), "Fire");
         // Katakana
-        assert_eq!(strip_trailing_cjk_parenthetical("Water (ウォーター)"), "Water");
+        assert_eq!(
+            strip_trailing_cjk_parenthetical("Water (ウォーター)"),
+            "Water"
+        );
     }
 
     #[test]
     fn test_exclude_known_place_generic_suffix() {
         // Known place + generic suffix → exclude
-        let glossary = vec![
-            GlossaryEntry {
-                source: "Yanbei".into(), target: "燕北".into(), entry_type: "place".into(),
-                notes: None, aliases: vec![], status: None, confidence: None, evidence_urls: None,
-            },
-        ];
+        let glossary = vec![GlossaryEntry {
+            source: "Yanbei".into(),
+            target: "燕北".into(),
+            entry_type: "place".into(),
+            notes: None,
+            aliases: vec![],
+            status: None,
+            confidence: None,
+            evidence_urls: None,
+        }];
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "Yanbei City is large.".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Yanbei City flourishes.".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "Yanbei City is large.".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "Yanbei City flourishes.".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, vec![], glossary).unwrap();
         let texts = candidates_texts(&result);
-        assert!(!texts.iter().any(|t| t.to_lowercase().contains("yanbei")),
-            "Yanbei City should be excluded (known place + generic suffix): {:?}", texts);
+        assert!(
+            !texts.iter().any(|t| t.to_lowercase().contains("yanbei")),
+            "Yanbei City should be excluded (known place + generic suffix): {:?}",
+            texts
+        );
     }
 
     #[test]
     fn test_keep_unknown_place_generic_suffix() {
         // Unknown prefix + generic suffix → keep
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "Luo River flows east.".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Luo River is deep.".into() },
-            SubtitleEntry { index: 3, start: "00:00:05,000".into(), end: "00:00:06,000".into(), text: "Qianzhang Lake sparkles.".into() },
-            SubtitleEntry { index: 4, start: "00:00:07,000".into(), end: "00:00:08,000".into(), text: "Qianzhang Lake is blue.".into() },
-            SubtitleEntry { index: 5, start: "00:00:09,000".into(), end: "00:00:10,000".into(), text: "Snow Region Tribe gathers.".into() },
-            SubtitleEntry { index: 6, start: "00:00:11,000".into(), end: "00:00:12,000".into(), text: "Snow Region Tribe dances.".into() },
-            SubtitleEntry { index: 7, start: "00:00:13,000".into(), end: "00:00:14,000".into(), text: "Qingshan House is tall.".into() },
-            SubtitleEntry { index: 8, start: "00:00:15,000".into(), end: "00:00:16,000".into(), text: "Qingshan House stands.".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "Luo River flows east.".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "Luo River is deep.".into(),
+            },
+            SubtitleEntry {
+                index: 3,
+                start: "00:00:05,000".into(),
+                end: "00:00:06,000".into(),
+                text: "Qianzhang Lake sparkles.".into(),
+            },
+            SubtitleEntry {
+                index: 4,
+                start: "00:00:07,000".into(),
+                end: "00:00:08,000".into(),
+                text: "Qianzhang Lake is blue.".into(),
+            },
+            SubtitleEntry {
+                index: 5,
+                start: "00:00:09,000".into(),
+                end: "00:00:10,000".into(),
+                text: "Snow Region Tribe gathers.".into(),
+            },
+            SubtitleEntry {
+                index: 6,
+                start: "00:00:11,000".into(),
+                end: "00:00:12,000".into(),
+                text: "Snow Region Tribe dances.".into(),
+            },
+            SubtitleEntry {
+                index: 7,
+                start: "00:00:13,000".into(),
+                end: "00:00:14,000".into(),
+                text: "Qingshan House is tall.".into(),
+            },
+            SubtitleEntry {
+                index: 8,
+                start: "00:00:15,000".into(),
+                end: "00:00:16,000".into(),
+                text: "Qingshan House stands.".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, vec![], vec![]).unwrap();
         let texts = candidates_texts(&result);
         let luo = result.iter().find(|r| r.source_text.contains("Luo"));
-        assert!(luo.is_some(), "Luo River should be kept (unknown prefix): {:?}", texts);
+        assert!(
+            luo.is_some(),
+            "Luo River should be kept (unknown prefix): {:?}",
+            texts
+        );
         let qianzhang = result.iter().find(|r| r.source_text.contains("Qianzhang"));
-        assert!(qianzhang.is_some(), "Qianzhang Lake should be kept (unknown prefix): {:?}", texts);
-        let snow = result.iter().find(|r| r.source_text.contains("Snow Region"));
-        assert!(snow.is_some(), "Snow Region Tribe should be kept (unknown prefix): {:?}", texts);
+        assert!(
+            qianzhang.is_some(),
+            "Qianzhang Lake should be kept (unknown prefix): {:?}",
+            texts
+        );
+        let snow = result
+            .iter()
+            .find(|r| r.source_text.contains("Snow Region"));
+        assert!(
+            snow.is_some(),
+            "Snow Region Tribe should be kept (unknown prefix): {:?}",
+            texts
+        );
         let qingshan = result.iter().find(|r| r.source_text.contains("Qingshan"));
-        assert!(qingshan.is_some(), "Qingshan House should be kept (unknown prefix): {:?}", texts);
+        assert!(
+            qingshan.is_some(),
+            "Qingshan House should be kept (unknown prefix): {:?}",
+            texts
+        );
     }
 
     #[test]
     fn test_dedup_normalization_matches_variants() {
         // "Biantang" in glossary should match "Bian Tang" in SRT
-        let glossary = vec![
-            GlossaryEntry {
-                source: "Biantang".into(), target: "卞唐".into(), entry_type: "place".into(),
-                notes: None, aliases: vec![], status: None, confidence: None, evidence_urls: None,
-            },
-        ];
+        let glossary = vec![GlossaryEntry {
+            source: "Biantang".into(),
+            target: "卞唐".into(),
+            entry_type: "place".into(),
+            notes: None,
+            aliases: vec![],
+            status: None,
+            confidence: None,
+            evidence_urls: None,
+        }];
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "Bian Tang is far.".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Bian Tang City walls.".into() },
-            SubtitleEntry { index: 3, start: "00:00:05,000".into(), end: "00:00:06,000".into(), text: "Crown Prince of Biantang".into() },
-            SubtitleEntry { index: 4, start: "00:00:07,000".into(), end: "00:00:08,000".into(), text: "Crown Prince of Bian Tang".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "Bian Tang is far.".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "Bian Tang City walls.".into(),
+            },
+            SubtitleEntry {
+                index: 3,
+                start: "00:00:05,000".into(),
+                end: "00:00:06,000".into(),
+                text: "Crown Prince of Biantang".into(),
+            },
+            SubtitleEntry {
+                index: 4,
+                start: "00:00:07,000".into(),
+                end: "00:00:08,000".into(),
+                text: "Crown Prince of Bian Tang".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, vec![], glossary).unwrap();
         let texts = candidates_texts(&result);
-        assert!(!texts.iter().any(|t| t.to_lowercase().contains("bian tang")),
-            "Bian Tang should be excluded (dedup-match known): {:?}", texts);
-        assert!(!texts.iter().any(|t| t.to_lowercase().contains("biantang")),
-            "Biantang should be excluded: {:?}", texts);
-        assert!(!texts.iter().any(|t| t.contains("Crown Prince")),
-            "Crown Prince phrases should be excluded: {:?}", texts);
+        assert!(
+            !texts.iter().any(|t| t.to_lowercase().contains("bian tang")),
+            "Bian Tang should be excluded (dedup-match known): {:?}",
+            texts
+        );
+        assert!(
+            !texts.iter().any(|t| t.to_lowercase().contains("biantang")),
+            "Biantang should be excluded: {:?}",
+            texts
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("Crown Prince")),
+            "Crown Prince phrases should be excluded: {:?}",
+            texts
+        );
     }
 
     #[test]
     fn test_comma_the_fragment_stripped() {
         // "General Huan, the" should yield "General Huan", not "the"
         let entries = vec![
-            SubtitleEntry { index: 1, start: "00:00:01,000".into(), end: "00:00:02,000".into(), text: "General Huan, the".into() },
-            SubtitleEntry { index: 2, start: "00:00:03,000".into(), end: "00:00:04,000".into(), text: "Chun Er, the".into() },
-            SubtitleEntry { index: 3, start: "00:00:05,000".into(), end: "00:00:06,000".into(), text: "General Huan, the leader".into() },
-            SubtitleEntry { index: 4, start: "00:00:07,000".into(), end: "00:00:08,000".into(), text: "Chun Er, the girl".into() },
+            SubtitleEntry {
+                index: 1,
+                start: "00:00:01,000".into(),
+                end: "00:00:02,000".into(),
+                text: "General Huan, the".into(),
+            },
+            SubtitleEntry {
+                index: 2,
+                start: "00:00:03,000".into(),
+                end: "00:00:04,000".into(),
+                text: "Chun Er, the".into(),
+            },
+            SubtitleEntry {
+                index: 3,
+                start: "00:00:05,000".into(),
+                end: "00:00:06,000".into(),
+                text: "General Huan, the leader".into(),
+            },
+            SubtitleEntry {
+                index: 4,
+                start: "00:00:07,000".into(),
+                end: "00:00:08,000".into(),
+                text: "Chun Er, the girl".into(),
+            },
         ];
         let result = extract_srt_body_candidates(entries, vec![], vec![]).unwrap();
         let texts = candidates_texts(&result);
         // "the" fragment should never appear as a standalone candidate
-        assert!(!texts.iter().any(|t| t.eq_ignore_ascii_case("the")),
-            "'the' should not appear as candidate: {:?}", texts);
+        assert!(
+            !texts.iter().any(|t| t.eq_ignore_ascii_case("the")),
+            "'the' should not appear as candidate: {:?}",
+            texts
+        );
         // The actual names should survive
         let huan = result.iter().find(|r| r.source_text == "General Huan");
         assert!(huan.is_some(), "General Huan should be kept: {:?}", texts);
@@ -3824,7 +5909,9 @@ mod tests {
         // Japanese text with kana
         assert!(!is_likely_chinese("これは日本語の文章です。このドラマは古代中国を舞台に、主人公の成長を描いた物語である。"));
         // Chinese text (no kana, many CJK)
-        assert!(is_likely_chinese("这是一部关于古代中国宫廷斗争的电视剧。主角从小成长，最终成为了一代女将军。"));
+        assert!(is_likely_chinese(
+            "这是一部关于古代中国宫廷斗争的电视剧。主角从小成长，最终成为了一代女将军。"
+        ));
         // Short text (too few CJK to determine)
         assert!(!is_likely_chinese("楚喬"));
         // English text (no CJK)
@@ -3927,7 +6014,10 @@ mod tests {
         let known = build_known_names_set(&[], &glossary);
         let mut terms = vec![make_unresolved("Crown Prince of Biantang")];
         filter_synopsis_terms_by_known_names(&mut terms, &known);
-        assert!(terms.is_empty(), "Crown Prince of Biantang should be filtered (title+known)");
+        assert!(
+            terms.is_empty(),
+            "Crown Prince of Biantang should be filtered (title+known)"
+        );
     }
 
     #[test]
@@ -3936,7 +6026,10 @@ mod tests {
         let known = build_known_names_set(&[], &glossary);
         let mut terms = vec![make_unresolved("Yanbei City")];
         filter_synopsis_terms_by_known_names(&mut terms, &known);
-        assert!(terms.is_empty(), "Yanbei City should be filtered (known place+suffix)");
+        assert!(
+            terms.is_empty(),
+            "Yanbei City should be filtered (known place+suffix)"
+        );
     }
 
     #[test]
@@ -3945,7 +6038,10 @@ mod tests {
         let known = build_known_names_set(&[], &glossary);
         let mut terms = vec![make_unresolved("Defend Yanbei")];
         filter_synopsis_terms_by_known_names(&mut terms, &known);
-        assert!(terms.is_empty(), "Defend Yanbei should be filtered (verb+known)");
+        assert!(
+            terms.is_empty(),
+            "Defend Yanbei should be filtered (verb+known)"
+        );
     }
 
     #[test]
@@ -3963,7 +6059,11 @@ mod tests {
         let known = build_known_names_set(&[], &glossary);
         let mut terms = vec![make_unresolved("Lady Helian")];
         filter_synopsis_terms_by_known_names(&mut terms, &known);
-        assert_eq!(terms.len(), 1, "Lady Helian should be kept (unknown name under title)");
+        assert_eq!(
+            terms.len(),
+            1,
+            "Lady Helian should be kept (unknown name under title)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3995,37 +6095,35 @@ mod tests {
     #[test]
     fn test_validate_variants_removes_different_concepts() {
         // "Great Yong" (greatyong) vs "Yong Army" (yongarmy) — different dedup keys
-        let mut groups = vec![
-            make_variant_group(vec!["Great Yong", "Yong Army"]),
-        ];
+        let mut groups = vec![make_variant_group(vec!["Great Yong", "Yong Army"])];
         validate_term_variants(&mut groups);
-        assert!(groups.is_empty(), "Great Yong vs Yong Army should be removed as variant group (different dedup keys)");
+        assert!(
+            groups.is_empty(),
+            "Great Yong vs Yong Army should be removed as variant group (different dedup keys)"
+        );
     }
 
     #[test]
     fn test_validate_variants_removes_different_armies() {
         // "Black Eagle Army" (blackeaglearmy) vs "Yan Army" (yanarmy) — different dedup keys
-        let mut groups = vec![
-            make_variant_group(vec!["Black Eagle Army", "Yan Army"]),
-        ];
+        let mut groups = vec![make_variant_group(vec!["Black Eagle Army", "Yan Army"])];
         validate_term_variants(&mut groups);
-        assert!(groups.is_empty(), "Black Eagle Army vs Yan Army should be removed (independent forces)");
+        assert!(
+            groups.is_empty(),
+            "Black Eagle Army vs Yan Army should be removed (independent forces)"
+        );
     }
 
     #[test]
     fn test_validate_variants_keeps_single_variant() {
-        let mut groups = vec![
-            make_variant_group(vec!["Some Solo Term"]),
-        ];
+        let mut groups = vec![make_variant_group(vec!["Some Solo Term"])];
         validate_term_variants(&mut groups);
         assert_eq!(groups.len(), 1, "Single-variant groups should be kept");
     }
 
     #[test]
     fn test_validate_variants_removes_empty_group() {
-        let mut groups = vec![
-            make_variant_group(vec!["", ""]),
-        ];
+        let mut groups = vec![make_variant_group(vec!["", ""])];
         validate_term_variants(&mut groups);
         assert!(groups.is_empty(), "Empty variant keys should be removed");
     }
@@ -4053,86 +6151,104 @@ mod tests {
     #[test]
     fn test_replace_guessed_kanji_standalone() {
         let mut syn = "楚喬は目を負傷し、火屠水で治療を受ける。".to_string();
-        let terms = vec![
-            make_term_with_surface("Huotu Water", "火屠水"),
-        ];
+        let terms = vec![make_term_with_surface("Huotu Water", "火屠水")];
         replace_guessed_terms_in_synopsis(&mut syn, &terms);
         assert!(!syn.contains("火屠水"), "Guessed kanji should be replaced");
-        assert!(syn.contains("Huotu Water"), "English source_text should remain");
+        assert!(
+            syn.contains("Huotu Water"),
+            "English source_text should remain"
+        );
     }
 
     #[test]
     fn test_replace_guessed_kanji_with_parenthetical() {
         let mut syn = "火屠水（フオトゥ・ウォーター）で治療する。".to_string();
-        let terms = vec![
-            make_term_with_surface("Huotu Water", "火屠水"),
-        ];
+        let terms = vec![make_term_with_surface("Huotu Water", "火屠水")];
         replace_guessed_terms_in_synopsis(&mut syn, &terms);
-        assert!(!syn.contains("火屠水"), "Parenthetical kanji should be removed");
-        assert!(!syn.contains("フオトゥ"), "Parenthetical katakana should be removed");
-        assert!(syn.contains("Huotu Water"), "Should be replaced with English source");
+        assert!(
+            !syn.contains("火屠水"),
+            "Parenthetical kanji should be removed"
+        );
+        assert!(
+            !syn.contains("フオトゥ"),
+            "Parenthetical katakana should be removed"
+        );
+        assert!(
+            syn.contains("Huotu Water"),
+            "Should be replaced with English source"
+        );
     }
 
     #[test]
     fn test_replace_guessed_katakana() {
         let mut syn = "カ・トゥオが率いる部族が反乱を起こす。".to_string();
-        let terms = vec![
-            make_term_with_surface("Ka Tuo", "カ・トゥオ"),
-        ];
+        let terms = vec![make_term_with_surface("Ka Tuo", "カ・トゥオ")];
         replace_guessed_terms_in_synopsis(&mut syn, &terms);
-        assert!(!syn.contains("カ・トゥオ"), "Guessed katakana should be removed");
+        assert!(
+            !syn.contains("カ・トゥオ"),
+            "Guessed katakana should be removed"
+        );
         assert!(syn.contains("Ka Tuo"), "English should remain");
     }
 
     #[test]
     fn test_replace_guessed_does_not_touch_known_kanji() {
         let mut syn = "楚喬は目を負傷し、李策が治療する。".to_string();
-        let terms = vec![
-            make_term_with_surface("Huotu Water", "火屠水"),
-        ];
+        let terms = vec![make_term_with_surface("Huotu Water", "火屠水")];
         replace_guessed_terms_in_synopsis(&mut syn, &terms);
-        assert!(syn.contains("楚喬"), "Known kanji in dictionary should not be touched");
-        assert!(syn.contains("李策"), "Known kanji in dictionary should not be touched");
+        assert!(
+            syn.contains("楚喬"),
+            "Known kanji in dictionary should not be touched"
+        );
+        assert!(
+            syn.contains("李策"),
+            "Known kanji in dictionary should not be touched"
+        );
     }
 
     #[test]
     fn test_replace_guessed_empty_surface_skipped() {
         let original = "楚喬はHuotu Waterで治療を受ける。".to_string();
         let mut syn = original.clone();
-        let terms = vec![
-            make_term_with_surface("Huotu Water", ""),
-        ];
+        let terms = vec![make_term_with_surface("Huotu Water", "")];
         replace_guessed_terms_in_synopsis(&mut syn, &terms);
-        assert_eq!(syn, original, "Empty surface_ja should leave synopsis unchanged");
+        assert_eq!(
+            syn, original,
+            "Empty surface_ja should leave synopsis unchanged"
+        );
     }
 
     // --- validate_term_variants self-duplicate tests ---
 
     #[test]
     fn test_validate_variants_removes_self_duplicates() {
-        let mut groups = vec![
-            make_variant_group(vec!["Huotu Water", "Huotu Water"]),
-        ];
+        let mut groups = vec![make_variant_group(vec!["Huotu Water", "Huotu Water"])];
         validate_term_variants(&mut groups);
-        assert!(groups.is_empty(), "Self-duplicate variants (identical strings) should be removed");
+        assert!(
+            groups.is_empty(),
+            "Self-duplicate variants (identical strings) should be removed"
+        );
     }
 
     #[test]
     fn test_validate_variants_removes_self_duplicates_three() {
-        let mut groups = vec![
-            make_variant_group(vec!["Yue Qi", "Yue Qi", "Yue Qi"]),
-        ];
+        let mut groups = vec![make_variant_group(vec!["Yue Qi", "Yue Qi", "Yue Qi"])];
         validate_term_variants(&mut groups);
-        assert!(groups.is_empty(), "Three identical strings should be removed as self-duplicate");
+        assert!(
+            groups.is_empty(),
+            "Three identical strings should be removed as self-duplicate"
+        );
     }
 
     #[test]
     fn test_validate_variants_keeps_different_strings_same_dedup() {
-        let mut groups = vec![
-            make_variant_group(vec!["Yue Qi", "YueQi"]),
-        ];
+        let mut groups = vec![make_variant_group(vec!["Yue Qi", "YueQi"])];
         validate_term_variants(&mut groups);
-        assert_eq!(groups.len(), 1, "Different display strings with same dedup key should be kept");
+        assert_eq!(
+            groups.len(),
+            1,
+            "Different display strings with same dedup key should be kept"
+        );
     }
 
     // ---- generate_search_aliases tests ----
@@ -4142,7 +6258,10 @@ mod tests {
         let (search_text, generic_suffix, aliases) = generate_search_aliases("Zhenhuang City");
         assert_eq!(search_text, Some("Zhenhuang".to_string()));
         assert_eq!(generic_suffix, Some("City".to_string()));
-        assert_eq!(aliases, Some(vec!["Zhenhuang City".to_string(), "Zhenhuang".to_string()]));
+        assert_eq!(
+            aliases,
+            Some(vec!["Zhenhuang City".to_string(), "Zhenhuang".to_string()])
+        );
     }
 
     #[test]
@@ -4160,7 +6279,13 @@ mod tests {
         let (search_text, generic_suffix, aliases) = generate_search_aliases("Black Eagle Army");
         assert_eq!(search_text, Some("Black Eagle".to_string()));
         assert_eq!(generic_suffix, Some("Army".to_string()));
-        assert_eq!(aliases, Some(vec!["Black Eagle Army".to_string(), "Black Eagle".to_string()]));
+        assert_eq!(
+            aliases,
+            Some(vec![
+                "Black Eagle Army".to_string(),
+                "Black Eagle".to_string()
+            ])
+        );
     }
 
     #[test]
@@ -4169,7 +6294,13 @@ mod tests {
         let (search_text, generic_suffix, aliases) = generate_search_aliases("Snow Region Tribe");
         assert_eq!(search_text, Some("Snow Region".to_string()));
         assert_eq!(generic_suffix, Some("Tribe".to_string()));
-        assert_eq!(aliases, Some(vec!["Snow Region Tribe".to_string(), "Snow Region".to_string()]));
+        assert_eq!(
+            aliases,
+            Some(vec![
+                "Snow Region Tribe".to_string(),
+                "Snow Region".to_string()
+            ])
+        );
     }
 
     #[test]
@@ -4177,50 +6308,105 @@ mod tests {
         let (search_text, generic_suffix, aliases) = generate_search_aliases("Qianzhang Lake");
         assert_eq!(search_text, Some("Qianzhang".to_string()));
         assert_eq!(generic_suffix, Some("Lake".to_string()));
-        assert_eq!(aliases, Some(vec!["Qianzhang Lake".to_string(), "Qianzhang".to_string()]));
+        assert_eq!(
+            aliases,
+            Some(vec!["Qianzhang Lake".to_string(), "Qianzhang".to_string()])
+        );
     }
 
     #[test]
     fn test_possessive_split_king_of() {
         let (_, _, aliases) = generate_search_aliases("Yanbei's King of Zhenxiao");
         let a = aliases.unwrap();
-        assert!(a.contains(&"Yanbei".to_string()), "should contain Yanbei: {:?}", a);
-        assert!(a.contains(&"King of Zhenxiao".to_string()), "should contain King of Zhenxiao: {:?}", a);
-        assert!(a.contains(&"Zhenxiao".to_string()), "should contain Zhenxiao: {:?}", a);
-        assert!(a[0] == "Yanbei's King of Zhenxiao", "first alias must be source_text");
+        assert!(
+            a.contains(&"Yanbei".to_string()),
+            "should contain Yanbei: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"King of Zhenxiao".to_string()),
+            "should contain King of Zhenxiao: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"Zhenxiao".to_string()),
+            "should contain Zhenxiao: {:?}",
+            a
+        );
+        assert!(
+            a[0] == "Yanbei's King of Zhenxiao",
+            "first alias must be source_text"
+        );
     }
 
     #[test]
     fn test_possessive_split_ancestral_temple() {
-        let (_, _, aliases) = generate_search_aliases("Shengjin Palace's Chengguang Ancestral Temple");
+        let (_, _, aliases) =
+            generate_search_aliases("Shengjin Palace's Chengguang Ancestral Temple");
         let a = aliases.unwrap();
-        assert!(a.contains(&"Shengjin Palace".to_string()), "should contain Shengjin Palace: {:?}", a);
-        assert!(a.contains(&"Chengguang Ancestral Temple".to_string()), "should contain Chengguang Ancestral Temple: {:?}", a);
-        assert!(a.contains(&"Chengguang".to_string()), "should contain Chengguang: {:?}", a);
+        assert!(
+            a.contains(&"Shengjin Palace".to_string()),
+            "should contain Shengjin Palace: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"Chengguang Ancestral Temple".to_string()),
+            "should contain Chengguang Ancestral Temple: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"Chengguang".to_string()),
+            "should contain Chengguang: {:?}",
+            a
+        );
     }
 
     #[test]
     fn test_possessive_split_northwest_army() {
         let (_, _, aliases) = generate_search_aliases("Great Yong's Northwest Army");
         let a = aliases.unwrap();
-        assert!(a.contains(&"Great Yong".to_string()), "should contain Great Yong: {:?}", a);
-        assert!(a.contains(&"Northwest Army".to_string()), "should contain Northwest Army: {:?}", a);
+        assert!(
+            a.contains(&"Great Yong".to_string()),
+            "should contain Great Yong: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"Northwest Army".to_string()),
+            "should contain Northwest Army: {:?}",
+            a
+        );
     }
 
     #[test]
     fn test_possessive_split_wall_suffix() {
         let (_, _, aliases) = generate_search_aliases("Yanbei's Xun Lie Wall");
         let a = aliases.unwrap();
-        assert!(a.contains(&"Yanbei".to_string()), "should contain Yanbei: {:?}", a);
-        assert!(a.contains(&"Xun Lie Wall".to_string()), "should contain Xun Lie Wall: {:?}", a);
-        assert!(a.contains(&"Xun Lie".to_string()), "should contain Xun Lie: {:?}", a);
+        assert!(
+            a.contains(&"Yanbei".to_string()),
+            "should contain Yanbei: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"Xun Lie Wall".to_string()),
+            "should contain Xun Lie Wall: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"Xun Lie".to_string()),
+            "should contain Xun Lie: {:?}",
+            a
+        );
     }
 
     #[test]
     fn test_leading_title_emperor() {
         let (_, _, aliases) = generate_search_aliases("Emperor Pei Luo");
         let a = aliases.unwrap();
-        assert!(a.contains(&"Pei Luo".to_string()), "should contain Pei Luo: {:?}", a);
+        assert!(
+            a.contains(&"Pei Luo".to_string()),
+            "should contain Pei Luo: {:?}",
+            a
+        );
     }
 
     #[test]
@@ -4228,7 +6414,10 @@ mod tests {
         // "Emperor Pei" — only 1 word after title → no decomposition produced,
         // source_text only → sanitize returns None (nothing useful to search)
         let (_, _, aliases) = generate_search_aliases("Emperor Pei");
-        assert!(aliases.is_none(), "no extra search hints for single-word remainder");
+        assert!(
+            aliases.is_none(),
+            "no extra search hints for single-word remainder"
+        );
     }
 
     #[test]
@@ -4236,17 +6425,33 @@ mod tests {
         let (search_text, generic_suffix, aliases) = generate_search_aliases("Ka Tuo");
         assert_eq!(search_text, None);
         assert_eq!(generic_suffix, None);
-        assert_eq!(aliases, None, "no aliases for plain proper noun with no suffix/possessive");
+        assert_eq!(
+            aliases, None,
+            "no aliases for plain proper noun with no suffix/possessive"
+        );
     }
 
     #[test]
     fn test_curly_apostrophe_decomposition() {
         // \u{2019} = '
-        let (_, _, aliases) = generate_search_aliases("Shengjin Palace\u{2019}s Chengguang Ancestral Temple");
+        let (_, _, aliases) =
+            generate_search_aliases("Shengjin Palace\u{2019}s Chengguang Ancestral Temple");
         let a = aliases.unwrap();
-        assert!(a.contains(&"Shengjin Palace".to_string()), "should contain Shengjin Palace: {:?}", a);
-        assert!(a.contains(&"Chengguang Ancestral Temple".to_string()), "should contain Chengguang Ancestral Temple: {:?}", a);
-        assert!(a.contains(&"Chengguang".to_string()), "should contain Chengguang: {:?}", a);
+        assert!(
+            a.contains(&"Shengjin Palace".to_string()),
+            "should contain Shengjin Palace: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"Chengguang Ancestral Temple".to_string()),
+            "should contain Chengguang Ancestral Temple: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"Chengguang".to_string()),
+            "should contain Chengguang: {:?}",
+            a
+        );
     }
 
     #[test]
@@ -4254,19 +6459,47 @@ mod tests {
         // "Emperor Pei Luo's" → aliases should include "Emperor Pei Luo" and "Pei Luo"
         let (_, _, aliases) = generate_search_aliases("Emperor Pei Luo\u{2019}s");
         let a = aliases.unwrap();
-        assert!(a[0] == "Emperor Pei Luo\u{2019}s", "first alias must be original source_text");
-        assert!(a.contains(&"Emperor Pei Luo".to_string()), "should contain trailing-stripped: {:?}", a);
-        assert!(a.contains(&"Pei Luo".to_string()), "should contain title-stripped: {:?}", a);
+        assert!(
+            a[0] == "Emperor Pei Luo\u{2019}s",
+            "first alias must be original source_text"
+        );
+        assert!(
+            a.contains(&"Emperor Pei Luo".to_string()),
+            "should contain trailing-stripped: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"Pei Luo".to_string()),
+            "should contain title-stripped: {:?}",
+            a
+        );
     }
 
     #[test]
     fn test_grand_marshal_decomposition() {
-        let (_, _, aliases) = generate_search_aliases("Great Yong\u{2019}s Northwest Army Grand Marshal");
+        let (_, _, aliases) =
+            generate_search_aliases("Great Yong\u{2019}s Northwest Army Grand Marshal");
         let a = aliases.unwrap();
-        assert!(a.contains(&"Great Yong".to_string()), "should contain Great Yong: {:?}", a);
-        assert!(a.contains(&"Northwest Army Grand Marshal".to_string()), "should contain Northwest Army Grand Marshal: {:?}", a);
-        assert!(a.contains(&"Northwest Army".to_string()), "should contain Northwest Army: {:?}", a);
-        assert!(a.contains(&"Grand Marshal".to_string()), "should contain Grand Marshal: {:?}", a);
+        assert!(
+            a.contains(&"Great Yong".to_string()),
+            "should contain Great Yong: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"Northwest Army Grand Marshal".to_string()),
+            "should contain Northwest Army Grand Marshal: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"Northwest Army".to_string()),
+            "should contain Northwest Army: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"Grand Marshal".to_string()),
+            "should contain Grand Marshal: {:?}",
+            a
+        );
     }
 
     #[test]
@@ -4285,19 +6518,28 @@ mod tests {
     fn test_false_positive_contraction_curly() {
         // I\u{2019}m = I'm with curly apostrophe
         let (_, _, aliases) = generate_search_aliases("I\u{2019}m");
-        assert!(aliases.is_none(), "I'm (curly) should produce no search aliases");
+        assert!(
+            aliases.is_none(),
+            "I'm (curly) should produce no search aliases"
+        );
     }
 
     #[test]
     fn test_false_positive_master_standalone() {
         let (_, _, aliases) = generate_search_aliases("Master");
-        assert!(aliases.is_none(), "Master standalone should produce no search aliases");
+        assert!(
+            aliases.is_none(),
+            "Master standalone should produce no search aliases"
+        );
     }
 
     #[test]
     fn test_false_positive_your_highness() {
         let (_, _, aliases) = generate_search_aliases("Your Highness");
-        assert!(aliases.is_none(), "Your Highness should produce no search aliases");
+        assert!(
+            aliases.is_none(),
+            "Your Highness should produce no search aliases"
+        );
     }
 
     #[test]
@@ -4308,22 +6550,239 @@ mod tests {
     }
 
     #[test]
+    fn test_false_positive_but_im() {
+        let (_, _, aliases) = generate_search_aliases("But I'm");
+        assert!(
+            aliases.is_none(),
+            "But I'm should produce no search aliases"
+        );
+    }
+
+    #[test]
+    fn test_false_positive_and_ill() {
+        let (_, _, aliases) = generate_search_aliases("And I'll");
+        assert!(
+            aliases.is_none(),
+            "And I'll should produce no search aliases"
+        );
+    }
+
+    #[test]
+    fn test_false_positive_so_youre() {
+        let (_, _, aliases) = generate_search_aliases("So You're");
+        assert!(
+            aliases.is_none(),
+            "So You're should produce no search aliases"
+        );
+    }
+
+    #[test]
+    fn test_false_positive_this_is() {
+        let (_, _, aliases) = generate_search_aliases("This is");
+        assert!(
+            aliases.is_none(),
+            "This is should produce no search aliases"
+        );
+    }
+
+    #[test]
+    fn test_false_positive_there_is() {
+        let (_, _, aliases) = generate_search_aliases("There is");
+        assert!(
+            aliases.is_none(),
+            "There is should produce no search aliases"
+        );
+    }
+
+    #[test]
+    fn test_false_positive_you_are() {
+        let (_, _, aliases) = generate_search_aliases("You are");
+        assert!(
+            aliases.is_none(),
+            "You are should produce no search aliases"
+        );
+    }
+
+    #[test]
+    fn test_false_positive_curly_but_im() {
+        let (_, _, aliases) = generate_search_aliases("But I\u{2019}m");
+        assert!(
+            aliases.is_none(),
+            "But I'm (curly) should produce no search aliases"
+        );
+    }
+
+    #[test]
+    fn test_false_positive_does_not_affect_known_term() {
+        // Known proper noun containing "is" should not be blocked
+        assert!(!is_false_positive_unresolved("Gelin tribe"));
+        assert!(!is_false_positive_unresolved("Huotu Water"));
+    }
+
+    // -----------------------------------------------------------------------
+    // cleanup_unresolved_candidate / strip_leading_noise / is_valid_replacement
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cleanup_unresolved_candidate_drop_contraction() {
+        assert_eq!(cleanup_unresolved_candidate("I'll"), None);
+        assert_eq!(cleanup_unresolved_candidate("I\u{2019}ll"), None);
+        assert_eq!(cleanup_unresolved_candidate("I'm"), None);
+        assert_eq!(cleanup_unresolved_candidate("Don't"), None);
+    }
+
+    #[test]
+    fn test_cleanup_unresolved_candidate_drop_generic_title() {
+        assert_eq!(cleanup_unresolved_candidate("Shopkeeper"), None);
+        assert_eq!(cleanup_unresolved_candidate("Innkeeper"), None);
+    }
+
+    #[test]
+    fn test_cleanup_unresolved_candidate_drop_contraction_fragment() {
+        // "I'll go" → "go" is invalid replacement → drop
+        assert_eq!(cleanup_unresolved_candidate("I'll go"), None);
+    }
+
+    #[test]
+    fn test_cleanup_unresolved_candidate_replace() {
+        assert_eq!(
+            cleanup_unresolved_candidate("I'm A'Chu"),
+            Some("A'Chu".to_string())
+        );
+        assert_eq!(
+            cleanup_unresolved_candidate("When Snow Region"),
+            Some("Snow Region".to_string())
+        );
+        assert_eq!(
+            cleanup_unresolved_candidate("But Yanbei City"),
+            Some("Yanbei City".to_string())
+        );
+        assert_eq!(
+            cleanup_unresolved_candidate("So A'Su"),
+            Some("A'Su".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cleanup_unresolved_candidate_keep() {
+        assert_eq!(
+            cleanup_unresolved_candidate("Yingge Courtyard"),
+            Some("Yingge Courtyard".to_string())
+        );
+        assert_eq!(
+            cleanup_unresolved_candidate("Zhigu Herb"),
+            Some("Zhigu Herb".to_string())
+        );
+        assert_eq!(
+            cleanup_unresolved_candidate("A'Su"),
+            Some("A'Su".to_string())
+        );
+        assert_eq!(
+            cleanup_unresolved_candidate("Muhe Xi Feng"),
+            Some("Muhe Xi Feng".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cleanup_unresolved_candidate_shopkeeper_with_name_kept() {
+        assert_eq!(
+            cleanup_unresolved_candidate("Shopkeeper Wang"),
+            Some("Shopkeeper Wang".to_string())
+        );
+    }
+
+    #[test]
+    fn test_strip_leading_noise_basic() {
+        assert_eq!(
+            strip_leading_noise("I'm A'Chu"),
+            Some("A'Chu".to_string())
+        );
+        assert_eq!(
+            strip_leading_noise("When Snow Region"),
+            Some("Snow Region".to_string())
+        );
+        assert_eq!(strip_leading_noise("A'Chu"), None);
+    }
+
+    #[test]
+    fn test_is_valid_replacement_candidate() {
+        assert!(is_valid_replacement_candidate("A'Chu"));
+        assert!(is_valid_replacement_candidate("Snow Region"));
+        assert!(!is_valid_replacement_candidate("go"));
+        assert!(!is_valid_replacement_candidate("Shopkeeper"));
+    }
+
+    #[test]
+    fn test_cleanup_sentence_boundary_young_master_huai() {
+        assert_eq!(
+            cleanup_unresolved_candidate("Young Master Huai. Please"),
+            Some("Young Master Huai".to_string())
+        );
+    }
+
+    #[test]
+    fn test_false_positive_standalone_title_phrases() {
+        assert!(is_false_positive_unresolved("Crown Prince"));
+        assert!(is_false_positive_unresolved("Young Master"));
+        assert!(is_false_positive_unresolved("Commander"));
+        assert!(is_false_positive_unresolved("Shopkeeper"));
+    }
+
+    #[test]
+    fn test_title_plus_name_survives() {
+        assert_eq!(
+            cleanup_unresolved_candidate("Lord Tu Mu"),
+            Some("Lord Tu Mu".to_string())
+        );
+        assert_eq!(
+            cleanup_unresolved_candidate("Lord Huo Sang"),
+            Some("Lord Huo Sang".to_string())
+        );
+        assert_eq!(
+            cleanup_unresolved_candidate("Commander Chen"),
+            Some("Commander Chen".to_string())
+        );
+        assert_eq!(
+            cleanup_unresolved_candidate("Young Master Huai"),
+            Some("Young Master Huai".to_string())
+        );
+    }
+
+    #[test]
+    fn test_looks_like_title_like_prose_phrase() {
+        assert!(looks_like_title_like_prose_phrase("Blood on the Snow"));
+        assert!(!looks_like_title_like_prose_phrase("Snow Region"));
+        assert!(!looks_like_title_like_prose_phrase("Yingge Courtyard"));
+    }
+
+    #[test]
     fn test_suffix_stripping_rejects_possessive_remnant() {
-        let (search_text, _, aliases) = generate_search_aliases("Shengjin Palace's Chengguang Ancestral Temple");
+        let (search_text, _, aliases) =
+            generate_search_aliases("Shengjin Palace's Chengguang Ancestral Temple");
         assert!(aliases.is_some());
         let a = aliases.unwrap();
-        assert!(!a.contains(&"Shengjin Palace's Chengguang".to_string()),
-            "should NOT contain half-baked possessive remnant: {:?}", a);
-        assert_eq!(search_text, None, "search_text should be None for possessive phrases");
+        assert!(
+            !a.contains(&"Shengjin Palace's Chengguang".to_string()),
+            "should NOT contain half-baked possessive remnant: {:?}",
+            a
+        );
+        assert_eq!(
+            search_text, None,
+            "search_text should be None for possessive phrases"
+        );
     }
 
     #[test]
     fn test_grand_marshal_rejects_possessive_remnant() {
-        let (search_text, _, aliases) = generate_search_aliases("Great Yong\u{2019}s Northwest Army Grand Marshal");
+        let (search_text, _, aliases) =
+            generate_search_aliases("Great Yong\u{2019}s Northwest Army Grand Marshal");
         assert!(aliases.is_some());
         let a = aliases.unwrap();
-        assert!(!a.contains(&"Great Yong's Northwest Army".to_string()),
-            "should NOT contain half-baked remnant: {:?}", a);
+        assert!(
+            !a.contains(&"Great Yong's Northwest Army".to_string()),
+            "should NOT contain half-baked remnant: {:?}",
+            a
+        );
         assert_eq!(search_text, None);
     }
 
@@ -4349,7 +6808,10 @@ mod tests {
         // "Zhenhuang" is NOT generic → kept with full source_text
         let input = vec!["Zhenhuang City".to_string(), "Zhenhuang".to_string()];
         let result = sanitize_search_aliases(&input);
-        assert_eq!(result, vec!["Zhenhuang City".to_string(), "Zhenhuang".to_string()]);
+        assert_eq!(
+            result,
+            vec!["Zhenhuang City".to_string(), "Zhenhuang".to_string()]
+        );
     }
 
     #[test]
@@ -4363,7 +6825,10 @@ mod tests {
         // "Black Eagle" is two words → passes even though "Black" alone is generic
         let input = vec!["Black Eagle Army".to_string(), "Black Eagle".to_string()];
         let result = sanitize_search_aliases(&input);
-        assert_eq!(result, vec!["Black Eagle Army".to_string(), "Black Eagle".to_string()]);
+        assert_eq!(
+            result,
+            vec!["Black Eagle Army".to_string(), "Black Eagle".to_string()]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4401,9 +6866,7 @@ mod tests {
 
     #[test]
     fn test_glossary_alias_replacement() {
-        let glossary = vec![
-            make_glossary_full("Ka Tuo", "卡托", vec!["カトウ"]),
-        ];
+        let glossary = vec![make_glossary_full("Ka Tuo", "卡托", vec!["カトウ"])];
         let input = "カトウが金暉部落を扇動する";
         let expected = "卡托が金暉部落を扇動する";
         assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
@@ -4412,9 +6875,7 @@ mod tests {
     #[test]
     fn test_romanized_source_generates_katakana_key() {
         // No stored aliases — must generate from source "Ka Tuo" → "カトウ"
-        let glossary = vec![
-            make_glossary_full("Ka Tuo", "卡托", vec![]),
-        ];
+        let glossary = vec![make_glossary_full("Ka Tuo", "卡托", vec![])];
         let input = "カトウが金暉部落を扇動する";
         let expected = "卡托が金暉部落を扇動する";
         assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
@@ -4446,9 +6907,7 @@ mod tests {
 
     #[test]
     fn test_source_text_direct_replacement() {
-        let glossary = vec![
-            make_glossary_full("Jinhui Tribe", "金暉部落", vec![]),
-        ];
+        let glossary = vec![make_glossary_full("Jinhui Tribe", "金暉部落", vec![])];
         // Direct English source match
         let input = "Jinhui Tribe warriors arrived.";
         let expected = "金暉部落 warriors arrived.";
@@ -4457,28 +6916,32 @@ mod tests {
 
     #[test]
     fn test_character_alias_replacement() {
-        let characters = vec![
-            make_character("Chu Qiao", "楚喬", vec!["チュウチャオ"]),
-        ];
+        let characters = vec![make_character("Chu Qiao", "楚喬", vec!["チュウチャオ"])];
         let input = "チュウチャオが戦う";
         let expected = "楚喬が戦う";
-        assert_eq!(resolve_known_terms_in_text(input, &characters, &[]), expected);
+        assert_eq!(
+            resolve_known_terms_in_text(input, &characters, &[]),
+            expected
+        );
     }
 
     #[test]
     fn test_character_english_name_variant() {
         // Qiao Qiao → 楚喬 via explicit character alias (e.g. from ChatGPT確認 or buildRoleAliases)
-        let chars_with_alias = vec![
-            make_character("Chu Qiao", "楚喬", vec!["Qiao Qiao", "QiaoQiao", "Qiao_Qiao"]),
-        ];
+        let chars_with_alias = vec![make_character(
+            "Chu Qiao",
+            "楚喬",
+            vec!["Qiao Qiao", "QiaoQiao", "Qiao_Qiao"],
+        )];
         let input = "Qiao Qiaoが李策に火荼水の出所を問う";
         let expected = "楚喬が李策に火荼水の出所を問う";
-        assert_eq!(resolve_known_terms_in_text(input, &chars_with_alias, &[]), expected);
+        assert_eq!(
+            resolve_known_terms_in_text(input, &chars_with_alias, &[]),
+            expected
+        );
 
         // Also works via glossary entry
-        let glossary = vec![
-            make_glossary_full("Qiao Qiao", "楚喬", vec![]),
-        ];
+        let glossary = vec![make_glossary_full("Qiao Qiao", "楚喬", vec![])];
         assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
     }
 
@@ -4488,22 +6951,33 @@ mod tests {
         // No explicit Qiao Qiao alias stored — the replacement map generates it from
         // English name variants (source 2b: space-stripped "ChuQiao", underscored "Chu_Qiao")
         // plus the repeated-given-name variants "Qiao Qiao"/"QiaoQiao"/"Qiao_Qiao" in aliases.
-        let characters = vec![
-            make_character("Chu Qiao", "楚喬", vec!["Qiao Qiao", "QiaoQiao", "Qiao_Qiao"]),
-        ];
+        let characters = vec![make_character(
+            "Chu Qiao",
+            "楚喬",
+            vec!["Qiao Qiao", "QiaoQiao", "Qiao_Qiao"],
+        )];
         let input = "Qiao Qiaoが李策に火荼水の出所を問う";
         let expected = "楚喬が李策に火荼水の出所を問う";
-        assert_eq!(resolve_known_terms_in_text(input, &characters, &[]), expected);
+        assert_eq!(
+            resolve_known_terms_in_text(input, &characters, &[]),
+            expected
+        );
 
         // QiaoQiao (space-stripped) also works
         let input_no_space = "QiaoQiaoが李策に火荼水の出所を問う";
         let expected_no_space = "楚喬が李策に火荼水の出所を問う";
-        assert_eq!(resolve_known_terms_in_text(input_no_space, &characters, &[]), expected_no_space);
+        assert_eq!(
+            resolve_known_terms_in_text(input_no_space, &characters, &[]),
+            expected_no_space
+        );
 
         // Qiao_Qiao (underscored) also works
         let input_under = "Qiao_Qiaoが李策に火荼水の出所を問う";
         let expected_under = "楚喬が李策に火荼水の出所を問う";
-        assert_eq!(resolve_known_terms_in_text(input_under, &characters, &[]), expected_under);
+        assert_eq!(
+            resolve_known_terms_in_text(input_under, &characters, &[]),
+            expected_under
+        );
     }
 
     #[test]
@@ -4511,16 +6985,24 @@ mod tests {
         let candidates = romanized_to_katakana_candidates("Ka Tuo");
         assert!(candidates.contains(&"カトウ".to_string()));
         assert!(candidates.contains(&"カ・トウ".to_string()));
-        assert!(candidates.contains(&"カトゥオ".to_string()), "expected カトゥオ for トゥ+オ decomposition");
-        assert!(candidates.contains(&"カ・トゥオ".to_string()), "expected カ・トゥオ for dot form with トゥ");
+        assert!(
+            candidates.contains(&"カトゥオ".to_string()),
+            "expected カトゥオ for トゥ+オ decomposition"
+        );
+        assert!(
+            candidates.contains(&"カ・トゥオ".to_string()),
+            "expected カ・トゥオ for dot form with トゥ"
+        );
     }
 
     #[test]
     fn test_resolve_known_terms_katou_to_ka_tuo() {
         // Regression: カトウ → 卡托 via glossary alias (existing behavior)
-        let glossary = vec![
-            make_glossary_full("Ka Tuo", "卡托", vec!["カトウ", "カ・トウ"]),
-        ];
+        let glossary = vec![make_glossary_full(
+            "Ka Tuo",
+            "卡托",
+            vec!["カトウ", "カ・トウ"],
+        )];
         let input = "カトウが反乱を起こす";
         let expected = "卡托が反乱を起こす";
         assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
@@ -4529,9 +7011,11 @@ mod tests {
     #[test]
     fn test_resolve_known_terms_katuo_to_ka_tuo() {
         // カトゥオ → 卡托 via glossary alias (new behavior from Pass C)
-        let glossary = vec![
-            make_glossary_full("Ka Tuo", "卡托", vec!["カトゥオ", "カ・トゥオ"]),
-        ];
+        let glossary = vec![make_glossary_full(
+            "Ka Tuo",
+            "卡托",
+            vec!["カトゥオ", "カ・トゥオ"],
+        )];
         let input = "カトゥオが金暉部落を扇動して反乱を起こす";
         let expected = "卡托が金暉部落を扇動して反乱を起こす";
         assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
@@ -4540,9 +7024,11 @@ mod tests {
     #[test]
     fn test_resolve_known_terms_katou_dot_to_ka_tuo() {
         // カ・トゥオ → 卡托 (dot form)
-        let glossary = vec![
-            make_glossary_full("Ka Tuo", "卡托", vec!["カトゥオ", "カ・トゥオ"]),
-        ];
+        let glossary = vec![make_glossary_full(
+            "Ka Tuo",
+            "卡托",
+            vec!["カトゥオ", "カ・トゥオ"],
+        )];
         let input = "カ・トゥオが到着した";
         let expected = "卡托が到着した";
         assert_eq!(resolve_known_terms_in_text(input, &[], &glossary), expected);
@@ -4581,8 +7067,11 @@ mod tests {
         let (_, _, aliases) = generate_search_aliases("King of Zhenxi");
         let a = aliases.unwrap();
         assert!(a.contains(&"King of Zhenxi".to_string()));
-        assert!(a.contains(&"Zhenxi".to_string()),
-            "should decompose 'King of X' → X: {:?}", a);
+        assert!(
+            a.contains(&"Zhenxi".to_string()),
+            "should decompose 'King of X' → X: {:?}",
+            a
+        );
     }
 
     #[test]
@@ -4630,10 +7119,16 @@ mod tests {
         assert_eq!(terms.len(), 1);
         assert_eq!(terms[0].source_text, "King of Zhenxi");
         let a = terms[0].aliases.as_ref().unwrap();
-        assert!(a.contains(&"Zhenxi".to_string()),
-            "aliases should include title-of core 'Zhenxi': {:?}", a);
-        assert!(terms[0].reason.contains("Yanbei"),
-            "reason should preserve derivation context: {:?}", terms[0].reason);
+        assert!(
+            a.contains(&"Zhenxi".to_string()),
+            "aliases should include title-of core 'Zhenxi': {:?}",
+            a
+        );
+        assert!(
+            terms[0].reason.contains("Yanbei"),
+            "reason should preserve derivation context: {:?}",
+            terms[0].reason
+        );
     }
 
     #[test]
@@ -4645,12 +7140,21 @@ mod tests {
         assert_eq!(terms.len(), 1);
         assert_eq!(terms[0].source_text, "Northwest Army Grand Marshal");
         let a = terms[0].aliases.as_ref().unwrap();
-        assert!(a.contains(&"Northwest Army Grand Marshal".to_string()),
-            "should keep the full target: {:?}", a);
-        assert!(a.contains(&"Northwest Army".to_string()),
-            "should decompose suffix: {:?}", a);
-        assert!(a.contains(&"Grand Marshal".to_string()),
-            "should emit multi-word suffix: {:?}", a);
+        assert!(
+            a.contains(&"Northwest Army Grand Marshal".to_string()),
+            "should keep the full target: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"Northwest Army".to_string()),
+            "should decompose suffix: {:?}",
+            a
+        );
+        assert!(
+            a.contains(&"Grand Marshal".to_string()),
+            "should emit multi-word suffix: {:?}",
+            a
+        );
     }
 
     #[test]
@@ -4663,7 +7167,11 @@ mod tests {
         set.insert("xunliewall".to_string());
         let mut terms = vec![make_test_term("Yanbei's Xun Lie Wall")];
         prune_possessive_terms(&mut terms, &set);
-        assert_eq!(terms.len(), 0, "term should be removed when owner and target are known");
+        assert_eq!(
+            terms.len(),
+            0,
+            "term should be removed when owner and target are known"
+        );
     }
 
     #[test]
@@ -4725,5 +7233,4 @@ mod tests {
     }
 
     // --- map_normalized_offset tests ---
-
 }

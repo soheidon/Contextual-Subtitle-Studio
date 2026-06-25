@@ -1,4 +1,4 @@
-use crate::scraper::{ScrapedCharacter, ScrapeResult, ScrapeSource};
+use crate::scraper::{ScrapeResult, ScrapeSource, ScrapedCharacter};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -141,7 +141,10 @@ impl MergedCharacter {
     pub fn from_mdl(c: &ScrapedCharacter, url: &str) -> Self {
         Self {
             match_status: MatchStatus::UnmatchedMdl,
-            english_name: FieldWithSource::new(Some(c.character_name.clone()), FieldSource::MyDramaList),
+            english_name: FieldWithSource::new(
+                Some(c.character_name.clone()),
+                FieldSource::MyDramaList,
+            ),
             chinese_name: FieldWithSource::unknown(None),
             japanese_name: FieldWithSource::unknown(String::new()),
             aliases: c.aliases.clone(),
@@ -155,7 +158,9 @@ impl MergedCharacter {
                 ..Default::default()
             },
             needs_review: true,
-            review_note: Some("中国語名が見つかりませんでした。手動で追加してください。".to_string()),
+            review_note: Some(
+                "中国語名が見つかりませんでした。手動で追加してください。".to_string(),
+            ),
             source_urls: vec![url.to_string()],
         }
     }
@@ -177,7 +182,9 @@ pub fn merge_from_results(
     let cn_meta = cn_meta_result.as_ref();
 
     // If we have no MDL, we have nothing to anchor on.
-    let mdl_chars: Vec<&ScrapedCharacter> = mdl.map(|r| r.characters.iter().collect()).unwrap_or_default();
+    let mdl_chars: Vec<&ScrapedCharacter> = mdl
+        .map(|r| r.characters.iter().collect())
+        .unwrap_or_default();
     if mdl_chars.is_empty() {
         return make_unmatched_cn(cn_cast, cn_meta);
     }
@@ -290,14 +297,8 @@ pub fn merge_from_results(
                 ),
                 japanese_name: FieldWithSource::unknown(String::new()),
                 aliases: cn_char.aliases.clone(),
-                actor_name: FieldWithSource::new(
-                    cn_char.actor_name.clone(),
-                    cn_source.clone(),
-                ),
-                role_type: FieldWithSource::new(
-                    cn_char.role_type.clone(),
-                    cn_source.clone(),
-                ),
+                actor_name: FieldWithSource::new(cn_char.actor_name.clone(), cn_source.clone()),
+                role_type: FieldWithSource::new(cn_char.role_type.clone(), cn_source.clone()),
                 gender: None,
                 confidence: 0.0,
                 match_reasons: vec![],
@@ -332,12 +333,20 @@ fn source_to_field(
     cn_meta: Option<&ScrapeResult>,
 ) -> FieldSource {
     if cn_cast
-        .map(|r| r.characters.iter().any(|c| c.source_id == cn_char.source_id))
+        .map(|r| {
+            r.characters
+                .iter()
+                .any(|c| c.source_id == cn_char.source_id)
+        })
         .unwrap_or(false)
     {
         FieldSource::TvMao
     } else if cn_meta
-        .map(|r| r.characters.iter().any(|c| c.source_id == cn_char.source_id))
+        .map(|r| {
+            r.characters
+                .iter()
+                .any(|c| c.source_id == cn_char.source_id)
+        })
         .unwrap_or(false)
     {
         FieldSource::Douban
@@ -411,10 +420,7 @@ fn make_unmatched_cn(
 // ---------------------------------------------------------------------------
 
 /// Compute a confidence score (0.0 - 1.0) and reasons for matching two characters.
-fn compute_match_confidence(
-    mdl: &ScrapedCharacter,
-    cn: &ScrapedCharacter,
-) -> (f64, Vec<String>) {
+fn compute_match_confidence(mdl: &ScrapedCharacter, cn: &ScrapedCharacter) -> (f64, Vec<String>) {
     let mut score = 0.0f64;
     let mut reasons = Vec::new();
 
@@ -444,9 +450,7 @@ fn compute_match_confidence(
 
     // 4. Alias cross-reference (medium: +0.05 per match)
     for alias in &mdl.aliases {
-        if cn.character_name.contains(alias.as_str())
-            || alias.as_str() == &cn.character_name
-        {
+        if cn.character_name.contains(alias.as_str()) || alias.as_str() == &cn.character_name {
             score += 0.05;
             reasons.push("alias_cross_reference".to_string());
             break;
@@ -469,12 +473,30 @@ fn actor_pinyin_match(english_name: &str, chinese_name: &str) -> bool {
 
     // Common surname pinyin -> Chinese character mappings
     let common_pinyin: Vec<(&str, &str)> = vec![
-        ("zhao", "赵"), ("li", "李"), ("wang", "王"), ("zhang", "张"),
-        ("liu", "刘"), ("chen", "陈"), ("yang", "杨"), ("huang", "黄"),
-        ("wu", "吴"), ("zhou", "周"), ("xu", "徐"), ("sun", "孙"),
-        ("ma", "马"), ("zhu", "朱"), ("hu", "胡"), ("guo", "郭"),
-        ("lin", "林"), ("he", "何"), ("gao", "高"), ("luo", "罗"),
-        ("zheng", "郑"), ("liang", "梁"), ("xie", "谢"), ("song", "宋"),
+        ("zhao", "赵"),
+        ("li", "李"),
+        ("wang", "王"),
+        ("zhang", "张"),
+        ("liu", "刘"),
+        ("chen", "陈"),
+        ("yang", "杨"),
+        ("huang", "黄"),
+        ("wu", "吴"),
+        ("zhou", "周"),
+        ("xu", "徐"),
+        ("sun", "孙"),
+        ("ma", "马"),
+        ("zhu", "朱"),
+        ("hu", "胡"),
+        ("guo", "郭"),
+        ("lin", "林"),
+        ("he", "何"),
+        ("gao", "高"),
+        ("luo", "罗"),
+        ("zheng", "郑"),
+        ("liang", "梁"),
+        ("xie", "谢"),
+        ("song", "宋"),
     ];
 
     // Split English name into parts
@@ -623,7 +645,10 @@ mod tests {
         // actor pinyin match gives 0.40; name similarity is 0.0 (Chu Qiao vs 楚乔)
         // role_type_consistent gives 0.10 → total 0.50 → NeedsReview
         assert!(result[0].confidence >= 0.40);
-        assert!(result[0].match_reasons.iter().any(|r| r == "actor_name_pinyin_match"));
+        assert!(result[0]
+            .match_reasons
+            .iter()
+            .any(|r| r == "actor_name_pinyin_match"));
     }
 
     #[test]

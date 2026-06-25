@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ValidationIssue {
     pub index: u32,
     pub issue_type: String,
@@ -10,11 +10,31 @@ pub struct ValidationIssue {
     pub translation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scene_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle_number: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_fragment: Option<String>,
 }
 
 /// Gendered speech patterns to detect (from SPEC.md Section 9.3).
 const GENDERED_PATTERNS: &[&str] = &[
-    "だわ", "かしら", "なのよ", "なのね", "ですわ", "だぜ", "だぞ", "じゃねえ", "てめえ",
+    "だわ",
+    "かしら",
+    "なのよ",
+    "なのね",
+    "ですわ",
+    "だぜ",
+    "だぞ",
+    "じゃねえ",
+    "てめえ",
 ];
 
 /// Validate SRT structure using index-map comparison.
@@ -30,8 +50,7 @@ pub fn validate_srt_structure(
     use std::collections::HashMap;
     let trans_by_idx: HashMap<u32, &crate::srt::SubtitleEntry> =
         translated.iter().map(|e| (e.index, e)).collect();
-    let orig_indices: std::collections::HashSet<u32> =
-        original.iter().map(|e| e.index).collect();
+    let orig_indices: std::collections::HashSet<u32> = original.iter().map(|e| e.index).collect();
 
     // Detect duplicate indices in translated output (LLM may repeat numbers).
     {
@@ -45,7 +64,7 @@ pub fn validate_srt_structure(
                     message: format!("Duplicate translated index: {}", e.index),
                     source_text: String::new(),
                     translation: e.text.clone(),
-                    suggestion: None,
+                    ..Default::default()
                 });
             }
         }
@@ -61,7 +80,7 @@ pub fn validate_srt_structure(
                 message: format!("Unexpected translated index: {} (not in original)", e.index),
                 source_text: String::new(),
                 translation: e.text.clone(),
-                suggestion: None,
+                ..Default::default()
             });
         }
     }
@@ -78,10 +97,14 @@ pub fn validate_srt_structure(
                     index: orig.index,
                     issue_type: "structure".into(),
                     severity: "medium".into(),
-                    message: format!("Missing translated entry for index {} (original kept)", orig.index),
+                    message: format!(
+                        "Missing translated entry for index {} (original kept)",
+                        orig.index
+                    ),
                     source_text: orig.text.clone(),
                     translation: String::new(),
                     suggestion: Some("Original English text retained; translate manually.".into()),
+                    ..Default::default()
                 });
             }
             Some(trans) => {
@@ -93,7 +116,7 @@ pub fn validate_srt_structure(
                         message: "Timestamp modified during translation".into(),
                         source_text: orig.text.clone(),
                         translation: trans.text.clone(),
-                        suggestion: None,
+                        ..Default::default()
                     });
                 }
             }
@@ -117,9 +140,18 @@ pub fn validate_srt_structure(
     if original_non_empty.len() != translated_non_removed.len() {
         // Suppress when per-entry issues (Missing/Unexpected/Duplicate) already
         // explain the discrepancy — avoids duplicate noise for the same gap.
-        let missing_count = issues.iter().filter(|i| i.message.contains("Missing translated entry")).count();
-        let unexpected_count = issues.iter().filter(|i| i.message.contains("Unexpected translated index")).count();
-        let duplicate_count = issues.iter().filter(|i| i.message.contains("Duplicate translated index")).count();
+        let missing_count = issues
+            .iter()
+            .filter(|i| i.message.contains("Missing translated entry"))
+            .count();
+        let unexpected_count = issues
+            .iter()
+            .filter(|i| i.message.contains("Unexpected translated index"))
+            .count();
+        let duplicate_count = issues
+            .iter()
+            .filter(|i| i.message.contains("Duplicate translated index"))
+            .count();
 
         if missing_count == 0 && unexpected_count == 0 && duplicate_count == 0 {
             issues.push(ValidationIssue {
@@ -133,7 +165,7 @@ pub fn validate_srt_structure(
                 ),
                 source_text: String::new(),
                 translation: String::new(),
-                suggestion: None,
+                ..Default::default()
             });
         }
     }
@@ -234,7 +266,7 @@ pub fn validate_proper_nouns(
                 message: "Possible untranslated English text remaining".into(),
                 source_text: String::new(),
                 translation: entry.text.clone(),
-                suggestion: None,
+                ..Default::default()
             });
         }
     }
@@ -243,9 +275,7 @@ pub fn validate_proper_nouns(
 }
 
 /// Check for gendered speech patterns in translated text.
-pub fn validate_gendered_speech(
-    entries: &[crate::srt::SubtitleEntry],
-) -> Vec<ValidationIssue> {
+pub fn validate_gendered_speech(entries: &[crate::srt::SubtitleEntry]) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
 
     for entry in entries {
@@ -259,6 +289,7 @@ pub fn validate_gendered_speech(
                     source_text: String::new(),
                     translation: entry.text.clone(),
                     suggestion: Some("Consider using a neutral alternative".into()),
+                    ..Default::default()
                 });
                 break; // One issue per entry for gendered speech
             }
@@ -273,12 +304,13 @@ pub fn validate_translations(
     original: &[crate::srt::SubtitleEntry],
     translated: &[crate::srt::SubtitleEntry],
     glossary: &[crate::dictionary::GlossaryEntry],
+    scene_index: Option<usize>,
 ) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
     issues.extend(validate_srt_structure(original, translated));
     issues.extend(validate_proper_nouns(translated, glossary));
     issues.extend(validate_gendered_speech(translated));
-    issues.extend(validate_untranslated_chinese(translated));
+    issues.extend(validate_untranslated_chinese(translated, scene_index));
     issues
 }
 
@@ -289,9 +321,8 @@ pub fn validate_translations(
 fn contains_simplified_chinese(text: &str) -> bool {
     // Representative high-frequency simplified characters not shared with kanji.
     const SIMPLIFIED_HINTS: &[char] = &[
-        '过', '这', '进', '还', '们', '乔', '宫', '来', '说', '让',
-        '时', '问', '闻', '军', '马', '国', '门', '关', '药', '个',
-        '为', '会', '对', '实', '应', '当', '从', '给', '义',
+        '过', '这', '进', '还', '们', '乔', '宫', '来', '说', '让', '时', '问', '闻', '军', '马',
+        '国', '门', '关', '药', '个', '为', '会', '对', '实', '应', '当', '从', '给', '义',
     ];
     text.chars().any(|c| SIMPLIFIED_HINTS.contains(&c))
 }
@@ -302,20 +333,54 @@ fn contains_japanese_kana(text: &str) -> bool {
         .any(|c| matches!(c, '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}'))
 }
 
+/// Extract contiguous simplified Chinese fragments from text.
+/// Uses the same SIMPLIFIED_HINTS as `contains_simplified_chinese`.
+fn find_chinese_fragments(text: &str) -> Vec<String> {
+    const SIMPLIFIED_HINTS: &[char] = &[
+        '过', '这', '进', '还', '们', '乔', '宫', '来', '说', '让', '时', '问', '闻', '军', '马',
+        '国', '门', '关', '药', '个', '为', '会', '对', '实', '应', '当', '从', '给', '义',
+    ];
+    let mut fragments = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        if SIMPLIFIED_HINTS.contains(&c) {
+            current.push(c);
+        } else {
+            if !current.is_empty() {
+                fragments.push(current.clone());
+                current.clear();
+            }
+        }
+    }
+    if !current.is_empty() {
+        fragments.push(current);
+    }
+    fragments
+}
+
 pub fn validate_untranslated_chinese(
     entries: &[crate::srt::SubtitleEntry],
+    scene_index: Option<usize>,
 ) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
     for entry in entries {
         if contains_simplified_chinese(&entry.text) && !contains_japanese_kana(&entry.text) {
+            let fragments: Vec<String> = find_chinese_fragments(&entry.text);
+            let detected_fragment = fragments.first().cloned();
             issues.push(ValidationIssue {
                 index: entry.index,
                 issue_type: "untranslated_chinese".into(),
                 severity: "high".into(),
-                message: "Possible untranslated Chinese text remaining".into(),
+                message: "Translated line appears to contain untranslated simplified Chinese text.".into(),
                 source_text: String::new(),
                 translation: entry.text.clone(),
                 suggestion: Some("Translate this line into Japanese.".into()),
+                scene_index,
+                subtitle_index: Some(entry.index as usize),
+                subtitle_number: Some(entry.index as usize),
+                start_time: Some(entry.start.clone()),
+                end_time: Some(entry.end.clone()),
+                detected_fragment,
             });
         }
     }
@@ -337,7 +402,12 @@ mod tests {
     }
 
     fn make_entry_ts(index: u32, text: &str, start: &str, end: &str) -> SubtitleEntry {
-        SubtitleEntry { index, start: start.into(), end: end.into(), text: text.into() }
+        SubtitleEntry {
+            index,
+            start: start.into(),
+            end: end.into(),
+            text: text.into(),
+        }
     }
 
     #[test]
@@ -363,18 +433,22 @@ mod tests {
             make_entry(3, "さようなら"),
         ];
         let issues = validate_srt_structure(&orig, &trans);
-        let structure_issues: Vec<_> = issues.iter().filter(|i| i.issue_type == "structure").collect();
+        let structure_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.issue_type == "structure")
+            .collect();
         assert_eq!(structure_issues.len(), 1); // only the missing entry, count mismatch suppressed
-        assert!(structure_issues.iter().any(|i| i.message.contains("Missing translated entry for index 2")));
-        assert!(!structure_issues.iter().any(|i| i.message.contains("count mismatch")));
+        assert!(structure_issues
+            .iter()
+            .any(|i| i.message.contains("Missing translated entry for index 2")));
+        assert!(!structure_issues
+            .iter()
+            .any(|i| i.message.contains("count mismatch")));
     }
 
     #[test]
     fn test_validate_structure_duplicate_index() {
-        let orig = vec![
-            make_entry(1, "A"),
-            make_entry(2, "B"),
-        ];
+        let orig = vec![make_entry(1, "A"), make_entry(2, "B")];
         let trans = vec![
             make_entry(1, "あ"),
             make_entry(1, "あ重複"), // duplicate index 1
@@ -389,13 +463,20 @@ mod tests {
         let orig = vec![make_entry(1, "A")];
         let trans = vec![make_entry(99, "謎の字幕")]; // index not in original
         let issues = validate_srt_structure(&orig, &trans);
-        assert!(issues.iter().any(|i| i.message.contains("Unexpected translated index")));
+        assert!(issues
+            .iter()
+            .any(|i| i.message.contains("Unexpected translated index")));
     }
 
     #[test]
     fn test_validate_structure_timestamp_changed() {
         let orig = vec![make_entry_ts(1, "Hello", "00:00:01,000", "00:00:03,000")];
-        let trans = vec![make_entry_ts(1, "こんにちは", "00:00:02,000", "00:00:04,000")];
+        let trans = vec![make_entry_ts(
+            1,
+            "こんにちは",
+            "00:00:02,000",
+            "00:00:04,000",
+        )];
         let issues = validate_srt_structure(&orig, &trans);
         assert!(issues.iter().any(|i| i.message.contains("Timestamp")));
     }
@@ -404,7 +485,7 @@ mod tests {
     fn test_untranslated_chinese_real() {
         // Pure Chinese text with no kana — should be flagged
         let entries = vec![make_entry(1, "这是一个测试")];
-        let issues = validate_untranslated_chinese(&entries);
+        let issues = validate_untranslated_chinese(&entries, None);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].issue_type, "untranslated_chinese");
         assert_eq!(issues[0].severity, "high");
@@ -413,17 +494,26 @@ mod tests {
     #[test]
     fn test_untranslated_chinese_japanese_false_positive() {
         // Japanese text that contains shared kanji like 来 and 国 — should NOT be flagged
-        let entries = vec![make_entry(1, "三つの独立国。卞唐は繁栄し、他国に干渉しない。")];
-        let issues = validate_untranslated_chinese(&entries);
-        assert!(issues.is_empty(), "Japanese text with kana should not flag as Chinese");
+        let entries = vec![make_entry(
+            1,
+            "三つの独立国。卞唐は繁栄し、他国に干渉しない。",
+        )];
+        let issues = validate_untranslated_chinese(&entries, None);
+        assert!(
+            issues.is_empty(),
+            "Japanese text with kana should not flag as Chinese"
+        );
     }
 
     #[test]
     fn test_untranslated_chinese_japanese_with_kana() {
         // Japanese text containing 来 and 国 with kana — should be skipped
         let entries = vec![make_entry(1, "どこから来て どこへも帰れぬ")];
-        let issues = validate_untranslated_chinese(&entries);
-        assert!(issues.is_empty(), "Japanese text with kana should not flag as Chinese");
+        let issues = validate_untranslated_chinese(&entries, None);
+        assert!(
+            issues.is_empty(),
+            "Japanese text with kana should not flag as Chinese"
+        );
     }
 
     #[test]
@@ -451,16 +541,16 @@ mod tests {
 
     #[test]
     fn test_missing_entry_is_medium() {
-        let orig = vec![
-            make_entry(1, "A"),
-            make_entry(2, "B"),
-        ];
+        let orig = vec![make_entry(1, "A"), make_entry(2, "B")];
         let trans = vec![
             make_entry(1, "あ"),
             // entry 2 missing
         ];
         let issues = validate_srt_structure(&orig, &trans);
-        let missing: Vec<_> = issues.iter().filter(|i| i.message.contains("Missing translated entry")).collect();
+        let missing: Vec<_> = issues
+            .iter()
+            .filter(|i| i.message.contains("Missing translated entry"))
+            .collect();
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].severity, "medium");
     }
@@ -474,7 +564,10 @@ mod tests {
         let trans = vec![make_entry(1, "あ")];
         // 2 original, 1 translated → missing entry for index 2 (medium), count mismatch suppressed
         let issues = validate_srt_structure(&orig, &trans);
-        let missing: Vec<_> = issues.iter().filter(|i| i.message.contains("Missing translated entry")).collect();
+        let missing: Vec<_> = issues
+            .iter()
+            .filter(|i| i.message.contains("Missing translated entry"))
+            .collect();
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].severity, "medium");
         // Count mismatch is suppressed when missing entries explain the gap
@@ -491,22 +584,36 @@ mod tests {
             make_entry(2, "い"),
         ];
         let issues = validate_srt_structure(&orig, &trans);
-        let dup: Vec<_> = issues.iter().filter(|i| i.message.contains("Duplicate")).collect();
+        let dup: Vec<_> = issues
+            .iter()
+            .filter(|i| i.message.contains("Duplicate"))
+            .collect();
         assert_eq!(dup.len(), 1);
         assert_eq!(dup[0].severity, "high");
 
         // Unexpected index — should remain high
         let trans2 = vec![make_entry(99, "謎の字幕")];
         let issues2 = validate_srt_structure(&orig, &trans2);
-        let unexpected: Vec<_> = issues2.iter().filter(|i| i.message.contains("Unexpected")).collect();
+        let unexpected: Vec<_> = issues2
+            .iter()
+            .filter(|i| i.message.contains("Unexpected"))
+            .collect();
         assert_eq!(unexpected.len(), 1);
         assert_eq!(unexpected[0].severity, "high");
 
         // Timestamp modified — should remain high
         let orig3 = vec![make_entry_ts(1, "Hello", "00:00:01,000", "00:00:03,000")];
-        let trans3 = vec![make_entry_ts(1, "こんにちは", "00:00:02,000", "00:00:04,000")];
+        let trans3 = vec![make_entry_ts(
+            1,
+            "こんにちは",
+            "00:00:02,000",
+            "00:00:04,000",
+        )];
         let issues3 = validate_srt_structure(&orig3, &trans3);
-        let ts: Vec<_> = issues3.iter().filter(|i| i.message.contains("Timestamp")).collect();
+        let ts: Vec<_> = issues3
+            .iter()
+            .filter(|i| i.message.contains("Timestamp"))
+            .collect();
         assert_eq!(ts.len(), 1);
         assert_eq!(ts[0].severity, "high");
     }
@@ -540,9 +647,7 @@ mod tests {
 
     #[test]
     fn test_credit_line_skipped_in_validation() {
-        let entries = vec![
-            make_entry(1, "Subtitles by Viki Team"),
-        ];
+        let entries = vec![make_entry(1, "Subtitles by Viki Team")];
         let issues = validate_proper_nouns(&entries, &[]);
         // Credit line should be skipped, not flagged as untranslated English
         assert!(issues.is_empty());
@@ -581,15 +686,14 @@ mod tests {
         // Empty originals should be skipped in structure validation
         let orig = vec![
             make_entry(1, "Hello"),
-            make_entry(2, ""),       // empty — should not flag as missing
+            make_entry(2, ""), // empty — should not flag as missing
             make_entry(3, "World"),
         ];
-        let trans = vec![
-            make_entry(1, "こんにちは"),
-            make_entry(3, "世界"),
-        ];
+        let trans = vec![make_entry(1, "こんにちは"), make_entry(3, "世界")];
         let issues = validate_srt_structure(&orig, &trans);
-        assert!(!issues.iter().any(|i| i.message.contains("Missing translated entry for index 2")));
+        assert!(!issues
+            .iter()
+            .any(|i| i.message.contains("Missing translated entry for index 2")));
     }
 
     #[test]
@@ -610,36 +714,46 @@ mod tests {
 
     #[test]
     fn test_song_credit_not_flagged_untranslated() {
-        let entries = vec![
-            make_entry(1, "\"Rebirth\" - Curley Gao"),
-        ];
+        let entries = vec![make_entry(1, "\"Rebirth\" - Curley Gao")];
         let issues = validate_proper_nouns(&entries, &[]);
-        assert!(issues.is_empty(), "Song credit should not be flagged as untranslated");
+        assert!(
+            issues.is_empty(),
+            "Song credit should not be flagged as untranslated"
+        );
     }
 
     #[test]
     fn test_normal_dialog_not_misclassified() {
         // These are normal dialogue — must not be classified as removable or preservable
-        assert!(!should_ignore_for_untranslated_validation("Team, move out!"));
-        assert!(!should_ignore_for_untranslated_validation("He translated it."));
-        assert!(!should_ignore_for_untranslated_validation("The timing is off."));
-        assert!(!should_ignore_for_untranslated_validation("Where is the scout team?"));
+        assert!(!should_ignore_for_untranslated_validation(
+            "Team, move out!"
+        ));
+        assert!(!should_ignore_for_untranslated_validation(
+            "He translated it."
+        ));
+        assert!(!should_ignore_for_untranslated_validation(
+            "The timing is off."
+        ));
+        assert!(!should_ignore_for_untranslated_validation(
+            "Where is the scout team?"
+        ));
     }
 
     #[test]
     fn test_count_mismatch_suppressed_when_missing_exists() {
-        let orig = vec![
-            make_entry(1, "A"),
-            make_entry(2, "B"),
-        ];
+        let orig = vec![make_entry(1, "A"), make_entry(2, "B")];
         let trans = vec![
             make_entry(1, "あ"),
             // entry 2 missing
         ];
         let issues = validate_srt_structure(&orig, &trans);
-        assert!(issues.iter().any(|i| i.message.contains("Missing translated entry")));
-        assert!(!issues.iter().any(|i| i.message.contains("count mismatch")),
-            "Count mismatch should be suppressed when missing entries exist");
+        assert!(issues
+            .iter()
+            .any(|i| i.message.contains("Missing translated entry")));
+        assert!(
+            !issues.iter().any(|i| i.message.contains("count mismatch")),
+            "Count mismatch should be suppressed when missing entries exist"
+        );
     }
 
     #[test]
@@ -648,16 +762,16 @@ mod tests {
         // per-entry issues — e.g. LLM added extra entries without duplicating indices.
         // (In practice this is rare — here we test that the gate still fires when
         // no Missing/Unexpected/Duplicate issues exist.)
-        let orig = vec![
-            make_entry(1, "A"),
-        ];
+        let orig = vec![make_entry(1, "A")];
         let trans = vec![
             make_entry(1, "あ"),
             make_entry(2, "extra"), // unexpected index will be flagged separately
         ];
         let issues = validate_srt_structure(&orig, &trans);
         // Has unexpected index → count mismatch suppressed (unexpected explains it)
-        assert!(issues.iter().any(|i| i.message.contains("Unexpected translated index")));
+        assert!(issues
+            .iter()
+            .any(|i| i.message.contains("Unexpected translated index")));
         assert!(!issues.iter().any(|i| i.message.contains("count mismatch")));
     }
 
@@ -677,5 +791,33 @@ mod tests {
         // Missing entry 2 → count mismatch suppressed
         let issues = validate_srt_structure(&orig, &trans);
         assert!(!issues.iter().any(|i| i.message.contains("count mismatch")));
+    }
+
+    #[test]
+    fn test_find_chinese_fragments_detects() {
+        // Use characters actually in SIMPLIFIED_HINTS: 乔, 过
+        let fragments = find_chinese_fragments("乔过大人、落ち着いてください。");
+        assert!(fragments.iter().any(|s| s.contains("乔过")));
+    }
+
+    #[test]
+    fn test_find_chinese_fragments_ignores_kanji() {
+        // Pure Japanese kanji not in SIMPLIFIED_HINTS — should return empty
+        let fragments = find_chinese_fragments("図穆卿、落ち着いてください。");
+        assert!(fragments.is_empty());
+    }
+
+    #[test]
+    fn test_find_chinese_fragments_multiple() {
+        let fragments = find_chinese_fragments("过国门关是实");
+        // 是 is not in SIMPLIFIED_HINTS, so two fragments
+        assert_eq!(fragments, vec!["过国门关", "实"]);
+    }
+
+    #[test]
+    fn test_find_chinese_fragments_japanese_mixed() {
+        // Japanese with kana — 来 and 国 are in SIMPLIFIED_HINTS
+        let fragments = find_chinese_fragments("どこから来て国へ帰れぬ");
+        assert!(!fragments.is_empty());
     }
 }

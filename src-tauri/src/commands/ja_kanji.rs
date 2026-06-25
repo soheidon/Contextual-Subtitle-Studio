@@ -1,6 +1,7 @@
 use crate::character_dict::MergedCastEntry;
-use crate::commands::llm::resolve_provider;
+use crate::commands::llm::resolve_provider_for_tier;
 use crate::commands::project::AppState;
+use crate::commands::service_settings;
 use crate::envstore::EnvStoreState;
 use crate::llm::LlmClient;
 use crate::log::emit_log;
@@ -19,13 +20,20 @@ pub async fn correct_ja_kanji(
     let mut results = entries.clone();
 
     // Resolve provider — if no LLM configured, return as-is (entries stay pending_llm)
-    let provider = match resolve_provider(&state, &env_store, &app) {
-        Ok(p) => p,
-        Err(e) => {
-            emit_log(&app, "warn", "JaKanji", &format!("LLM未設定のためスキップ: {}", e));
-            return Ok(results);
-        }
-    };
+    let task_models = service_settings::read_llm_task_model_settings(&app);
+    let provider =
+        match resolve_provider_for_tier(&state, &env_store, &app, task_models.kanji_correction) {
+            Ok(p) => p,
+            Err(e) => {
+                emit_log(
+                    &app,
+                    "warn",
+                    "JaKanji",
+                    &format!("LLM未設定のためスキップ: {}", e),
+                );
+                return Ok(results);
+            }
+        };
     let client = LlmClient::new(provider);
 
     // Build batch items from non-manual entries with non-empty character_zh
@@ -52,7 +60,12 @@ pub async fn correct_ja_kanji(
         return Ok(results);
     }
 
-    emit_log(&app, "info", "JaKanji", &format!("一括漢字変換開始: {}件", items.len()));
+    emit_log(
+        &app,
+        "info",
+        "JaKanji",
+        &format!("一括漢字変換開始: {}件", items.len()),
+    );
 
     let title = drama_title.as_deref().unwrap_or("");
     match ja_kanji_batch::batch_convert_kanji(&client, &items, title).await {
@@ -69,10 +82,20 @@ pub async fn correct_ja_kanji(
                     }
                 }
             }
-            emit_log(&app, "info", "JaKanji", &format!("一括漢字変換完了: {}件", responses.len()));
+            emit_log(
+                &app,
+                "info",
+                "JaKanji",
+                &format!("一括漢字変換完了: {}件", responses.len()),
+            );
         }
         Err(e) => {
-            emit_log(&app, "error", "JaKanji", &format!("一括漢字変換失敗: {}", e));
+            emit_log(
+                &app,
+                "error",
+                "JaKanji",
+                &format!("一括漢字変換失敗: {}", e),
+            );
             // Entries stay in pending_llm state
         }
     }

@@ -1,6 +1,6 @@
 pub mod douban;
-pub mod tmdb;
 pub mod mydramalist;
+pub mod tmdb;
 pub mod tvmao;
 
 use serde::{Deserialize, Serialize};
@@ -63,36 +63,22 @@ pub async fn fetch_html(url: &str) -> Result<String, String> {
             );
             headers.insert(
                 reqwest::header::ACCEPT_LANGUAGE,
-                "en-US,en;q=0.9,zh-CN;q=0.8,ja;q=0.7"
-                    .parse()
-                    .unwrap(),
+                "en-US,en;q=0.9,zh-CN;q=0.8,ja;q=0.7".parse().unwrap(),
             );
             headers.insert(
                 reqwest::header::ACCEPT_ENCODING,
                 "gzip, deflate, br".parse().unwrap(),
             );
-            headers.insert(
-                reqwest::header::CACHE_CONTROL,
-                "no-cache".parse().unwrap(),
-            );
-            headers.insert(
-                reqwest::header::PRAGMA,
-                "no-cache".parse().unwrap(),
-            );
+            headers.insert(reqwest::header::CACHE_CONTROL, "no-cache".parse().unwrap());
+            headers.insert(reqwest::header::PRAGMA, "no-cache".parse().unwrap());
             headers.insert(
                 "sec-ch-ua",
                 "\"Google Chrome\";v=\"125\", \"Chromium\";v=\"125\", \"Not.A/Brand\";v=\"24\""
                     .parse()
                     .unwrap(),
             );
-            headers.insert(
-                "sec-ch-ua-mobile",
-                "?0".parse().unwrap(),
-            );
-            headers.insert(
-                "sec-ch-ua-platform",
-                "\"Windows\"".parse().unwrap(),
-            );
+            headers.insert("sec-ch-ua-mobile", "?0".parse().unwrap());
+            headers.insert("sec-ch-ua-platform", "\"Windows\"".parse().unwrap());
             headers
         })
         .build()
@@ -207,7 +193,12 @@ mod tests {
     #[test]
     fn test_score_exact_zh() {
         let (conf, reason) = score_search_candidate(
-            "冰湖重生", "Rebirth", &[], "冰湖重生 (2025)", &Some("2025".into()), &Some("2025".into()),
+            "冰湖重生",
+            "Rebirth",
+            &[],
+            "冰湖重生 (2025)",
+            &Some("2025".into()),
+            &Some("2025".into()),
         );
         assert_eq!(conf, 1.0);
         assert_eq!(reason, "title_exact_zh");
@@ -216,7 +207,12 @@ mod tests {
     #[test]
     fn test_score_exact_en_with_year() {
         let (conf, reason) = score_search_candidate(
-            "", "Rebirth", &[], "Rebirth", &Some("2025".into()), &Some("2025".into()),
+            "",
+            "Rebirth",
+            &[],
+            "Rebirth",
+            &Some("2025".into()),
+            &Some("2025".into()),
         );
         assert_eq!(conf, 0.95);
         assert_eq!(reason, "title_exact_en+year");
@@ -224,9 +220,7 @@ mod tests {
 
     #[test]
     fn test_score_exact_en_no_year() {
-        let (conf, reason) = score_search_candidate(
-            "", "Rebirth", &[], "Rebirth", &None, &None,
-        );
+        let (conf, reason) = score_search_candidate("", "Rebirth", &[], "Rebirth", &None, &None);
         assert_eq!(conf, 0.85);
         assert_eq!(reason, "title_exact_en");
     }
@@ -234,7 +228,12 @@ mod tests {
     #[test]
     fn test_score_alias_match() {
         let (conf, reason) = score_search_candidate(
-            "", "X", &["Frozen Awakening".into()], "Frozen Awakening", &None, &None,
+            "",
+            "X",
+            &["Frozen Awakening".into()],
+            "Frozen Awakening",
+            &None,
+            &None,
         );
         assert_eq!(conf, 0.80);
         assert_eq!(reason, "alias_match");
@@ -243,7 +242,12 @@ mod tests {
     #[test]
     fn test_score_no_match() {
         let (conf, reason) = score_search_candidate(
-            "冰湖重生", "Rebirth", &[], "Something Completely Different", &None, &None,
+            "冰湖重生",
+            "Rebirth",
+            &[],
+            "Something Completely Different",
+            &None,
+            &None,
         );
         assert_eq!(conf, 0.0);
         assert_eq!(reason, "no_match");

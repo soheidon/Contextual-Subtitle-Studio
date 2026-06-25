@@ -106,9 +106,9 @@ pub type CharacterDict = std::collections::HashMap<String, CharacterDictEntry>;
 /// A normalized Douban cast entry with CJK/Latin split.
 #[derive(Debug, Clone)]
 pub struct DoubanCastEntry {
-    pub actor_zh: String,           // CJK only, e.g. "李昀锐"
-    pub actor_en: Option<String>,   // extracted Latin, e.g. Some("Yunrui Li")
-    pub character_zh: String,       // e.g. "诸葛玥"
+    pub actor_zh: String,         // CJK only, e.g. "李昀锐"
+    pub actor_en: Option<String>, // extracted Latin, e.g. Some("Yunrui Li")
+    pub character_zh: String,     // e.g. "诸葛玥"
 }
 
 /// Split a mixed CN/EN string into (CJK, Latin) parts.
@@ -118,13 +118,15 @@ pub struct DoubanCastEntry {
 /// - `"李昀锐"` → `("李昀锐", None)`
 /// - `"Yunrui Li"` → `("", Some("Yunrui Li"))`
 pub fn split_cjk_latin(text: &str) -> (String, Option<String>) {
-    let cjk: String = text.chars()
+    let cjk: String = text
+        .chars()
         .filter(|c| is_cjk(*c) || c.is_whitespace())
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let latin: String = text.chars()
+    let latin: String = text
+        .chars()
         .filter(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || *c == '.' || c.is_whitespace())
         .collect::<String>()
         .split_whitespace()
@@ -133,7 +135,11 @@ pub fn split_cjk_latin(text: &str) -> (String, Option<String>) {
 
     let trimmed_cjk = cjk.trim().to_string();
     let trimmed_latin = latin.trim().to_string();
-    let en = if trimmed_latin.is_empty() { None } else { Some(trimmed_latin) };
+    let en = if trimmed_latin.is_empty() {
+        None
+    } else {
+        Some(trimmed_latin)
+    };
     (trimmed_cjk, en)
 }
 
@@ -149,37 +155,44 @@ fn is_cjk(c: char) -> bool {
 /// - Splits `actor_name` into CN/EN via `split_cjk_latin`
 /// - If `character_name` is all Latin → sets `character_zh = ""`
 pub fn normalize_douban_entries(entries: &[PastedEntry]) -> Vec<DoubanCastEntry> {
-    entries.iter().map(|e| {
-        let (actor_zh, actor_en) = split_cjk_latin(&e.actor_name);
-        let char_zh = if e.character_name.chars().any(is_cjk) {
-            e.character_name.clone()
-        } else {
-            String::new()
-        };
-        DoubanCastEntry { actor_zh, actor_en, character_zh: char_zh }
-    }).collect()
+    entries
+        .iter()
+        .map(|e| {
+            let (actor_zh, actor_en) = split_cjk_latin(&e.actor_name);
+            let char_zh = if e.character_name.chars().any(is_cjk) {
+                e.character_name.clone()
+            } else {
+                String::new()
+            };
+            DoubanCastEntry {
+                actor_zh,
+                actor_en,
+                character_zh: char_zh,
+            }
+        })
+        .collect()
 }
 
 /// A single row in the merged cast spreadsheet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergedCastEntry {
-    pub actor_zh: String,                      // Douban CJK only
-    pub actor_en_douban: Option<String>,       // Douban extracted EN
-    pub actor_en_matched: String,              // TMDb/MDL matched EN
-    pub character_zh: String,                  // Douban
-    pub character_en: Option<String>,          // TMDb/MDL
-    pub source_en: String,                     // "TMDb" | "MDL" | ""
+    pub actor_zh: String,                // Douban CJK only
+    pub actor_en_douban: Option<String>, // Douban extracted EN
+    pub actor_en_matched: String,        // TMDb/MDL matched EN
+    pub character_zh: String,            // Douban
+    pub character_en: Option<String>,    // TMDb/MDL
+    pub source_en: String,               // "TMDb" | "MDL" | ""
     #[serde(default)]
     pub character_ja_kanji: String,
     #[serde(default)]
-    pub character_ja_kanji_source: String,       // "rule" | "llm" | "manual" | ""
+    pub character_ja_kanji_source: String, // "rule" | "llm" | "manual" | ""
     #[serde(default)]
     pub character_ja_kanji_confidence: Option<f64>,
     #[serde(default)]
     pub character_ja_kanji_note: Option<String>,
     pub confidence: f64,
-    pub match_reason: String,                  // "name_variant_exact" etc.
-    pub alt_character_en: String,              // alternative character-en from other sources, comma-separated
+    pub match_reason: String,     // "name_variant_exact" etc.
+    pub alt_character_en: String, // alternative character-en from other sources, comma-separated
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +329,8 @@ fn is_noise_line(s: &str) -> bool {
         return true;
     }
     // MDL stats lines (contain only numbers and units)
-    if s.chars().all(|c| c.is_numeric() || c.is_whitespace() || c == '.' || c == ',' || c == '%')
+    if s.chars()
+        .all(|c| c.is_numeric() || c.is_whitespace() || c == '.' || c == ',' || c == '%')
         && s.len() < 15
     {
         return true;
@@ -475,7 +489,7 @@ fn is_likely_chinese_name(s: &str) -> bool {
         ('\u{4E00}'..='\u{9FFF}').contains(&c)  // CJK Unified
             || ('\u{3400}'..='\u{4DBF}').contains(&c)  // CJK Ext-A
             || c == '·'  // middle dot used in some Chinese names
-            || c == '　'  // full-width space
+            || c == '　' // full-width space
     })
 }
 
@@ -530,12 +544,7 @@ pub fn parse_mdl_html_paste(html: &str) -> Vec<PastedEntry> {
             .or_else(|| {
                 // Fallback: find a <small> without text-muted class
                 li.select(&small_sel)
-                    .find(|e| {
-                        !e.value()
-                            .attr("class")
-                            .unwrap_or("")
-                            .contains("text-muted")
-                    })
+                    .find(|e| !e.value().attr("class").unwrap_or("").contains("text-muted"))
                     .map(|e| e.text().collect::<String>().trim().to_string())
             });
 
@@ -557,7 +566,10 @@ pub fn parse_mdl_html_paste(html: &str) -> Vec<PastedEntry> {
             });
             // Log character-less entries
             if !has_character {
-                eprintln!("[MDL HTML] actor/character抽出: characterなし: actor={}", entries.last().unwrap().actor_name);
+                eprintln!(
+                    "[MDL HTML] actor/character抽出: characterなし: actor={}",
+                    entries.last().unwrap().actor_name
+                );
             }
         }
     }
@@ -829,10 +841,22 @@ fn compact_name(name: &str) -> String {
 /// Requires: all four actor/role fields populated, Japanese kanji present,
 /// Douban source, non-SingleSource match, and confidence >= 0.85.
 fn is_active_dictionary_entry(entry: &CharacterDictEntry) -> bool {
-    entry.actor.chinese.as_deref().map_or(false, |s| !s.trim().is_empty())
+    entry
+        .actor
+        .chinese
+        .as_deref()
+        .map_or(false, |s| !s.trim().is_empty())
         && !entry.actor.english.trim().is_empty()
-        && entry.role.chinese.as_deref().map_or(false, |s| !s.trim().is_empty())
-        && entry.role.english.as_deref().map_or(false, |s| !s.trim().is_empty())
+        && entry
+            .role
+            .chinese
+            .as_deref()
+            .map_or(false, |s| !s.trim().is_empty())
+        && entry
+            .role
+            .english
+            .as_deref()
+            .map_or(false, |s| !s.trim().is_empty())
         && !entry.role.japanese_kanji.trim().is_empty()
         && entry.source_flags.douban
         && !matches!(entry.match_detail, MatchDetail::SingleSource)
@@ -864,9 +888,7 @@ pub fn enrich_dict_kanji_from_cast(
             if mc.character_zh != role_cn {
                 continue;
             }
-            if mc.character_ja_kanji_source == "llm"
-                || mc.character_ja_kanji_source == "manual"
-            {
+            if mc.character_ja_kanji_source == "llm" || mc.character_ja_kanji_source == "manual" {
                 entry.role.japanese_kanji = mc.character_ja_kanji.clone();
                 entry.ja_kanji_source = mc.character_ja_kanji_source.clone();
                 updated += 1;
@@ -900,10 +922,7 @@ pub fn build_character_dict(
             } else {
                 (None, MatchKind::NoMatch)
             };
-            let (vm, vk) = find_tmdb_match_for_douban_en(
-                ndb.actor_en.as_deref(),
-                imdb_entries,
-            );
+            let (vm, vk) = find_tmdb_match_for_douban_en(ndb.actor_en.as_deref(), imdb_entries);
             (pm, pk, vm, vk)
         };
 
@@ -935,11 +954,17 @@ pub fn build_character_dict(
         };
 
         // Determine English name: Douban own EN first, then matched TMDb name
-        let actor_en = ndb.actor_en.clone()
+        let actor_en = ndb
+            .actor_en
+            .clone()
             .or_else(|| best_match.map(|e| e.actor_name.clone()))
             .unwrap_or_else(|| String::new());
 
-        let key = to_snake_key(if actor_en.is_empty() { &ndb.actor_zh } else { &actor_en });
+        let key = to_snake_key(if actor_en.is_empty() {
+            &ndb.actor_zh
+        } else {
+            &actor_en
+        });
 
         let (confidence, match_detail) = match match_kind {
             MatchKind::ExactActorEn => (1.0, MatchDetail::NameVariantExact),
@@ -964,22 +989,24 @@ pub fn build_character_dict(
             ..Default::default()
         };
 
-        let entry = dict.entry(key.clone()).or_insert_with(|| CharacterDictEntry {
-            actor: ActorNames {
-                chinese: Some(ndb.actor_zh.clone()),
-                english: actor_en.clone(),
-            },
-            role: RoleNames {
-                chinese: None,
-                english: None,
-                japanese_kanji: String::new(),
-                japanese_reading: String::new(),
-            },
-            source_flags: SourceFlags::default(),
-            confidence: 0.0,
-            match_detail: MatchDetail::Inferred,
-            ja_kanji_source: "pending_llm".to_string(),
-        });
+        let entry = dict
+            .entry(key.clone())
+            .or_insert_with(|| CharacterDictEntry {
+                actor: ActorNames {
+                    chinese: Some(ndb.actor_zh.clone()),
+                    english: actor_en.clone(),
+                },
+                role: RoleNames {
+                    chinese: None,
+                    english: None,
+                    japanese_kanji: String::new(),
+                    japanese_reading: String::new(),
+                },
+                source_flags: SourceFlags::default(),
+                confidence: 0.0,
+                match_detail: MatchDetail::Inferred,
+                ja_kanji_source: "pending_llm".to_string(),
+            });
 
         // Fill actor CN (CJK only, not the raw mixed string)
         if entry.actor.chinese.is_none() || entry.actor.chinese.as_deref() == Some("") {
@@ -1069,7 +1096,10 @@ pub fn build_character_dict(
     eprintln!("[Dictionary] total character entries: {}", total);
     eprintln!("[Dictionary] active entries: {}", active);
     eprintln!("[Dictionary] pending entries dropped: {}", pending_dropped);
-    eprintln!("[Dictionary] source-only entries dropped: {}", source_only_dropped);
+    eprintln!(
+        "[Dictionary] source-only entries dropped: {}",
+        source_only_dropped
+    );
 
     dict
 }
@@ -1106,21 +1136,31 @@ fn merge_english_by_actor(
     for entry in tmdb_entries.iter().chain(mdl_entries.iter()) {
         // Generate all compact variants as potential grouping keys
         let variants = chinese_romanized_name_variants(&entry.actor_name);
-        let compact_keys: Vec<String> = variants.into_iter()
+        let compact_keys: Vec<String> = variants
+            .into_iter()
             .filter(|v| !v.contains(' '))
-            .map(|v| v.chars().filter(|c| !matches!(c, '-' | '.' | '\'')).collect())
+            .map(|v| {
+                v.chars()
+                    .filter(|c| !matches!(c, '-' | '.' | '\''))
+                    .collect()
+            })
             .collect();
 
         // Try to find an existing group that shares any compact key
         let mut found = false;
         for (_, group_entries) in groups.iter_mut() {
             // Check if this entry shares any compact key with any group member
-            let group_variants: std::collections::HashSet<String> = group_entries.iter()
+            let group_variants: std::collections::HashSet<String> = group_entries
+                .iter()
                 .flat_map(|e| {
                     let ev = chinese_romanized_name_variants(&e.actor_name);
                     ev.into_iter()
                         .filter(|v| !v.contains(' '))
-                        .map(|v| v.chars().filter(|c| !matches!(c, '-' | '.' | '\'')).collect::<String>())
+                        .map(|v| {
+                            v.chars()
+                                .filter(|c| !matches!(c, '-' | '.' | '\''))
+                                .collect::<String>()
+                        })
                         .collect::<Vec<_>>()
                 })
                 .collect();
@@ -1133,7 +1173,10 @@ fn merge_english_by_actor(
 
         if !found {
             // New group: use the first compact key as group identifier
-            let key = compact_keys.into_iter().next().unwrap_or_else(|| "unknown".into());
+            let key = compact_keys
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "unknown".into());
             groups.push((key, vec![entry.clone()]));
         }
     }
@@ -1186,14 +1229,24 @@ fn merge_english_by_actor(
         eprintln!("[Merge] English source group: {}", actor_name);
         for e in &entries {
             let src = source_label_for(&e.source);
-            let ch = if e.character_name.trim().is_empty() { "(empty)" } else { e.character_name.trim() };
+            let ch = if e.character_name.trim().is_empty() {
+                "(empty)"
+            } else {
+                e.character_name.trim()
+            };
             eprintln!("[Merge]   candidate: {} / {}", src, ch);
         }
         eprintln!("[Merge]   selected: {} / {}", source_label, best_char_name);
         for a in &alt {
-            let src_of_alt = entries.iter().find(|e| e.character_name.trim() == a.as_str())
+            let src_of_alt = entries
+                .iter()
+                .find(|e| e.character_name.trim() == a.as_str())
                 .map(|e| source_label_for(&e.source));
-            eprintln!("[Merge]   alternative kept: {} / {}", src_of_alt.unwrap_or("?"), a);
+            eprintln!(
+                "[Merge]   alternative kept: {} / {}",
+                src_of_alt.unwrap_or("?"),
+                a
+            );
         }
 
         result.push(MergedEnglishEntry {
@@ -1211,7 +1264,11 @@ fn merge_english_by_actor(
 /// Classify which variant matched and return (score, reason).
 /// `matched` is the variant string that matched. `db_variants` holds all variants
 /// of the Douban side; we use idx 0 (normalized) to determine the original first token.
-fn classify_variant_match(matched: &str, db_variants: &[String], _en_variants: &[String]) -> (f64, &'static str) {
+fn classify_variant_match(
+    matched: &str,
+    db_variants: &[String],
+    _en_variants: &[String],
+) -> (f64, &'static str) {
     if !matched.contains(' ') {
         return (0.96, "actor_en_compact");
     }
@@ -1339,7 +1396,8 @@ pub fn merge_cast_list(
 
                 // ---- Priority 3: compact exact match ----
                 // idx 1 is always the compact (no-space) form
-                if db_variants.len() > 1 && en_variants.len() > 1
+                if db_variants.len() > 1
+                    && en_variants.len() > 1
                     && db_variants[1] == en_variants[1]
                 {
                     candidates.push((mg, 0.96, "actor_en_compact".into()));
@@ -1357,7 +1415,8 @@ pub fn merge_cast_list(
                     for ev in &en_variants {
                         if dv == ev {
                             // Score based on variant pattern
-                            let (score, reason) = classify_variant_match(dv, &db_variants, &en_variants);
+                            let (score, reason) =
+                                classify_variant_match(dv, &db_variants, &en_variants);
                             if score > best_var_score {
                                 best_var_score = score;
                                 best_var_reason = reason;
@@ -1377,7 +1436,10 @@ pub fn merge_cast_list(
                 // ---- Priority 5: token subset (e.g. "Davika Hoorne" ⊂ "Mai Davika Hoorne") ----
                 if let Some((shared, _rel)) = token_subset_relation(db_en, en_name) {
                     // Only adopt if >= 2 shared tokens (already enforced in token_subset_relation)
-                    if !candidates.iter().any(|(_, _, r)| r == "actor_en_token_subset") {
+                    if !candidates
+                        .iter()
+                        .any(|(_, _, r)| r == "actor_en_token_subset")
+                    {
                         candidates.push((mg, 0.90, "actor_en_token_subset".into()));
                         eprintln!(
                             "[Merge] token_subset: {} ⊂ {} (shared={}) score=0.90",
@@ -1388,9 +1450,20 @@ pub fn merge_cast_list(
                 }
 
                 // ---- Priority 6: compact form intersection (fallback) ----
-                let db_compacts: Vec<&str> = db_variants.iter().filter(|v| !v.contains(' ')).map(|s| s.as_str()).collect();
-                let en_compacts: Vec<&str> = en_variants.iter().filter(|v| !v.contains(' ')).map(|s| s.as_str()).collect();
-                if db_compacts.iter().any(|dc| en_compacts.iter().any(|ec| dc == ec)) {
+                let db_compacts: Vec<&str> = db_variants
+                    .iter()
+                    .filter(|v| !v.contains(' '))
+                    .map(|s| s.as_str())
+                    .collect();
+                let en_compacts: Vec<&str> = en_variants
+                    .iter()
+                    .filter(|v| !v.contains(' '))
+                    .map(|s| s.as_str())
+                    .collect();
+                if db_compacts
+                    .iter()
+                    .any(|dc| en_compacts.iter().any(|ec| dc == ec))
+                {
                     candidates.push((mg, 0.96, "actor_en_compact".into()));
                     eprintln!(
                         "[Merge] Douban actor_en: {} / Candidate actor_en: {} / compact overlap",
@@ -1401,13 +1474,15 @@ pub fn merge_cast_list(
             } else {
                 // No Douban EN → pinyin fallback using CN name
                 if !ndb.actor_zh.is_empty() {
-                    let (pm, pk) = find_pinyin_match_detail_for_zh(&ndb.actor_zh, &flat_en_for_pinyin);
+                    let (pm, pk) =
+                        find_pinyin_match_detail_for_zh(&ndb.actor_zh, &flat_en_for_pinyin);
                     if let Some(pm_entry) = pm {
                         // Map the raw PastedEntry back to its MergedEnglishEntry group
                         let pm_key = to_snake_key(&pm_entry.actor_name);
-                        if let Some(mg) = merged_english.iter().find(|mg| {
-                            mg.source_keys.iter().any(|k| *k == pm_key)
-                        }) {
+                        if let Some(mg) = merged_english
+                            .iter()
+                            .find(|mg| mg.source_keys.iter().any(|k| *k == pm_key))
+                        {
                             let score = match pk {
                                 MatchKind::ExactPinyin => 0.85,
                                 MatchKind::PartialPinyin => 0.65,
@@ -1420,14 +1495,16 @@ pub fn merge_cast_list(
                     }
                 }
             }
-
         }
 
         // ---- Actor ZH pinyin bridge ----
         // Uses actor_zh pinyin to find English entries missed by actor_en matching.
         if !ndb.actor_zh.is_empty() {
             if let Some((mg, score, reason)) = try_actor_zh_pinyin_match(&ndb.actor_zh, &en_refs) {
-                if !candidates.iter().any(|(c, _, _)| c.actor_name == mg.actor_name) {
+                if !candidates
+                    .iter()
+                    .any(|(c, _, _)| c.actor_name == mg.actor_name)
+                {
                     candidates.push((mg, score, reason));
                 }
             }
@@ -1446,13 +1523,17 @@ pub fn merge_cast_list(
                 Some((mg, reason))
             } else {
                 // Exact match but no character_en — prefer a candidate with character_en
-                let better = candidates.iter().find(|(c, s, _)| {
-                    *s >= 0.85 && !c.character_name.is_empty()
-                });
+                let better = candidates
+                    .iter()
+                    .find(|(c, s, _)| *s >= 0.85 && !c.character_name.is_empty());
                 if let Some((better_mg, better_score, better_reason)) = better {
                     eprintln!(
                         "[Merge] {} exact_match={} (empty char) → prefer {} ({}) score={:.2}",
-                        ndb.actor_zh, mg.actor_name, better_mg.actor_name, better_reason, better_score
+                        ndb.actor_zh,
+                        mg.actor_name,
+                        better_mg.actor_name,
+                        better_reason,
+                        better_score
                     );
                     Some((*better_mg, better_reason.clone()))
                 } else {
@@ -1467,13 +1548,15 @@ pub fn merge_cast_list(
             let best = candidates.first();
             match best {
                 Some((mg, score, _)) if score >= &0.85 => {
-                    if candidates.len() > 1
-                        && (candidates[0].1 - candidates[1].1) < 0.10
-                    {
+                    if candidates.len() > 1 && (candidates[0].1 - candidates[1].1) < 0.10 {
                         eprintln!(
                             "[Merge] Ambiguous: {} / {:?} — candidates {:?}",
-                            ndb.actor_zh, ndb.actor_en,
-                            candidates.iter().map(|c| format!("{}@{}", c.0.actor_name, c.1)).collect::<Vec<_>>()
+                            ndb.actor_zh,
+                            ndb.actor_en,
+                            candidates
+                                .iter()
+                                .map(|c| format!("{}@{}", c.0.actor_name, c.1))
+                                .collect::<Vec<_>>()
                         );
                         None
                     } else {
@@ -1481,10 +1564,7 @@ pub fn merge_cast_list(
                     }
                 }
                 _ => {
-                    eprintln!(
-                        "[Merge] No match: {} / {:?}",
-                        ndb.actor_zh, ndb.actor_en
-                    );
+                    eprintln!("[Merge] No match: {} / {:?}", ndb.actor_zh, ndb.actor_en);
                     None
                 }
             }
@@ -1492,9 +1572,7 @@ pub fn merge_cast_list(
             let best = candidates.first();
             match best {
                 Some((mg, score, reason)) if score >= &0.85 => {
-                    if candidates.len() > 1
-                        && (candidates[0].1 - candidates[1].1) < 0.10
-                    {
+                    if candidates.len() > 1 && (candidates[0].1 - candidates[1].1) < 0.10 {
                         None
                     } else {
                         Some((*mg, reason.clone()))
@@ -1505,62 +1583,90 @@ pub fn merge_cast_list(
         };
 
         // Build MergedCastEntry
-        let (matched_en, character_en, source_en, confidence, reason, alt_en) = if let Some((mg, r)) = best_candidate {
-            // Mark ALL source_keys in this group as used (prevents source_only duplicates)
-            for sk in &mg.source_keys {
-                matched_en_keys.insert(sk.clone());
-            }
-            let conf = match r.as_str() {
-                "exact_actor_en" => 1.0,
-                "actor_en_normalized" => 0.98,
-                "actor_en_compact" => 0.96,
-                "actor_en_joined_given_name" => 0.95,
-                "actor_en_reversed_joined_given_name" => 0.93,
-                "actor_en_reversed" => 0.88,
-                "actor_en_token_subset" => 0.90,
-                "actor_zh_pinyin" => 0.94,
-                "role_pinyin_with_actor_surname" => 0.88,
-                "name_variant_exact" => 0.98,
-                "exact_pinyin" => 0.85,
-                "partial_pinyin" => 0.65,
-                _ => 0.95,
-            };
-            eprintln!(
-                "[Merge] Douban actor: {} / matched English group: {}",
-                ndb.actor_zh, mg.actor_name
-            );
-            eprintln!(
-                "[Merge] character_en selected: {} source={}",
-                if mg.character_name.is_empty() { "(empty)" } else { &mg.character_name },
-                mg.character_source
-            );
-            // Prefer Douban actor_en as display name when it's a subset of
-            // the matched group name (e.g. "Davika Hoorne" over "Mai Davika Hoorne")
-            let display_en = if let Some(ref db_en) = ndb.actor_en {
-                if r == "actor_en_token_subset" || token_subset_relation(db_en, &mg.actor_name).is_some() {
-                    db_en.clone()
+        let (matched_en, character_en, source_en, confidence, reason, alt_en) =
+            if let Some((mg, r)) = best_candidate {
+                // Mark ALL source_keys in this group as used (prevents source_only duplicates)
+                for sk in &mg.source_keys {
+                    matched_en_keys.insert(sk.clone());
+                }
+                let conf = match r.as_str() {
+                    "exact_actor_en" => 1.0,
+                    "actor_en_normalized" => 0.98,
+                    "actor_en_compact" => 0.96,
+                    "actor_en_joined_given_name" => 0.95,
+                    "actor_en_reversed_joined_given_name" => 0.93,
+                    "actor_en_reversed" => 0.88,
+                    "actor_en_token_subset" => 0.90,
+                    "actor_zh_pinyin" => 0.94,
+                    "role_pinyin_with_actor_surname" => 0.88,
+                    "name_variant_exact" => 0.98,
+                    "exact_pinyin" => 0.85,
+                    "partial_pinyin" => 0.65,
+                    _ => 0.95,
+                };
+                eprintln!(
+                    "[Merge] Douban actor: {} / matched English group: {}",
+                    ndb.actor_zh, mg.actor_name
+                );
+                eprintln!(
+                    "[Merge] character_en selected: {} source={}",
+                    if mg.character_name.is_empty() {
+                        "(empty)"
+                    } else {
+                        &mg.character_name
+                    },
+                    mg.character_source
+                );
+                // Prefer Douban actor_en as display name when it's a subset of
+                // the matched group name (e.g. "Davika Hoorne" over "Mai Davika Hoorne")
+                let display_en = if let Some(ref db_en) = ndb.actor_en {
+                    if r == "actor_en_token_subset"
+                        || token_subset_relation(db_en, &mg.actor_name).is_some()
+                    {
+                        db_en.clone()
+                    } else {
+                        mg.actor_name.clone()
+                    }
                 } else {
                     mg.actor_name.clone()
-                }
+                };
+                (
+                    display_en,
+                    if !mg.character_name.is_empty() {
+                        Some(mg.character_name.clone())
+                    } else {
+                        None
+                    },
+                    mg.character_source.clone(),
+                    conf,
+                    r,
+                    mg.alt_character_en.join(", "),
+                )
             } else {
-                mg.actor_name.clone()
+                (
+                    String::new(),
+                    None,
+                    String::new(),
+                    0.0,
+                    if has_en {
+                        "unmatched_en"
+                    } else {
+                        "unmatched_cn"
+                    }
+                    .to_string(),
+                    String::new(),
+                )
             };
-            (
-                display_en,
-                if !mg.character_name.is_empty() { Some(mg.character_name.clone()) } else { None },
-                mg.character_source.clone(),
-                conf,
-                r,
-                mg.alt_character_en.join(", "),
-            )
-        } else {
-            (String::new(), None, String::new(), 0.0, if has_en { "unmatched_en" } else { "unmatched_cn" }.to_string(), String::new())
-        };
 
         eprintln!(
             "[Merge] {} / {:?} / {} → matched={} source={} score={:.2} reason={}",
-            ndb.actor_zh, ndb.actor_en, ndb.character_zh,
-            !matched_en.is_empty(), source_en, confidence, reason
+            ndb.actor_zh,
+            ndb.actor_en,
+            ndb.character_zh,
+            !matched_en.is_empty(),
+            source_en,
+            confidence,
+            reason
         );
 
         // Push every Douban row with a valid character_zh.
@@ -1614,9 +1720,9 @@ pub fn merge_cast_list(
             if let Some(ndb) = ndb {
                 if let Some((mg, score, reason)) = try_role_assisted_match(ndb, &en_refs) {
                     // Check ambiguity: don't match same English group to multiple Douban entries
-                    let competing = role_updates.iter().any(|(_, m, _, _)| {
-                        m.actor_name == mg.actor_name
-                    });
+                    let competing = role_updates
+                        .iter()
+                        .any(|(_, m, _, _)| m.actor_name == mg.actor_name);
                     if competing {
                         eprintln!(
                             "[Merge] role-assisted ambiguous: multiple entries match {}",
@@ -1638,12 +1744,21 @@ pub fn merge_cast_list(
             let entry = &result[*ri];
             eprintln!(
                 "[Merge] {} / {:?} / {} → role_assisted matched={} source={} score={:.2} reason={}",
-                entry.actor_zh, entry.actor_en_douban, entry.character_zh,
-                !mg.actor_name.is_empty(), mg.character_source, score, reason
+                entry.actor_zh,
+                entry.actor_en_douban,
+                entry.character_zh,
+                !mg.actor_name.is_empty(),
+                mg.character_source,
+                score,
+                reason
             );
 
             result[*ri].actor_en_matched = mg.actor_name.clone();
-            result[*ri].character_en = if !mg.character_name.is_empty() { Some(normalize_character_en(&mg.character_name)) } else { None };
+            result[*ri].character_en = if !mg.character_name.is_empty() {
+                Some(normalize_character_en(&mg.character_name))
+            } else {
+                None
+            };
             result[*ri].source_en = mg.character_source.clone();
             result[*ri].confidence = *score;
             result[*ri].match_reason = reason.clone();
@@ -1654,11 +1769,18 @@ pub fn merge_cast_list(
     // ---- Post-filter: keep only rows with ALL four fields ----
     // actor_zh, actor_en_matched, character_zh, character_en must all be present.
     let total_douban = norm_douban.len();
-    let douban_with_char = norm_douban.iter().filter(|n| is_valid_character_name(&n.character_zh)).count();
+    let douban_with_char = norm_douban
+        .iter()
+        .filter(|n| is_valid_character_name(&n.character_zh))
+        .count();
     let douban_dropped_no_char = total_douban - douban_with_char;
     let en_source_only = merged_english
         .iter()
-        .filter(|mg| mg.source_keys.iter().all(|k| !matched_en_keys.contains(k.as_str())))
+        .filter(|mg| {
+            mg.source_keys
+                .iter()
+                .all(|k| !matched_en_keys.contains(k.as_str()))
+        })
         .filter(|mg| !mg.character_name.is_empty())
         .count();
 
@@ -1677,12 +1799,24 @@ pub fn merge_cast_list(
     });
     let en_filled = result.len();
 
-    eprintln!("[Merge] Douban rows with character_zh: {}", douban_with_char);
+    eprintln!(
+        "[Merge] Douban rows with character_zh: {}",
+        douban_with_char
+    );
     eprintln!("[Merge] character_en filled: {}", en_filled);
-    eprintln!("[Merge] dropped actor matched but no character_en: {}", dropped_matched_no_en);
+    eprintln!(
+        "[Merge] dropped actor matched but no character_en: {}",
+        dropped_matched_no_en
+    );
     eprintln!("[Merge] dropped unmatched_en: {}", dropped_unmatched);
-    eprintln!("[Merge] dropped Douban rows without character_zh: {}", douban_dropped_no_char);
-    eprintln!("[Merge] dropped source_only (English unmatched): {}", en_source_only);
+    eprintln!(
+        "[Merge] dropped Douban rows without character_zh: {}",
+        douban_dropped_no_char
+    );
+    eprintln!(
+        "[Merge] dropped source_only (English unmatched): {}",
+        en_source_only
+    );
     eprintln!("[Merge] final output rows: {}", result.len());
 
     // ---- Set pending_llm state (Chinese text as placeholder until LLM runs) ----
@@ -1697,12 +1831,22 @@ pub fn merge_cast_list(
     }
 
     result.sort_by(|a, b| {
-        let a_key = if !a.actor_en_douban.as_ref().unwrap_or(&a.actor_en_matched).is_empty() {
+        let a_key = if !a
+            .actor_en_douban
+            .as_ref()
+            .unwrap_or(&a.actor_en_matched)
+            .is_empty()
+        {
             a.actor_en_douban.as_ref().unwrap_or(&a.actor_en_matched)
         } else {
             &a.actor_zh
         };
-        let b_key = if !b.actor_en_douban.as_ref().unwrap_or(&b.actor_en_matched).is_empty() {
+        let b_key = if !b
+            .actor_en_douban
+            .as_ref()
+            .unwrap_or(&b.actor_en_matched)
+            .is_empty()
+        {
             b.actor_en_douban.as_ref().unwrap_or(&b.actor_en_matched)
         } else {
             &b.actor_zh
@@ -1751,41 +1895,142 @@ fn to_snake_key(name: &str) -> String {
 // Common pinyin→hanzi lookup table used across the module.
 static COMMON_PINYIN: &[(&str, &str)] = &[
     // Surnames
-    ("zhao", "赵"), ("li", "李"), ("wang", "王"), ("zhang", "张"),
-    ("liu", "刘"), ("chen", "陈"), ("yang", "杨"), ("huang", "黄"),
-    ("wu", "吴"), ("zhou", "周"), ("xu", "徐"), ("sun", "孙"),
-    ("ma", "马"), ("zhu", "朱"), ("hu", "胡"), ("guo", "郭"),
-    ("lin", "林"), ("he", "何"), ("gao", "高"), ("luo", "罗"),
-    ("zheng", "郑"), ("liang", "梁"), ("xie", "谢"), ("song", "宋"),
-    ("feng", "冯"), ("yu", "于"), ("dong", "董"), ("xiao", "萧"),
-    ("cheng", "程"), ("cao", "曹"), ("yuan", "袁"), ("deng", "邓"),
-    ("xu", "许"), ("fu", "傅"), ("shen", "沈"), ("zeng", "曾"),
-    ("peng", "彭"), ("lu", "吕"), ("su", "苏"), ("jiang", "蒋"),
-    ("cai", "蔡"), ("jia", "贾"), ("ding", "丁"), ("wei", "魏"),
-    ("xue", "薛"), ("ye", "叶"), ("yan", "阎"), ("yu", "余"),
-    ("pan", "潘"), ("du", "杜"), ("dai", "戴"), ("xia", "夏"),
-    ("zhong", "钟"), ("tian", "田"), ("ren", "任"), ("jiang", "姜"),
-    ("fan", "范"), ("fang", "方"), ("shi", "石"), ("yao", "姚"),
-    ("tan", "谭"), ("liao", "廖"), ("zou", "邹"), ("xiong", "熊"),
-    ("jin", "金"), ("lu", "陆"), ("hao", "郝"), ("kong", "孔"),
-    ("bai", "白"), ("cui", "崔"), ("kang", "康"), ("mao", "毛"),
-    ("qiu", "邱"), ("qin", "秦"), ("jiang", "江"), ("shi", "史"),
-    ("gu", "顾"), ("hou", "侯"), ("shao", "邵"), ("meng", "孟"),
-    ("long", "龙"), ("wan", "万"), ("duan", "段"), ("lei", "雷"),
-    ("qian", "钱"), ("tang", "汤"), ("yin", "尹"), ("yi", "易"),
-    ("chang", "常"), ("wu", "武"), ("qiao", "乔"), ("he", "贺"),
-    ("lai", "赖"), ("gong", "龚"), ("wen", "文"),
+    ("zhao", "赵"),
+    ("li", "李"),
+    ("wang", "王"),
+    ("zhang", "张"),
+    ("liu", "刘"),
+    ("chen", "陈"),
+    ("yang", "杨"),
+    ("huang", "黄"),
+    ("wu", "吴"),
+    ("zhou", "周"),
+    ("xu", "徐"),
+    ("sun", "孙"),
+    ("ma", "马"),
+    ("zhu", "朱"),
+    ("hu", "胡"),
+    ("guo", "郭"),
+    ("lin", "林"),
+    ("he", "何"),
+    ("gao", "高"),
+    ("luo", "罗"),
+    ("zheng", "郑"),
+    ("liang", "梁"),
+    ("xie", "谢"),
+    ("song", "宋"),
+    ("feng", "冯"),
+    ("yu", "于"),
+    ("dong", "董"),
+    ("xiao", "萧"),
+    ("cheng", "程"),
+    ("cao", "曹"),
+    ("yuan", "袁"),
+    ("deng", "邓"),
+    ("xu", "许"),
+    ("fu", "傅"),
+    ("shen", "沈"),
+    ("zeng", "曾"),
+    ("peng", "彭"),
+    ("lu", "吕"),
+    ("su", "苏"),
+    ("jiang", "蒋"),
+    ("cai", "蔡"),
+    ("jia", "贾"),
+    ("ding", "丁"),
+    ("wei", "魏"),
+    ("xue", "薛"),
+    ("ye", "叶"),
+    ("yan", "阎"),
+    ("yu", "余"),
+    ("pan", "潘"),
+    ("du", "杜"),
+    ("dai", "戴"),
+    ("xia", "夏"),
+    ("zhong", "钟"),
+    ("tian", "田"),
+    ("ren", "任"),
+    ("jiang", "姜"),
+    ("fan", "范"),
+    ("fang", "方"),
+    ("shi", "石"),
+    ("yao", "姚"),
+    ("tan", "谭"),
+    ("liao", "廖"),
+    ("zou", "邹"),
+    ("xiong", "熊"),
+    ("jin", "金"),
+    ("lu", "陆"),
+    ("hao", "郝"),
+    ("kong", "孔"),
+    ("bai", "白"),
+    ("cui", "崔"),
+    ("kang", "康"),
+    ("mao", "毛"),
+    ("qiu", "邱"),
+    ("qin", "秦"),
+    ("jiang", "江"),
+    ("shi", "史"),
+    ("gu", "顾"),
+    ("hou", "侯"),
+    ("shao", "邵"),
+    ("meng", "孟"),
+    ("long", "龙"),
+    ("wan", "万"),
+    ("duan", "段"),
+    ("lei", "雷"),
+    ("qian", "钱"),
+    ("tang", "汤"),
+    ("yin", "尹"),
+    ("yi", "易"),
+    ("chang", "常"),
+    ("wu", "武"),
+    ("qiao", "乔"),
+    ("he", "贺"),
+    ("lai", "赖"),
+    ("gong", "龚"),
+    ("wen", "文"),
     // Given-name characters
-    ("yun", "昀"), ("rui", "锐"), ("li", "丽"), ("ying", "颖"),
-    ("mi", "米"), ("le", "乐"), ("lun", "伦"), ("yan", "彦"),
-    ("che", "彻"), ("xuan", "璇"), ("zi", "紫"), ("yue", "越"),
-    ("ling", "陵"), ("nv", "女"), ("shen", "神"), ("nan", "南"),
-    ("sheng", "盛"), ("yi", "一"), ("kai", "开"), ("qian", "茜"),
-    ("chen", "晨"), ("yu", "雨"), ("xiao", "晓"), ("si", "思"),
-    ("jing", "静"), ("tong", "彤"), ("meng", "梦"), ("xian", "璇"),
-    ("lu", "卢"), ("huo", "霍"), ("nei", "内"), ("wei", "薇"),
-    ("ka", "卡"), ("chong", "冲"), ("jie", "洁"), ("qiong", "琼"),
-    ("feng", "风"), ("mu", "木"), ("ning", "宁"), ("dai", "黛"),
+    ("yun", "昀"),
+    ("rui", "锐"),
+    ("li", "丽"),
+    ("ying", "颖"),
+    ("mi", "米"),
+    ("le", "乐"),
+    ("lun", "伦"),
+    ("yan", "彦"),
+    ("che", "彻"),
+    ("xuan", "璇"),
+    ("zi", "紫"),
+    ("yue", "越"),
+    ("ling", "陵"),
+    ("nv", "女"),
+    ("shen", "神"),
+    ("nan", "南"),
+    ("sheng", "盛"),
+    ("yi", "一"),
+    ("kai", "开"),
+    ("qian", "茜"),
+    ("chen", "晨"),
+    ("yu", "雨"),
+    ("xiao", "晓"),
+    ("si", "思"),
+    ("jing", "静"),
+    ("tong", "彤"),
+    ("meng", "梦"),
+    ("xian", "璇"),
+    ("lu", "卢"),
+    ("huo", "霍"),
+    ("nei", "内"),
+    ("wei", "薇"),
+    ("ka", "卡"),
+    ("chong", "冲"),
+    ("jie", "洁"),
+    ("qiong", "琼"),
+    ("feng", "风"),
+    ("mu", "木"),
+    ("ning", "宁"),
+    ("dai", "黛"),
 ];
 
 /// Title/role semantic dictionary for role-assisted matching.
@@ -1815,7 +2060,10 @@ fn zh_to_pinyin(zh: &str) -> Option<String> {
         if c.is_whitespace() || c == '·' || c == '・' {
             continue;
         }
-        let py = COMMON_PINYIN.iter().find(|(_, h)| *h == c.to_string().as_str()).map(|(p, _)| *p);
+        let py = COMMON_PINYIN
+            .iter()
+            .find(|(_, h)| *h == c.to_string().as_str())
+            .map(|(p, _)| *p);
         match py {
             Some(p) => parts.push(p),
             None => return None,
@@ -1841,7 +2089,7 @@ fn zh_pinyin_variants(zh: &str) -> Vec<String> {
             let first2 = format!("{} {}", parts[0], parts[1]);
             variants.push(first2.replace(' ', ""));
             if parts.len() >= 3 {
-                let last2 = format!("{} {}", parts[parts.len()-2], parts[parts.len()-1]);
+                let last2 = format!("{} {}", parts[parts.len() - 2], parts[parts.len() - 1]);
                 variants.push(last2.replace(' ', ""));
             }
         }
@@ -1977,7 +2225,12 @@ fn try_role_assisted_match<'a>(
         let mut actor_evidence = Vec::new();
 
         // Evidence 1: surname match
-        let en_surname = mg.actor_name.split_whitespace().next().unwrap_or("").to_lowercase();
+        let en_surname = mg
+            .actor_name
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
         if !db_surname.is_empty() && en_surname == db_surname {
             actor_evidence.push(format!("surname={}", db_surname));
         }
@@ -2002,7 +2255,8 @@ fn try_role_assisted_match<'a>(
         }
 
         // Score based on best role + actor evidence
-        let best_role_ev = role_evidence.iter()
+        let best_role_ev = role_evidence
+            .iter()
             .map(|(kind, val)| {
                 if *kind == "pinyin" && val.len() >= 4 {
                     // Longer pinyin match = strong
@@ -2031,7 +2285,11 @@ fn try_role_assisted_match<'a>(
         );
 
         if best.as_ref().map_or(true, |(_, s, _)| best_role_ev > *s) {
-            best = Some((*mg, best_role_ev, "role_pinyin_with_actor_surname".to_string()));
+            best = Some((
+                *mg,
+                best_role_ev,
+                "role_pinyin_with_actor_surname".to_string(),
+            ));
         }
     }
 
@@ -2043,7 +2301,6 @@ fn find_pinyin_match_detail_for_zh<'a>(
     zh_name: &str,
     en_entries: &'a [PastedEntry],
 ) -> (Option<&'a PastedEntry>, MatchKind) {
-
     let mut best_match: Option<&PastedEntry> = None;
     let mut best_kind = MatchKind::NoMatch;
 
@@ -2051,19 +2308,23 @@ fn find_pinyin_match_detail_for_zh<'a>(
 
     // Recursively split a pinyin string into syllables found in common_pinyin.
     // Returns the number of parts if all sub-segments match, or 0 if not splittable.
-    fn split_pinyin_parts(
-        rest: &str,
-        table: &[(&str, &str)],
-        zh_name: &str,
-    ) -> usize {
-        if rest.is_empty() { return 0; }
+    fn split_pinyin_parts(rest: &str, table: &[(&str, &str)], zh_name: &str) -> usize {
+        if rest.is_empty() {
+            return 0;
+        }
         for len in 1..=rest.len() {
             let candidate = &rest[..len];
-            let found = table.iter().any(|(p, h)| candidate == *p && zh_name.contains(h));
+            let found = table
+                .iter()
+                .any(|(p, h)| candidate == *p && zh_name.contains(h));
             if found {
-                if len == rest.len() { return 1; }
+                if len == rest.len() {
+                    return 1;
+                }
                 let sub = split_pinyin_parts(&rest[len..], table, zh_name);
-                if sub > 0 { return 1 + sub; }
+                if sub > 0 {
+                    return 1 + sub;
+                }
             }
         }
         0
@@ -2072,7 +2333,9 @@ fn find_pinyin_match_detail_for_zh<'a>(
     for en_entry in en_entries {
         let en_name = en_entry.actor_name.to_lowercase();
         let en_parts: Vec<&str> = en_name.split_whitespace().collect();
-        if en_parts.is_empty() { continue; }
+        if en_parts.is_empty() {
+            continue;
+        }
 
         // Phase 1: compound name splitting (runs FIRST, highest priority)
         // e.g., "Li Yunrui" → ["li", "yunrui"]: "yunrui" splits into "yun"+"rui"
@@ -2080,7 +2343,8 @@ fn find_pinyin_match_detail_for_zh<'a>(
             let mut total_parts: usize = 0;
             let mut all_parts_valid = true;
             for en_part in &en_parts {
-                let direct = COMMON_PINYIN.iter()
+                let direct = COMMON_PINYIN
+                    .iter()
                     .any(|(p, h)| *en_part == *p && zh_name.contains(h));
                 if direct {
                     total_parts += 1;
@@ -2115,7 +2379,9 @@ fn find_pinyin_match_detail_for_zh<'a>(
                     break;
                 }
             }
-            if !part_matched { all_matched = false; }
+            if !part_matched {
+                all_matched = false;
+            }
         }
 
         // ExactPinyin: all parts matched AND count matches zh_char_count
@@ -2172,7 +2438,10 @@ fn find_tmdb_match_for_douban_en<'a>(
         let en_full_variants = chinese_romanized_name_variants(&entry.actor_name);
 
         // Priority 3: variant intersection (including space-containing forms)
-        if let Some(matched_variant) = db_full_variants.iter().find(|dv| en_full_variants.contains(dv)) {
+        if let Some(matched_variant) = db_full_variants
+            .iter()
+            .find(|dv| en_full_variants.contains(dv))
+        {
             if !matched_variant.contains(' ') {
                 // Compact-only match
                 best_match = Some(entry);
@@ -2231,9 +2500,9 @@ pub struct QualityReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfidenceBreakdown {
-    pub high: usize,    // >= 0.85
-    pub medium: usize,  // 0.60 - 0.84
-    pub low: usize,     // < 0.60
+    pub high: usize,   // >= 0.85
+    pub medium: usize, // 0.60 - 0.84
+    pub low: usize,    // < 0.60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2261,10 +2530,14 @@ pub fn verify_character_dict(dict: &CharacterDict) -> QualityReport {
     let mut low = 0usize;
 
     // Duplicate detection maps: value → [keys]
-    let mut actor_en_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    let mut actor_cn_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    let mut role_en_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    let mut role_cn_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut actor_en_map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut actor_cn_map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut role_en_map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut role_cn_map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
     for (key, entry) in dict {
         // Missing checks
@@ -2296,7 +2569,10 @@ pub fn verify_character_dict(dict: &CharacterDict) -> QualityReport {
         // Duplicate detection
         let actor_en_norm = entry.actor.english.to_lowercase().trim().to_string();
         if !actor_en_norm.is_empty() {
-            actor_en_map.entry(actor_en_norm).or_default().push(key.clone());
+            actor_en_map
+                .entry(actor_en_norm)
+                .or_default()
+                .push(key.clone());
         }
 
         if let Some(ref cn) = entry.actor.chinese {
@@ -2415,22 +2691,18 @@ mod tests {
 
     #[test]
     fn test_build_dict_with_pinyin_match() {
-        let mdl = vec![
-            PastedEntry {
-                actor_name: "Zhao Liying".into(),
-                character_name: "Chu Qiao".into(),
-                role_type: Some("Main Role".into()),
-                source: PasteSource::MyDramaList,
-            },
-        ];
-        let douban = vec![
-            PastedEntry {
-                actor_name: "赵丽颖".into(),
-                character_name: "楚乔".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let mdl = vec![PastedEntry {
+            actor_name: "Zhao Liying".into(),
+            character_name: "Chu Qiao".into(),
+            role_type: Some("Main Role".into()),
+            source: PasteSource::MyDramaList,
+        }];
+        let douban = vec![PastedEntry {
+            actor_name: "赵丽颖".into(),
+            character_name: "楚乔".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
         let dict = build_character_dict(&mdl, &douban);
         assert_eq!(dict.len(), 1, "expected 1 entry but got {}", dict.len());
         let entry = dict.get("zhao_liying").unwrap();
@@ -2587,14 +2859,12 @@ mod tests {
 
     #[test]
     fn test_normalize_douban_basic() {
-        let entries = vec![
-            PastedEntry {
-                actor_name: "李昀锐 Yunrui Li".into(),
-                character_name: "诸葛玥".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let entries = vec![PastedEntry {
+            actor_name: "李昀锐 Yunrui Li".into(),
+            character_name: "诸葛玥".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
         let norm = normalize_douban_entries(&entries);
         assert_eq!(norm.len(), 1);
         assert_eq!(norm[0].actor_zh, "李昀锐");
@@ -2604,14 +2874,12 @@ mod tests {
 
     #[test]
     fn test_normalize_douban_latin_character() {
-        let entries = vec![
-            PastedEntry {
-                actor_name: "赵丽颖".into(),
-                character_name: "Chu Qiao".into(), // all Latin → filtered
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let entries = vec![PastedEntry {
+            actor_name: "赵丽颖".into(),
+            character_name: "Chu Qiao".into(), // all Latin → filtered
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
         let norm = normalize_douban_entries(&entries);
         assert_eq!(norm.len(), 1);
         assert_eq!(norm[0].character_zh, ""); // Latin-only filtered out
@@ -2622,11 +2890,21 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     fn make_tmdb(name: &str, role: &str) -> PastedEntry {
-        PastedEntry { actor_name: name.into(), character_name: role.into(), role_type: None, source: PasteSource::Tmdb }
+        PastedEntry {
+            actor_name: name.into(),
+            character_name: role.into(),
+            role_type: None,
+            source: PasteSource::Tmdb,
+        }
     }
 
     fn make_mdl(name: &str, role: &str) -> PastedEntry {
-        PastedEntry { actor_name: name.into(), character_name: role.into(), role_type: None, source: PasteSource::MdlHtml }
+        PastedEntry {
+            actor_name: name.into(),
+            character_name: role.into(),
+            role_type: None,
+            source: PasteSource::MdlHtml,
+        }
     }
 
     #[test]
@@ -2701,11 +2979,36 @@ mod tests {
             make_tmdb("Li Xiaoqian", "Xiao Ce"),
         ];
         let douban = vec![
-            PastedEntry { actor_name: "李昀锐 Yunrui Li".into(), character_name: "诸葛玥".into(), role_type: None, source: PasteSource::Douban },
-            PastedEntry { actor_name: "黄杨钿甜 Tiantian Huangyang".into(), character_name: "楚乔".into(), role_type: None, source: PasteSource::Douban },
-            PastedEntry { actor_name: "张康乐 Kangle Zhang".into(), character_name: "燕洵".into(), role_type: None, source: PasteSource::Douban },
-            PastedEntry { actor_name: "夏梦 Meng Xia".into(), character_name: "元淳".into(), role_type: None, source: PasteSource::Douban },
-            PastedEntry { actor_name: "李孝谦 Xiaoqian Li".into(), character_name: "萧策".into(), role_type: None, source: PasteSource::Douban },
+            PastedEntry {
+                actor_name: "李昀锐 Yunrui Li".into(),
+                character_name: "诸葛玥".into(),
+                role_type: None,
+                source: PasteSource::Douban,
+            },
+            PastedEntry {
+                actor_name: "黄杨钿甜 Tiantian Huangyang".into(),
+                character_name: "楚乔".into(),
+                role_type: None,
+                source: PasteSource::Douban,
+            },
+            PastedEntry {
+                actor_name: "张康乐 Kangle Zhang".into(),
+                character_name: "燕洵".into(),
+                role_type: None,
+                source: PasteSource::Douban,
+            },
+            PastedEntry {
+                actor_name: "夏梦 Meng Xia".into(),
+                character_name: "元淳".into(),
+                role_type: None,
+                source: PasteSource::Douban,
+            },
+            PastedEntry {
+                actor_name: "李孝谦 Xiaoqian Li".into(),
+                character_name: "萧策".into(),
+                role_type: None,
+                source: PasteSource::Douban,
+            },
         ];
         let mdl: Vec<PastedEntry> = vec![];
 
@@ -2729,8 +3032,11 @@ mod tests {
         // Check no actor_zh contains Latin
         for e in &merged {
             if !e.actor_zh.is_empty() {
-                assert!(!e.actor_zh.chars().any(|c| c.is_ascii_alphabetic()),
-                    "actor_zh should not contain Latin: {}", e.actor_zh);
+                assert!(
+                    !e.actor_zh.chars().any(|c| c.is_ascii_alphabetic()),
+                    "actor_zh should not contain Latin: {}",
+                    e.actor_zh
+                );
             }
         }
     }
@@ -2784,14 +3090,12 @@ mod tests {
     #[test]
     fn test_exact_actor_en_charles_lin() {
         let tmdb = vec![make_tmdb("Charles Lin", "Zhan Zi Yu")];
-        let douban = vec![
-            PastedEntry {
-                actor_name: "林柏叡 Charles Lin".into(),
-                character_name: "詹子瑜".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let douban = vec![PastedEntry {
+            actor_name: "林柏叡 Charles Lin".into(),
+            character_name: "詹子瑜".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
         let mdl: Vec<PastedEntry> = vec![];
 
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
@@ -2810,14 +3114,12 @@ mod tests {
     #[test]
     fn test_exact_actor_en_jin_qiu() {
         let tmdb = vec![make_tmdb("Jin Qiu", "Jin Yue")];
-        let douban = vec![
-            PastedEntry {
-                actor_name: "金秋 Jin Qiu".into(),
-                character_name: "金月".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let douban = vec![PastedEntry {
+            actor_name: "金秋 Jin Qiu".into(),
+            character_name: "金月".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
         let mdl: Vec<PastedEntry> = vec![];
 
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
@@ -2835,14 +3137,12 @@ mod tests {
         // NBSP in Douban actor_name is normalized to regular space by split_cjk_latin,
         // so it matches TMDb via exact_actor_en
         let tmdb = vec![make_tmdb("Jin Qiu", "Jin Yue")];
-        let douban = vec![
-            PastedEntry {
-                actor_name: "金秋 Jin\u{00A0}Qiu".into(),
-                character_name: "金月".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let douban = vec![PastedEntry {
+            actor_name: "金秋 Jin\u{00A0}Qiu".into(),
+            character_name: "金月".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
         let mdl: Vec<PastedEntry> = vec![];
 
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
@@ -2858,42 +3158,46 @@ mod tests {
     fn test_no_duplicate_tmdb_only_for_matched() {
         // Charles Lin matched from Douban → should NOT appear as tmdb_only
         let tmdb = vec![make_tmdb("Charles Lin", "Zhan Zi Yu")];
-        let douban = vec![
-            PastedEntry {
-                actor_name: "林柏叡 Charles Lin".into(),
-                character_name: "詹子瑜".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let douban = vec![PastedEntry {
+            actor_name: "林柏叡 Charles Lin".into(),
+            character_name: "詹子瑜".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
         let mdl: Vec<PastedEntry> = vec![];
 
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
-        let tmdb_only: Vec<_> = merged.iter()
+        let tmdb_only: Vec<_> = merged
+            .iter()
             .filter(|e| e.match_reason.contains("tmdb_only"))
             .collect();
-        assert!(tmdb_only.is_empty(),
-            "matched Charles Lin should not appear as tmdb_only: {:?}", tmdb_only);
+        assert!(
+            tmdb_only.is_empty(),
+            "matched Charles Lin should not appear as tmdb_only: {:?}",
+            tmdb_only
+        );
     }
 
     #[test]
     fn test_exact_actor_en_no_false_match() {
         // "Lin Bo" should NOT match "Charles Lin" → unmatched_en → dropped in final output.
         let tmdb = vec![make_tmdb("Charles Lin", "Zhan Zi Yu")];
-        let douban = vec![
-            PastedEntry {
-                actor_name: "林某 Lin Bo".into(),
-                character_name: "某角色".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let douban = vec![PastedEntry {
+            actor_name: "林某 Lin Bo".into(),
+            character_name: "某角色".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
         let mdl: Vec<PastedEntry> = vec![];
 
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
         // Lin Bo has no match with Charles Lin → unmatched_en → dropped
-        assert_eq!(merged.len(), 0,
-            "unmatched Lin Bo should be dropped from final output, got {:?}", merged);
+        assert_eq!(
+            merged.len(),
+            0,
+            "unmatched Lin Bo should be dropped from final output, got {:?}",
+            merged
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -2907,14 +3211,12 @@ mod tests {
         // name_variants("Li Yun Rui") = ["liyunrui", "yunruili"]
         // "liyunrui" ∈ both → NameVariantExact
         let tmdb = vec![make_tmdb("Li Yun Rui", "Zhuge Yue")];
-        let douban = vec![
-            PastedEntry {
-                actor_name: "李昀锐 Yunrui Li".into(),
-                character_name: "诸葛玥".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let douban = vec![PastedEntry {
+            actor_name: "李昀锐 Yunrui Li".into(),
+            character_name: "诸葛玥".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
         let mdl: Vec<PastedEntry> = vec![];
 
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
@@ -2924,7 +3226,11 @@ mod tests {
         assert_eq!(entry.actor_zh, "李昀锐");
         assert_eq!(entry.actor_en_matched, "Li Yun Rui");
         assert_eq!(entry.character_en.as_deref(), Some("Zhuge Yue"));
-        assert!(entry.confidence >= 0.95, "confidence {} should be >= 0.95", entry.confidence);
+        assert!(
+            entry.confidence >= 0.95,
+            "confidence {} should be >= 0.95",
+            entry.confidence
+        );
     }
 
     #[test]
@@ -2932,14 +3238,12 @@ mod tests {
         // "Hu Yi Xuan" vs "Hu Yixuan" — space in given name
         // compact("Hu Yi Xuan") = "huyixuan" == compact("Hu Yixuan") = "huyixuan"
         let tmdb = vec![make_tmdb("Hu Yi Xuan", "Fang Xiao")];
-        let douban = vec![
-            PastedEntry {
-                actor_name: "胡一天 Hu Yixuan".into(),
-                character_name: "方小".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let douban = vec![PastedEntry {
+            actor_name: "胡一天 Hu Yixuan".into(),
+            character_name: "方小".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
         let mdl: Vec<PastedEntry> = vec![];
 
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
@@ -2948,7 +3252,11 @@ mod tests {
         let entry = &merged[0];
         assert_eq!(entry.actor_en_matched, "Hu Yi Xuan");
         assert_eq!(entry.character_en.as_deref(), Some("Fang Xiao"));
-        assert!(entry.confidence >= 0.95, "confidence {} should be >= 0.95", entry.confidence);
+        assert!(
+            entry.confidence >= 0.95,
+            "confidence {} should be >= 0.95",
+            entry.confidence
+        );
     }
 
     #[test]
@@ -2956,22 +3264,24 @@ mod tests {
         // Realistic scenario: TMDb + MDL both present, name reversed in Douban
         let tmdb = vec![make_tmdb("Li Yun Rui", "Zhuge Yue")];
         let mdl = vec![make_mdl("Li Yun Rui", "Zhuge Yue")];
-        let douban = vec![
-            PastedEntry {
-                actor_name: "李昀锐 Yunrui Li".into(),
-                character_name: "诸葛玥".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let douban = vec![PastedEntry {
+            actor_name: "李昀锐 Yunrui Li".into(),
+            character_name: "诸葛玥".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
 
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
         // Should NOT have tmdb_only or mdl_only for Li Yun Rui
-        let tmdb_only: Vec<_> = merged.iter()
+        let tmdb_only: Vec<_> = merged
+            .iter()
             .filter(|e| e.match_reason.contains("tmdb_only") || e.match_reason.contains("mdl_only"))
             .collect();
-        assert!(tmdb_only.is_empty(),
-            "matched Li Yun Rui should not appear as *_only: {:?}", tmdb_only);
+        assert!(
+            tmdb_only.is_empty(),
+            "matched Li Yun Rui should not appear as *_only: {:?}",
+            tmdb_only
+        );
     }
 
     #[test]
@@ -2981,14 +3291,12 @@ mod tests {
         // TMDb parts: ["li", "yun", "rui"] — all in common_pinyin
         // All matched → ExactPinyin (score=0.85)
         let tmdb = vec![make_tmdb("Li Yun Rui", "Zhuge Yue")];
-        let douban = vec![
-            PastedEntry {
-                actor_name: "李昀锐".into(),  // CJK only, no EN
-                character_name: "诸葛玥".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let douban = vec![PastedEntry {
+            actor_name: "李昀锐".into(), // CJK only, no EN
+            character_name: "诸葛玥".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
         let mdl: Vec<PastedEntry> = vec![];
 
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
@@ -3007,14 +3315,12 @@ mod tests {
         // TMDb has "Li Yunrui" (compact given name) — "yunrui" NOT in common_pinyin
         // Falls through to compact pinyin check: "liyunrui" is prefix of "liyunrui"
         let tmdb = vec![make_tmdb("Li Yunrui", "Zhuge Yue")];
-        let douban = vec![
-            PastedEntry {
-                actor_name: "李昀锐".into(),  // CJK only
-                character_name: "诸葛玥".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let douban = vec![PastedEntry {
+            actor_name: "李昀锐".into(), // CJK only
+            character_name: "诸葛玥".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
         let mdl: Vec<PastedEntry> = vec![];
 
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
@@ -3024,7 +3330,11 @@ mod tests {
         assert_eq!(entry.actor_en_matched, "Li Yunrui");
         assert_eq!(entry.character_en.as_deref(), Some("Zhuge Yue"));
         // compact pinyin match — confidence should be reasonable
-        assert!(entry.confidence >= 0.5, "confidence {} should be >= 0.5", entry.confidence);
+        assert!(
+            entry.confidence >= 0.5,
+            "confidence {} should be >= 0.5",
+            entry.confidence
+        );
     }
 
     #[test]
@@ -3033,19 +3343,20 @@ mod tests {
         // "huangzuxin" is NOT a prefix/suffix of "huangyangdiantian"
         // CJK-only Douban with no EN match → dropped (unmatched_cn) in final output.
         let tmdb = vec![make_tmdb("Huang Zuxin", "Some Role")];
-        let douban = vec![
-            PastedEntry {
-                actor_name: "黄杨钿甜".into(),
-                character_name: "楚乔".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let douban = vec![PastedEntry {
+            actor_name: "黄杨钿甜".into(),
+            character_name: "楚乔".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
         let mdl: Vec<PastedEntry> = vec![];
 
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
-        assert_eq!(merged.len(), 0,
-            "Huang Zuxin should NOT match 黄杨钿甜, and unmatched_cn rows are dropped");
+        assert_eq!(
+            merged.len(),
+            0,
+            "Huang Zuxin should NOT match 黄杨钿甜, and unmatched_cn rows are dropped"
+        );
     }
 
     // ---- English source pre-merge tests ----
@@ -3061,7 +3372,9 @@ mod tests {
         assert_eq!(merged_en[0].actor_name, "Dong Bo");
         assert_eq!(merged_en[0].character_name, "Tu Mu Gong");
         assert_eq!(merged_en[0].character_source, "MDL");
-        assert!(merged_en[0].alt_character_en.contains(&"Lord Tumu".to_string()));
+        assert!(merged_en[0]
+            .alt_character_en
+            .contains(&"Lord Tumu".to_string()));
     }
 
     #[test]
@@ -3095,18 +3408,29 @@ mod tests {
         // → 1 row for Dong Bo, character_en=Tu Mu Gong, no source_only row
         let tmdb = vec![make_tmdb("Dong Bo", "Lord Tumu")];
         let mdl = vec![make_mdl("Dong Bo", "Tu Mu Gong")];
-        let douban = vec![
-            PastedEntry {
-                actor_name: "董博 Dong Bo".into(),
-                character_name: "土木公".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let douban = vec![PastedEntry {
+            actor_name: "董博 Dong Bo".into(),
+            character_name: "土木公".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
 
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
-        assert_eq!(merged.len(), 1, "should have exactly 1 row, got {}: {:?}", merged.len(),
-            merged.iter().map(|e| format!("{}|{}|{}", e.actor_en_matched, e.character_en.as_deref().unwrap_or(""), e.match_reason)).collect::<Vec<_>>());
+        assert_eq!(
+            merged.len(),
+            1,
+            "should have exactly 1 row, got {}: {:?}",
+            merged.len(),
+            merged
+                .iter()
+                .map(|e| format!(
+                    "{}|{}|{}",
+                    e.actor_en_matched,
+                    e.character_en.as_deref().unwrap_or(""),
+                    e.match_reason
+                ))
+                .collect::<Vec<_>>()
+        );
 
         let entry = &merged[0];
         assert_eq!(entry.actor_en_matched, "Dong Bo");
@@ -3114,8 +3438,11 @@ mod tests {
         assert_eq!(entry.source_en, "MDL");
         assert_eq!(entry.match_reason, "exact_actor_en");
         assert_eq!(entry.confidence, 1.0);
-        assert!(entry.alt_character_en.contains("Lord Tumu"),
-            "alt should contain TMDb alternative, got: {}", entry.alt_character_en);
+        assert!(
+            entry.alt_character_en.contains("Lord Tumu"),
+            "alt should contain TMDb alternative, got: {}",
+            entry.alt_character_en
+        );
     }
 
     #[test]
@@ -3134,14 +3461,12 @@ mod tests {
         // Verify Charles Lin exact_actor_en still works after refactor
         let tmdb = vec![make_tmdb("Charles Lin", "Lord Tumu")];
         let mdl: Vec<PastedEntry> = vec![];
-        let douban = vec![
-            PastedEntry {
-                actor_name: "林柏叡 Charles Lin".into(),
-                character_name: "土木公".into(),
-                role_type: None,
-                source: PasteSource::Douban,
-            },
-        ];
+        let douban = vec![PastedEntry {
+            actor_name: "林柏叡 Charles Lin".into(),
+            character_name: "土木公".into(),
+            role_type: None,
+            source: PasteSource::Douban,
+        }];
 
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
         assert_eq!(merged.len(), 1);
@@ -3155,35 +3480,78 @@ mod tests {
     #[test]
     fn test_variants_li_yun_rui_3part() {
         let v = chinese_romanized_name_variants("Li Yun Rui");
-        assert!(v.contains(&"li yun rui".to_string()), "should contain normalized");
-        assert!(v.contains(&"liyunrui".to_string()), "should contain compact, got {:?}", v);
-        assert!(v.contains(&"li yunrui".to_string()), "should contain surname+joined given");
-        assert!(v.contains(&"yunrui li".to_string()), "should contain joined+surname");
+        assert!(
+            v.contains(&"li yun rui".to_string()),
+            "should contain normalized"
+        );
+        assert!(
+            v.contains(&"liyunrui".to_string()),
+            "should contain compact, got {:?}",
+            v
+        );
+        assert!(
+            v.contains(&"li yunrui".to_string()),
+            "should contain surname+joined given"
+        );
+        assert!(
+            v.contains(&"yunrui li".to_string()),
+            "should contain joined+surname"
+        );
     }
 
     #[test]
     fn test_variants_li_yunrui_2part() {
         let v = chinese_romanized_name_variants("Li Yunrui");
-        assert!(v.contains(&"li yunrui".to_string()), "should contain normalized");
-        assert!(v.contains(&"liyunrui".to_string()), "should contain compact");
-        assert!(v.contains(&"yunrui li".to_string()), "should contain reversed");
+        assert!(
+            v.contains(&"li yunrui".to_string()),
+            "should contain normalized"
+        );
+        assert!(
+            v.contains(&"liyunrui".to_string()),
+            "should contain compact"
+        );
+        assert!(
+            v.contains(&"yunrui li".to_string()),
+            "should contain reversed"
+        );
     }
 
     #[test]
     fn test_variants_dong_yu_fei_3part() {
         let v = chinese_romanized_name_variants("Dong Yu Fei");
-        assert!(v.contains(&"dong yu fei".to_string()), "should contain normalized");
-        assert!(v.contains(&"dongyufei".to_string()), "should contain compact");
-        assert!(v.contains(&"dong yufei".to_string()), "should contain surname+joined");
-        assert!(v.contains(&"yufei dong".to_string()), "should contain joined+surname");
+        assert!(
+            v.contains(&"dong yu fei".to_string()),
+            "should contain normalized"
+        );
+        assert!(
+            v.contains(&"dongyufei".to_string()),
+            "should contain compact"
+        );
+        assert!(
+            v.contains(&"dong yufei".to_string()),
+            "should contain surname+joined"
+        );
+        assert!(
+            v.contains(&"yufei dong".to_string()),
+            "should contain joined+surname"
+        );
     }
 
     #[test]
     fn test_variants_dong_yufei_2part() {
         let v = chinese_romanized_name_variants("Dong Yufei");
-        assert!(v.contains(&"dong yufei".to_string()), "should contain normalized");
-        assert!(v.contains(&"dongyufei".to_string()), "should contain compact");
-        assert!(v.contains(&"yufei dong".to_string()), "should contain reversed");
+        assert!(
+            v.contains(&"dong yufei".to_string()),
+            "should contain normalized"
+        );
+        assert!(
+            v.contains(&"dongyufei".to_string()),
+            "should contain compact"
+        );
+        assert!(
+            v.contains(&"yufei dong".to_string()),
+            "should contain reversed"
+        );
     }
 
     // ---- Positive match tests via merge_cast_list ----
@@ -3207,18 +3575,36 @@ mod tests {
         }
     }
 
-    fn assert_single_merge(tmdb_name: &str, douban_name: &str, tmdb_role: &str, douban_char_zh: &str) {
+    fn assert_single_merge(
+        tmdb_name: &str,
+        douban_name: &str,
+        tmdb_role: &str,
+        douban_char_zh: &str,
+    ) {
         let tmdb = vec![make_tmdb(tmdb_name, tmdb_role)];
         let mdl: Vec<PastedEntry> = vec![];
         let douban = vec![make_douban_full(douban_name, douban_char_zh)];
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
-        assert_eq!(merged.len(), 1,
+        assert_eq!(
+            merged.len(),
+            1,
             "{} vs {}: expected 1 row, got {}: {:?}",
-            tmdb_name, douban_name, merged.len(),
-            merged.iter().map(|e| format!("{}|{}", e.actor_en_matched, e.match_reason)).collect::<Vec<_>>());
+            tmdb_name,
+            douban_name,
+            merged.len(),
+            merged
+                .iter()
+                .map(|e| format!("{}|{}", e.actor_en_matched, e.match_reason))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(merged[0].actor_en_matched, tmdb_name);
-        assert!(merged[0].confidence >= 0.93,
-            "confidence too low for {} vs {}: {}", tmdb_name, douban_name, merged[0].confidence);
+        assert!(
+            merged[0].confidence >= 0.93,
+            "confidence too low for {} vs {}: {}",
+            tmdb_name,
+            douban_name,
+            merged[0].confidence
+        );
     }
 
     #[test]
@@ -3238,7 +3624,12 @@ mod tests {
 
     #[test]
     fn test_match_huangyang_tian_tian_to_huangyang_tiantian() {
-        assert_single_merge("Huangyang Tiantian", "Huangyang Tian Tian", "Chu Qiao", "楚乔");
+        assert_single_merge(
+            "Huangyang Tiantian",
+            "Huangyang Tian Tian",
+            "Chu Qiao",
+            "楚乔",
+        );
     }
 
     #[test]
@@ -3272,12 +3663,22 @@ mod tests {
         // (now only Douban rows with character_zh are returned, so any result
         //  with a real match_reason means they were merged)
         let cross_matched = merged.iter().find(|e| {
-            e.match_reason != "unmatched_en" && e.match_reason != "unmatched_cn"
+            e.match_reason != "unmatched_en"
+                && e.match_reason != "unmatched_cn"
                 && !e.match_reason.ends_with("_only")
         });
-        assert!(cross_matched.is_none(),
-            "{} should NOT match {}: found {:?}", tmdb_name, douban_full,
-            cross_matched.map(|e| format!("{}|{}|{}", e.actor_en_matched, e.character_en.as_deref().unwrap_or(""), e.match_reason)));
+        assert!(
+            cross_matched.is_none(),
+            "{} should NOT match {}: found {:?}",
+            tmdb_name,
+            douban_full,
+            cross_matched.map(|e| format!(
+                "{}|{}|{}",
+                e.actor_en_matched,
+                e.character_en.as_deref().unwrap_or(""),
+                e.match_reason
+            ))
+        );
     }
 
     #[test]
@@ -3309,8 +3710,15 @@ mod tests {
         let mdl = vec![make_mdl("Li Yun Rui", "Zhuge Yue")];
         let douban = vec![make_douban_en("李昀锐 Li Yun Rui", "诸葛玥")];
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
-        assert_eq!(merged.len(), 1, "should have 1 row, got {:?}",
-            merged.iter().map(|e| format!("{}|{}", e.actor_en_matched, e.match_reason)).collect::<Vec<_>>());
+        assert_eq!(
+            merged.len(),
+            1,
+            "should have 1 row, got {:?}",
+            merged
+                .iter()
+                .map(|e| format!("{}|{}", e.actor_en_matched, e.match_reason))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(merged[0].actor_en_matched, "Li Yun Rui");
         assert_eq!(merged[0].character_en.as_deref(), Some("Zhuge Yue"));
         assert!(merged[0].confidence >= 0.95);
@@ -3333,8 +3741,12 @@ mod tests {
         let tmdb = vec![make_tmdb("Li Yunrui", "Role From TMDb")];
         let mdl = vec![make_mdl("Li Yun Rui", "Role From MDL")];
         let merged_en = merge_english_by_actor(&tmdb, &mdl);
-        assert_eq!(merged_en.len(), 1, "3-part vs 2-part should merge into one group, got {:?}",
-            merged_en.iter().map(|e| &e.actor_name).collect::<Vec<_>>());
+        assert_eq!(
+            merged_en.len(),
+            1,
+            "3-part vs 2-part should merge into one group, got {:?}",
+            merged_en.iter().map(|e| &e.actor_name).collect::<Vec<_>>()
+        );
         assert_eq!(merged_en[0].character_name, "Role From MDL");
         assert_eq!(merged_en[0].character_source, "MDL");
     }
@@ -3432,7 +3844,11 @@ mod tests {
         assert_eq!(merged.len(), 1, "Davika should merge into 1 row");
         assert_eq!(merged[0].actor_en_matched, "Davika Hoorne");
         assert_eq!(merged[0].character_zh, "乌南神女");
-        assert!(merged[0].character_en.as_deref().unwrap_or("").contains("Goddess"));
+        assert!(merged[0]
+            .character_en
+            .as_deref()
+            .unwrap_or("")
+            .contains("Goddess"));
         assert_eq!(merged[0].source_en, "MDL");
         // match reason should be token_subset
         assert!(merged[0].match_reason.contains("token_subset") || merged[0].confidence >= 0.85);
@@ -3473,7 +3889,11 @@ mod tests {
         // Should have 1 merged entry with MDL character
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].character_zh, "赵彻");
-        assert!(merged[0].character_en.as_deref().unwrap_or("").contains("Zhao Che"));
+        assert!(merged[0]
+            .character_en
+            .as_deref()
+            .unwrap_or("")
+            .contains("Zhao Che"));
         assert_eq!(merged[0].source_en, "MDL");
     }
 
@@ -3487,7 +3907,11 @@ mod tests {
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].character_zh, "陵越女王");
-        assert!(merged[0].character_en.as_deref().unwrap_or("").contains("Queen"));
+        assert!(merged[0]
+            .character_en
+            .as_deref()
+            .unwrap_or("")
+            .contains("Queen"));
         assert_eq!(merged[0].source_en, "MDL");
     }
 
@@ -3504,8 +3928,10 @@ mod tests {
         // Dongyi Xu and Xu Chong should be SEPARATE rows
         for e in &merged {
             if e.actor_zh == "徐东怡" {
-                assert_ne!(e.actor_en_matched, "Xu Chong",
-                    "Dongyi Xu should NOT merge with Xu Chong");
+                assert_ne!(
+                    e.actor_en_matched, "Xu Chong",
+                    "Dongyi Xu should NOT merge with Xu Chong"
+                );
             }
         }
     }
@@ -3671,7 +4097,11 @@ mod tests {
         let douban = vec![make_douban_full("李昀锐 Li Yun Rui", "诸葛玥")];
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
         // Exact match with TMDb, but character_en is empty → row dropped
-        assert_eq!(merged.len(), 0, "actor matched but no character_en must be dropped");
+        assert_eq!(
+            merged.len(),
+            0,
+            "actor matched but no character_en must be dropped"
+        );
     }
 
     #[test]
@@ -3682,7 +4112,11 @@ mod tests {
         let douban = vec![make_douban_full("李昀锐 Li Yun Rui", "诸葛玥")];
         let merged = merge_cast_list(&tmdb, &douban, &mdl);
         // MDL matched, but empty character_en → row excluded
-        assert_eq!(merged.len(), 0, "MDL matched with empty character_en must be dropped");
+        assert_eq!(
+            merged.len(),
+            0,
+            "MDL matched with empty character_en must be dropped"
+        );
     }
 
     #[test]
@@ -3756,9 +4190,14 @@ mod tests {
     fn test_active_entry_source_only_excluded() {
         // Zhang Kangle / Yan Xun — TMDb only, no Chinese names
         let entry = make_entry(
-            None, "Zhang Kangle",
-            None, Some("Yan Xun"),
-            "", false, 0.50, MatchDetail::SingleSource,
+            None,
+            "Zhang Kangle",
+            None,
+            Some("Yan Xun"),
+            "",
+            false,
+            0.50,
+            MatchDetail::SingleSource,
         );
         assert!(!is_active_dictionary_entry(&entry));
     }
@@ -3767,9 +4206,14 @@ mod tests {
     fn test_active_entry_douban_no_role_en_excluded() {
         // Dongyi Xu / 荆小八 — Douban role exists but no English role name
         let entry = make_entry(
-            Some("徐东艺"), "Dongyi Xu",
-            Some("荆小八"), None,
-            "荆小八", true, 0.85, MatchDetail::ExactPinyin,
+            Some("徐东艺"),
+            "Dongyi Xu",
+            Some("荆小八"),
+            None,
+            "荆小八",
+            true,
+            0.85,
+            MatchDetail::ExactPinyin,
         );
         assert!(!is_active_dictionary_entry(&entry));
     }
@@ -3778,9 +4222,14 @@ mod tests {
     fn test_active_entry_completed_included() {
         // Xixi Chen / 方苗苗 / Miao Miao — all fields populated
         let entry = make_entry(
-            Some("陈熹熹"), "Xixi Chen",
-            Some("方苗苗"), Some("Miao Miao"),
-            "方苗苗", true, 0.95, MatchDetail::NameVariantExact,
+            Some("陈熹熹"),
+            "Xixi Chen",
+            Some("方苗苗"),
+            Some("Miao Miao"),
+            "方苗苗",
+            true,
+            0.95,
+            MatchDetail::NameVariantExact,
         );
         assert!(is_active_dictionary_entry(&entry));
     }
@@ -3789,9 +4238,14 @@ mod tests {
     fn test_active_entry_pending_kanji_excluded() {
         // All fields present but Japanese kanji is empty
         let entry = make_entry(
-            Some("演员"), "Actor Name",
-            Some("赵彻"), Some("Zhao Che"),
-            "", true, 0.95, MatchDetail::NameVariantExact,
+            Some("演员"),
+            "Actor Name",
+            Some("赵彻"),
+            Some("Zhao Che"),
+            "",
+            true,
+            0.95,
+            MatchDetail::NameVariantExact,
         );
         assert!(!is_active_dictionary_entry(&entry));
     }
@@ -3800,9 +4254,14 @@ mod tests {
     fn test_active_entry_low_confidence_excluded() {
         // All fields present but confidence below 0.85
         let entry = make_entry(
-            Some("演员"), "Actor Name",
-            Some("角色"), Some("Role"),
-            "役割", true, 0.60, MatchDetail::PartialPinyin,
+            Some("演员"),
+            "Actor Name",
+            Some("角色"),
+            Some("Role"),
+            "役割",
+            true,
+            0.60,
+            MatchDetail::PartialPinyin,
         );
         assert!(!is_active_dictionary_entry(&entry));
     }
@@ -3827,7 +4286,10 @@ mod tests {
 
     #[test]
     fn test_normalize_character_en_goddess() {
-        assert_eq!(normalize_character_en("[Goddess of Unan]"), "Goddess of Unan");
+        assert_eq!(
+            normalize_character_en("[Goddess of Unan]"),
+            "Goddess of Unan"
+        );
     }
 
     #[test]
@@ -3888,12 +4350,17 @@ mod tests {
         let mut dict: CharacterDict = std::collections::HashMap::new();
         let key = to_snake_key("Li Yun Rui");
         let mut entry = make_entry(
-            Some("李昀锐"), "Li Yun Rui",
-            Some("诸葛玥"), Some("Zhuge Yue"),
-            "诸葛玥", true, 0.98, MatchDetail::NameVariantExact,
+            Some("李昀锐"),
+            "Li Yun Rui",
+            Some("诸葛玥"),
+            Some("Zhuge Yue"),
+            "诸葛玥",
+            true,
+            0.98,
+            MatchDetail::NameVariantExact,
         );
         assert_eq!(entry.ja_kanji_source, "llm"); // make_entry sets "llm" for non-empty kanji
-        // Override: simulate unenriched state
+                                                  // Override: simulate unenriched state
         entry.ja_kanji_source = "pending_llm".to_string();
         dict.insert(key, entry);
 
@@ -3925,9 +4392,14 @@ mod tests {
     fn test_enrich_skips_different_actor_en() {
         let mut dict: CharacterDict = std::collections::HashMap::new();
         let mut entry = make_entry(
-            Some("演员"), "Other Actor",
-            Some("诸葛玥"), Some("Zhuge Yue"),
-            "诸葛玥", true, 0.98, MatchDetail::NameVariantExact,
+            Some("演员"),
+            "Other Actor",
+            Some("诸葛玥"),
+            Some("Zhuge Yue"),
+            "诸葛玥",
+            true,
+            0.98,
+            MatchDetail::NameVariantExact,
         );
         entry.ja_kanji_source = "pending_llm".to_string();
         dict.insert(to_snake_key("Other Actor"), entry);
@@ -3958,9 +4430,14 @@ mod tests {
     fn test_enrich_applies_manual_source() {
         let mut dict: CharacterDict = std::collections::HashMap::new();
         let mut entry = make_entry(
-            Some("赵丽颖"), "Zhao Liying",
-            Some("盛明兰"), Some("Sheng Minglan"),
-            "盛明兰", true, 0.98, MatchDetail::NameVariantExact,
+            Some("赵丽颖"),
+            "Zhao Liying",
+            Some("盛明兰"),
+            Some("Sheng Minglan"),
+            "盛明兰",
+            true,
+            0.98,
+            MatchDetail::NameVariantExact,
         );
         entry.ja_kanji_source = "pending_llm".to_string();
         dict.insert(to_snake_key("Zhao Liying"), entry);
@@ -3992,9 +4469,14 @@ mod tests {
     fn test_enrich_skips_pending_llm_in_cast() {
         let mut dict: CharacterDict = std::collections::HashMap::new();
         let mut entry = make_entry(
-            Some("李昀锐"), "Li Yun Rui",
-            Some("诸葛玥"), Some("Zhuge Yue"),
-            "诸葛玥", true, 0.98, MatchDetail::NameVariantExact,
+            Some("李昀锐"),
+            "Li Yun Rui",
+            Some("诸葛玥"),
+            Some("Zhuge Yue"),
+            "诸葛玥",
+            true,
+            0.98,
+            MatchDetail::NameVariantExact,
         );
         entry.ja_kanji_source = "pending_llm".to_string();
         dict.insert(to_snake_key("Li Yun Rui"), entry);

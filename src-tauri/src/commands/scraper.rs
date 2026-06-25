@@ -51,7 +51,14 @@ pub async fn scrape_all(
     imdb_url: Option<String>,
     tvmao_url: Option<String>,
     douban_url: Option<String>,
-) -> Result<(Option<ScrapeResult>, Option<ScrapeResult>, Option<ScrapeResult>), String> {
+) -> Result<
+    (
+        Option<ScrapeResult>,
+        Option<ScrapeResult>,
+        Option<ScrapeResult>,
+    ),
+    String,
+> {
     let imdb_fut = async {
         if let Some(url) = &imdb_url {
             match scraper::tmdb::scrape_tmdb_from_url(url).await {
@@ -129,7 +136,9 @@ pub fn save_scrape_result(dir: String, result: ScrapeResult) -> Result<String, S
         ScrapeSource::Other(s) => s.as_str(),
     };
 
-    let extracted_dir = std::path::Path::new(&dir).join("metadata").join("extracted");
+    let extracted_dir = std::path::Path::new(&dir)
+        .join("metadata")
+        .join("extracted");
     std::fs::create_dir_all(&extracted_dir)
         .map_err(|e| format!("Failed to create extracted dir: {}", e))?;
 
@@ -147,8 +156,7 @@ pub fn save_scrape_result(dir: String, result: ScrapeResult) -> Result<String, S
 pub fn load_scrape_result(path: String) -> Result<ScrapeResult, String> {
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("Failed to read {}: {}", path, e))?;
-    serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to deserialize {}: {}", path, e))
+    serde_json::from_str(&content).map_err(|e| format!("Failed to deserialize {}: {}", path, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -289,13 +297,34 @@ pub fn parse_mdl_paste(text: String) -> Vec<PastedEntry> {
 /// Parse MDL Cast HTML pasted from browser DevTools.
 #[tauri::command]
 pub fn parse_mdl_html_paste(app: tauri::AppHandle, html: String) -> Vec<PastedEntry> {
-    emit_log(&app, "debug", "MDL", &format!("貼り付けHTML受信: {}文字", html.len()));
+    emit_log(
+        &app,
+        "debug",
+        "MDL",
+        &format!("貼り付けHTML受信: {}文字", html.len()),
+    );
     let list_item_count = html.matches("list-item").count();
-    emit_log(&app, "debug", "MDL", &format!("list-item検出: {}件", list_item_count));
+    emit_log(
+        &app,
+        "debug",
+        "MDL",
+        &format!("list-item検出: {}件", list_item_count),
+    );
     let entries = character_dict::parse_mdl_html_paste(&html);
-    let with_char = entries.iter().filter(|e| !e.character_name.is_empty()).count();
+    let with_char = entries
+        .iter()
+        .filter(|e| !e.character_name.is_empty())
+        .count();
     let without_char = entries.len() - with_char;
-    emit_log(&app, "info", "MDL", &format!("actor/character抽出成功: {}件, characterなし: {}件", with_char, without_char));
+    emit_log(
+        &app,
+        "info",
+        "MDL",
+        &format!(
+            "actor/character抽出成功: {}件, characterなし: {}件",
+            with_char, without_char
+        ),
+    );
     entries
 }
 
@@ -307,16 +336,15 @@ pub fn parse_douban_paste(text: String) -> Vec<PastedEntry> {
 
 /// Search TMDb for movies and TV shows matching the query.
 #[tauri::command]
-pub async fn search_tmdb(query: String) -> Result<Vec<crate::scraper::tmdb::TmdbSearchResult>, String> {
+pub async fn search_tmdb(
+    query: String,
+) -> Result<Vec<crate::scraper::tmdb::TmdbSearchResult>, String> {
     scraper::tmdb::search_tmdb(&query).await
 }
 
 /// Fetch TMDb credits by TMDb ID and media type.
 #[tauri::command]
-pub async fn scrape_tmdb_credits(
-    tmdb_id: u32,
-    media_type: String,
-) -> Result<ScrapeResult, String> {
+pub async fn scrape_tmdb_credits(tmdb_id: u32, media_type: String) -> Result<ScrapeResult, String> {
     scraper::tmdb::fetch_tmdb_credits_by_id(tmdb_id, &media_type).await
 }
 
@@ -345,7 +373,16 @@ pub fn enrich_dict_kanji(
 ) -> Result<CharacterDict, String> {
     let mut dict = dict;
     let updated = character_dict::enrich_dict_kanji_from_cast(&mut dict, &merged_cast);
-    emit_log(&app, "info", "DICT", &format!("漢字情報enrich: {}件更新 (merged cast {}件中)", updated, merged_cast.len()));
+    emit_log(
+        &app,
+        "info",
+        "DICT",
+        &format!(
+            "漢字情報enrich: {}件更新 (merged cast {}件中)",
+            updated,
+            merged_cast.len()
+        ),
+    );
     Ok(dict)
 }
 
@@ -387,10 +424,15 @@ pub async fn search_database_url(
     database: String,
     query: DramaSearchQuery,
 ) -> Result<(Option<SearchCandidate>, Vec<SearchCandidate>), String> {
-    emit_log(&app, "info", "SEARCH", &format!(
-        "database={}, title_zh=\"{}\", title_en=\"{}\", year={:?}",
-        database, query.title_zh, query.title_en, query.year
-    ));
+    emit_log(
+        &app,
+        "info",
+        "SEARCH",
+        &format!(
+            "database={}, title_zh=\"{}\", title_en=\"{}\", year={:?}",
+            database, query.title_zh, query.title_en, query.year
+        ),
+    );
 
     match database.as_str() {
         "douban" => {
@@ -417,7 +459,9 @@ pub async fn search_database_url(
 // MDL WebView DOM extraction
 // ---------------------------------------------------------------------------
 
-use crate::scraper::mydramalist::{MdlExtractResult, MdlExtractState, MdlPageInfo, MdlPageInfoState};
+use crate::scraper::mydramalist::{
+    MdlExtractResult, MdlExtractState, MdlPageInfo, MdlPageInfoState,
+};
 use tauri::Manager;
 
 /// Open a dedicated Tauri WebView window to display an MDL page.
@@ -449,8 +493,7 @@ pub fn open_mdl_window(app: tauri::AppHandle, url: String) -> Result<(), String>
         .devtools(true)
         .build()
         .map_err(|e| format!("[MDL] window build error: {}", e))?;
-    println!("[MDL] window created successfully, opening devtools");
-    win.open_devtools();
+    println!("[MDL] window created successfully");
 
     // Force-close the window when the user clicks X, even if the external
     // page's JavaScript tries to prevent it via beforeunload.
@@ -468,11 +511,11 @@ pub fn open_mdl_window(app: tauri::AppHandle, url: String) -> Result<(), String>
 /// Receive the full HTML of the currently displayed MDL page (sent via eval/invoke),
 /// parse it, and store the result in MdlExtractState.
 #[tauri::command]
-pub fn receive_mdl_extract(
-    state: State<'_, MdlExtractState>,
-    html: String,
-) -> Result<(), String> {
-    println!("[MDL] receive_mdl_extract called, html length={} bytes", html.len());
+pub fn receive_mdl_extract(state: State<'_, MdlExtractState>, html: String) -> Result<(), String> {
+    println!(
+        "[MDL] receive_mdl_extract called, html length={} bytes",
+        html.len()
+    );
     let result = scraper::mydramalist::parse_mdl_html(&html);
     match &result {
         Ok(r) => println!(
@@ -495,7 +538,10 @@ pub fn get_mdl_extract(
     state: State<'_, MdlExtractState>,
 ) -> Result<Option<MdlExtractResult>, String> {
     let result = state.0.lock().unwrap().take();
-    println!("[MDL] get_mdl_extract called, has_result={}", result.is_some());
+    println!(
+        "[MDL] get_mdl_extract called, has_result={}",
+        result.is_some()
+    );
     Ok(result)
 }
 
@@ -593,7 +639,10 @@ pub fn get_mdl_page_info(
     state: State<'_, MdlPageInfoState>,
 ) -> Result<Option<MdlPageInfo>, String> {
     let result = state.0.lock().unwrap().take();
-    println!("[MDL] get_mdl_page_info called, has_result={}", result.is_some());
+    println!(
+        "[MDL] get_mdl_page_info called, has_result={}",
+        result.is_some()
+    );
     Ok(result)
 }
 
@@ -604,18 +653,16 @@ pub fn close_mdl_window(app: tauri::AppHandle) -> Result<(), String> {
     let found = app.get_webview_window("mdl-browser");
     println!("[MDL] close: window_found={}", found.is_some());
     match found {
-        Some(w) => {
-            match w.close() {
-                Ok(()) => {
-                    println!("[MDL] close: result=ok");
-                    Ok(())
-                }
-                Err(e) => {
-                    println!("[MDL] close: result=fail error={}", e);
-                    Err(format!("[MDL] window close error: {}", e))
-                }
+        Some(w) => match w.close() {
+            Ok(()) => {
+                println!("[MDL] close: result=ok");
+                Ok(())
             }
-        }
+            Err(e) => {
+                println!("[MDL] close: result=fail error={}", e);
+                Err(format!("[MDL] window close error: {}", e))
+            }
+        },
         None => {
             println!("[MDL] close: result=skip (no window)");
             Ok(())

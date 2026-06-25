@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
+use crate::llm::{provider_preset, ModelTier};
 use crate::log::emit_log;
 
 const DEFAULT_TMDB_ENV_VAR: &str = "TMDB_API_KEY";
@@ -19,6 +20,14 @@ pub struct ProviderSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub pro_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flash_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_tier: Option<ModelTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_thinking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
 }
 
@@ -27,7 +36,55 @@ pub struct ProviderSettings {
 pub struct ResolvedProviderSettings {
     pub base_url: String,
     pub model: String,
+    pub pro_model: String,
+    pub flash_model: String,
+    pub default_tier: ModelTier,
+    pub supports_thinking: bool,
     pub thinking: String,
+}
+
+/// Model-tier choices for each LLM-backed workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmTaskModelSettings {
+    #[serde(default = "default_tier_pro")]
+    pub synopsis_generation: ModelTier,
+    #[serde(default = "default_tier_pro")]
+    pub scene_detection: ModelTier,
+    #[serde(default = "default_tier_pro")]
+    pub scene_context_analysis: ModelTier,
+    #[serde(default = "default_tier_pro")]
+    pub proper_noun_confirmation: ModelTier,
+    #[serde(default = "default_tier_pro")]
+    pub subtitle_translation: ModelTier,
+    #[serde(default = "default_tier_flash")]
+    pub lightweight_cleanup: ModelTier,
+    #[serde(default = "default_tier_pro")]
+    pub kanji_correction: ModelTier,
+    #[serde(default = "default_tier_flash")]
+    pub zh_context_disambiguation: ModelTier,
+}
+
+fn default_tier_pro() -> ModelTier {
+    ModelTier::Pro
+}
+
+fn default_tier_flash() -> ModelTier {
+    ModelTier::Flash
+}
+
+impl Default for LlmTaskModelSettings {
+    fn default() -> Self {
+        Self {
+            synopsis_generation: ModelTier::Pro,
+            scene_detection: ModelTier::Pro,
+            scene_context_analysis: ModelTier::Pro,
+            proper_noun_confirmation: ModelTier::Pro,
+            subtitle_translation: ModelTier::Pro,
+            lightweight_cleanup: ModelTier::Flash,
+            kanji_correction: ModelTier::Pro,
+            zh_context_disambiguation: ModelTier::Flash,
+        }
+    }
 }
 
 /// TMDb-only settings (kept separate from LLM provider settings).
@@ -57,17 +114,16 @@ impl Default for ServiceSettings {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Preset defaults for each known provider prefix.
-fn provider_defaults(prefix: &str) -> (&str, &str, &str) {
-    match prefix {
-        "DEEPSEEK" => ("https://api.deepseek.com", "deepseek-v4-flash", "disabled"),
-        "OPENAI" => ("https://api.openai.com/v1", "gpt-5.5", "disabled"),
-        "ANTHROPIC" | "CLAUDE" => ("https://api.anthropic.com", "claude-sonnet-4-5", "disabled"),
-        "GEMINI" | "GOOGLE" => ("https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-3.5-flash", "disabled"),
-        "MINIMAX" => ("https://api.minimax.chat", "MiniMax-chat", "disabled"),
-        "MOONSHOT" | "KIMI" => ("https://api.moonshot.cn", "moonshot-v1-8k", "disabled"),
-        _ => ("", "", "disabled"),
-    }
+fn preset_for_prefix(prefix: &str) -> crate::llm::ProviderPreset {
+    provider_preset(&format!("{}_API_KEY", prefix)).unwrap_or(crate::llm::ProviderPreset {
+        provider: prefix.to_string(),
+        base_url: String::new(),
+        pro_model: String::new(),
+        flash_model: String::new(),
+        default_tier: ModelTier::Pro,
+        supports_thinking: false,
+        default_thinking: "disabled".to_string(),
+    })
 }
 
 fn settings_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -142,10 +198,23 @@ fn migrate_deepseek_model(model: &str, thinking: &str) -> (String, String) {
             ("deepseek-v4-flash".to_string(), "disabled".to_string())
         }
         "deepseek-reasoner" => {
-            eprintln!("[DeepSeek] 旧モデル名 deepseek-reasoner を deepseek-v4-flash + thinking enabled に移行しました");
-            ("deepseek-v4-flash".to_string(), "enabled".to_string())
+            eprintln!("[DeepSeek] 旧モデル名 deepseek-reasoner を deepseek-v4-pro + thinking enabled に移行しました");
+            ("deepseek-v4-pro".to_string(), "enabled".to_string())
         }
         _ => (model.to_string(), thinking.to_string()),
+    }
+}
+
+fn looks_like_flash_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("flash") || model.contains("haiku") || model.ends_with("-8k")
+}
+
+fn parse_model_tier(value: Option<&str>, default_tier: ModelTier) -> ModelTier {
+    match value.unwrap_or_default().to_ascii_lowercase().as_str() {
+        "flash" => ModelTier::Flash,
+        "pro" => ModelTier::Pro,
+        _ => default_tier,
     }
 }
 
@@ -163,6 +232,12 @@ pub fn read_srt_en_pattern(app: &tauri::AppHandle) -> String {
         .unwrap_or_else(|| DEFAULT_SRT_EN_PATTERN.to_string())
 }
 
+/// Read model-tier choices for LLM-backed workflows.
+pub fn read_llm_task_model_settings(app: &tauri::AppHandle) -> LlmTaskModelSettings {
+    let settings = read_settings(app);
+    serde_json::from_value(settings["llm_task_model_settings"].clone()).unwrap_or_default()
+}
+
 /// Read the resolved per-provider settings from disk.
 /// Applies defaults, migration, and old-model-name migration for DeepSeek.
 pub fn read_provider_settings(app: &tauri::AppHandle, prefix: &str) -> ResolvedProviderSettings {
@@ -174,34 +249,73 @@ pub fn read_provider_settings(app: &tauri::AppHandle, prefix: &str) -> ResolvedP
     let providers = &settings["providers"];
     let ps = &providers[prefix];
 
-    let (default_url, default_model, default_thinking) = provider_defaults(prefix);
+    let preset = preset_for_prefix(prefix);
+    let default_url = preset.base_url.as_str();
+    let default_thinking = preset.default_thinking.as_str();
+    let supports_thinking = ps["supports_thinking"]
+        .as_bool()
+        .unwrap_or(preset.supports_thinking);
 
-    let raw_model = ps["model"].as_str().filter(|s| !s.is_empty()).unwrap_or(default_model);
-    let raw_thinking = ps["thinking"].as_str().filter(|s| !s.is_empty()).unwrap_or(default_thinking);
+    let raw_thinking = ps["thinking"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_thinking);
 
-    let (model, thinking) = if prefix == "DEEPSEEK" {
-        let (m, t) = migrate_deepseek_model(raw_model, raw_thinking);
-        // Persist migration
-        if m != raw_model || t != raw_thinking {
-            let mut current = read_settings(app);
-            if current["providers"].is_null() {
-                current["providers"] = serde_json::json!({});
-            }
-            current["providers"][prefix] = serde_json::json!({
-                "base_url": ps["base_url"].as_str().filter(|s| !s.is_empty()).unwrap_or(default_url),
-                "model": &m,
-                "thinking": &t,
-            });
-            let _ = write_settings(app, &current);
+    let legacy_model = ps["model"].as_str().filter(|s| !s.is_empty());
+    let mut pro_model = ps["pro_model"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&preset.pro_model)
+        .to_string();
+    let mut flash_model = ps["flash_model"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&preset.flash_model)
+        .to_string();
+    let mut default_tier = parse_model_tier(ps["default_tier"].as_str(), preset.default_tier);
+    let mut thinking = raw_thinking.to_string();
+
+    if let Some(model) = legacy_model {
+        let (migrated_model, migrated_thinking) = if prefix == "DEEPSEEK" {
+            migrate_deepseek_model(model, raw_thinking)
+        } else {
+            (model.to_string(), raw_thinking.to_string())
+        };
+
+        thinking = migrated_thinking;
+        if looks_like_flash_model(&migrated_model) {
+            flash_model = migrated_model;
+            default_tier = ModelTier::Flash;
+        } else {
+            pro_model = migrated_model;
+            default_tier = ModelTier::Pro;
         }
-        (m, t)
-    } else {
-        (raw_model.to_string(), raw_thinking.to_string())
+    }
+
+    if prefix == "DEEPSEEK" {
+        let (migrated_pro, migrated_thinking) = migrate_deepseek_model(&pro_model, &thinking);
+        let (migrated_flash, _) = migrate_deepseek_model(&flash_model, "disabled");
+        pro_model = migrated_pro;
+        flash_model = migrated_flash;
+        thinking = migrated_thinking;
+    }
+
+    let model = match default_tier {
+        ModelTier::Pro => pro_model.clone(),
+        ModelTier::Flash => flash_model.clone(),
     };
 
     ResolvedProviderSettings {
-        base_url: ps["base_url"].as_str().filter(|s| !s.is_empty()).unwrap_or(default_url).to_string(),
+        base_url: ps["base_url"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default_url)
+            .to_string(),
         model,
+        pro_model,
+        flash_model,
+        default_tier,
+        supports_thinking,
         thinking,
     }
 }
@@ -222,20 +336,17 @@ fn migrate_gemini_defaults(app: &tauri::AppHandle, settings: &mut serde_json::Va
     let mut migrated = serde_json::json!({});
 
     // Copy existing values
-    if let Some(v) = gemini.get("base_url").and_then(|v| v.as_str()) {
-        migrated["base_url"] = serde_json::Value::String(v.to_string());
-    }
-    if let Some(v) = gemini.get("model").and_then(|v| v.as_str()) {
-        migrated["model"] = serde_json::Value::String(v.to_string());
-    }
-    if let Some(v) = gemini.get("thinking").and_then(|v| v.as_str()) {
-        migrated["thinking"] = serde_json::Value::String(v.to_string());
+    if let Some(obj) = gemini.as_object() {
+        for (key, value) in obj {
+            migrated[key] = value.clone();
+        }
     }
 
     // Normalize: base_url without trailing slash → with trailing slash
     if let Some(url) = migrated["base_url"].as_str() {
         if url == "https://generativelanguage.googleapis.com/v1beta/openai" {
-            migrated["base_url"] = serde_json::json!("https://generativelanguage.googleapis.com/v1beta/openai/");
+            migrated["base_url"] =
+                serde_json::json!("https://generativelanguage.googleapis.com/v1beta/openai/");
             eprintln!("[Gemini] base_url を正規化: 末尾 / を追加しました");
             changed = true;
         }
@@ -273,21 +384,19 @@ fn migrate_openai_defaults(app: &tauri::AppHandle, settings: &mut serde_json::Va
     let mut migrated = serde_json::json!({});
 
     // Copy existing values
-    if let Some(v) = openai.get("base_url").and_then(|v| v.as_str()) {
-        migrated["base_url"] = serde_json::Value::String(v.to_string());
-    }
-    if let Some(v) = openai.get("model").and_then(|v| v.as_str()) {
-        migrated["model"] = serde_json::Value::String(v.to_string());
-    }
-    if let Some(v) = openai.get("thinking").and_then(|v| v.as_str()) {
-        migrated["thinking"] = serde_json::Value::String(v.to_string());
+    if let Some(obj) = openai.as_object() {
+        for (key, value) in obj {
+            migrated[key] = value.clone();
+        }
     }
 
     // Normalize old base_url without /v1 → with /v1
     if let Some(url) = migrated["base_url"].as_str() {
         if url == "https://api.openai.com" {
             migrated["base_url"] = serde_json::json!("https://api.openai.com/v1");
-            eprintln!("[OpenAI] base_url を正規化: https://api.openai.com → https://api.openai.com/v1");
+            eprintln!(
+                "[OpenAI] base_url を正規化: https://api.openai.com → https://api.openai.com/v1"
+            );
             changed = true;
         }
     }
@@ -334,11 +443,29 @@ pub fn get_service_settings(app: tauri::AppHandle) -> ServiceSettings {
 }
 
 #[tauri::command]
-pub fn save_service_settings(app: tauri::AppHandle, settings: ServiceSettings) -> Result<(), String> {
+pub fn save_service_settings(
+    app: tauri::AppHandle,
+    settings: ServiceSettings,
+) -> Result<(), String> {
     let mut current = read_settings(&app);
     current["tmdb_env_var_name"] = serde_json::Value::String(settings.tmdb_env_var_name);
     current["tmdb_base_url"] = serde_json::Value::String(settings.tmdb_base_url);
     current["srt_en_pattern"] = serde_json::Value::String(settings.srt_en_pattern);
+    write_settings(&app, &current)
+}
+
+#[tauri::command]
+pub fn get_llm_task_model_settings(app: tauri::AppHandle) -> LlmTaskModelSettings {
+    read_llm_task_model_settings(&app)
+}
+
+#[tauri::command]
+pub fn save_llm_task_model_settings(
+    app: tauri::AppHandle,
+    settings: LlmTaskModelSettings,
+) -> Result<(), String> {
+    let mut current = read_settings(&app);
+    current["llm_task_model_settings"] = serde_json::json!(settings);
     write_settings(&app, &current)
 }
 
@@ -410,13 +537,21 @@ pub async fn test_openai_ai_confirm(
         .ok()
         .filter(|v| !v.is_empty())
         .or_else(|| {
-            env_store.0.lock().ok().and_then(|s| s.0.get("OPENAI_API_KEY").cloned())
+            env_store
+                .0
+                .lock()
+                .ok()
+                .and_then(|s| s.0.get("OPENAI_API_KEY").cloned())
         })
         .ok_or("OPENAI_API_KEY が設定されていません。設定画面でAPIキーを保存してください。")?;
 
     // Read the saved model from provider settings
     let overrides = read_provider_settings(&app, "OPENAI");
-    let model = overrides.model;
+    let task_models = read_llm_task_model_settings(&app);
+    let model = match task_models.proper_noun_confirmation {
+        ModelTier::Pro => overrides.pro_model,
+        ModelTier::Flash => overrides.flash_model,
+    };
 
     let url = "https://api.openai.com/v1/responses";
 
@@ -445,12 +580,21 @@ pub async fn test_openai_ai_confirm(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        emit_log(&app, "error", "Service", &format!(
-            "OpenAI Responses API HTTP {}: {}",
+        emit_log(
+            &app,
+            "error",
+            "Service",
+            &format!(
+                "OpenAI Responses API HTTP {}: {}",
+                status.as_u16(),
+                crate::log::preview_chars(&body, 500)
+            ),
+        );
+        return Err(format!(
+            "OpenAI Responses API エラー ({}): {}",
             status.as_u16(),
             crate::log::preview_chars(&body, 500)
         ));
-        return Err(format!("OpenAI Responses API エラー ({}): {}", status.as_u16(), crate::log::preview_chars(&body, 500)));
     }
 
     Ok(true)

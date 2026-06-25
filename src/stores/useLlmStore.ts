@@ -14,6 +14,9 @@ export const useLlmStore = create<LlmState>((set) => ({
     provider: null,
     base_url: null,
     model: null,
+    pro_model: null,
+    flash_model: null,
+    default_tier: null,
   },
   setActive: (info) => set({ active: info }),
   refresh: async () => {

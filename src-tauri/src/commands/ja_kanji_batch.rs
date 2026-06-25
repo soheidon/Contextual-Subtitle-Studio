@@ -12,7 +12,7 @@ pub struct KanjiRequestItem {
     pub term_en: String,
     #[serde(rename = "type")]
     pub item_type: String, // "character" | "proper_noun"
-    pub context: String,   // actor name for characters, empty for proper nouns
+    pub context: String, // actor name for characters, empty for proper nouns
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -132,7 +132,8 @@ mod tests {
 
     #[test]
     fn test_batch_response_deserialization() {
-        let json = r#"{"items":[{"id":"cast_0","ja_kanji":"諸葛玥","confidence":0.95,"reason":"诸→諸"}]}"#;
+        let json =
+            r#"{"items":[{"id":"cast_0","ja_kanji":"諸葛玥","confidence":0.95,"reason":"诸→諸"}]}"#;
         let batch: KanjiBatchResponse = serde_json::from_str(json).unwrap();
         assert_eq!(batch.items.len(), 1);
         assert_eq!(batch.items[0].id, "cast_0");

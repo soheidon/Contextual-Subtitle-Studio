@@ -1,6 +1,6 @@
 use crate::project::config::{ProjectConfig, ProjectInfo, ProjectSummary};
-use tauri::State;
 use std::sync::Mutex;
+use tauri::State;
 
 pub struct AppState {
     pub config: Mutex<Option<ProjectConfig>>,
@@ -53,10 +53,7 @@ pub fn create_project(
 }
 
 #[tauri::command]
-pub fn open_project(
-    state: State<AppState>,
-    path: String,
-) -> Result<ProjectSummary, String> {
+pub fn open_project(state: State<AppState>, path: String) -> Result<ProjectSummary, String> {
     let config = ProjectConfig::load_from_file(&path)?;
 
     let summary = ProjectSummary {
@@ -78,10 +75,7 @@ pub fn get_project_config(state: State<AppState>) -> Result<Option<ProjectConfig
 }
 
 #[tauri::command]
-pub fn save_project_config(
-    state: State<AppState>,
-    config: ProjectConfig,
-) -> Result<(), String> {
+pub fn save_project_config(state: State<AppState>, config: ProjectConfig) -> Result<(), String> {
     let config_path = format!("{}/config.yaml", config.project.base_dir);
     config.save_to_file(&config_path)?;
 

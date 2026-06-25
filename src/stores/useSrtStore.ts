@@ -10,6 +10,98 @@ import type {
   GlossaryEntry,
 } from "../types";
 
+function uniqueStrings(values: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(trimmed);
+  }
+  return result;
+}
+
+function normalizeTermKey(text: string): string {
+  return text.replace(/[‘’ʼ]/g, "'").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function generateReplacementAliases(sourceText: string, previousSourceText: string, existingAliases?: string[]): string[] {
+  const suffixes = [
+    "Ancestral Temple", "Grand Marshal", "Northwest Army",
+    "Mountains", "Guards", "Emperor", "Princess", "Prince", "General",
+    "Temple", "Palace", "Guard", "City", "River", "Lake", "Mountain", "Pass",
+    "Tribe", "Army", "House", "Lady", "Lord", "King", "Wall",
+  ];
+  const aliases = uniqueStrings([...(existingAliases ?? []), previousSourceText, sourceText]);
+  for (const suffix of suffixes) {
+    const pattern = ` ${suffix}`;
+    if (sourceText.length > pattern.length && sourceText.toLowerCase().endsWith(pattern.toLowerCase())) {
+      aliases.push(...uniqueStrings([sourceText.slice(0, -pattern.length).trim()]));
+      break;
+    }
+  }
+  return uniqueStrings(aliases);
+}
+
+function applyTermResolution(term: UnresolvedTerm, result: WebTermResolution): UnresolvedTerm | null {
+  if (result.action === "remove" || result.is_proper_noun === false) return null;
+
+  if (result.action === "replace" && result.suggested_source_text?.trim()) {
+    const sourceText = result.suggested_source_text.trim();
+    const webResult = { ...result, suggested_source_text: sourceText };
+    return {
+      ...term,
+      source_text: sourceText,
+      term_type: result.term_type || term.term_type,
+      search_text: undefined,
+      generic_suffix: undefined,
+      aliases: generateReplacementAliases(sourceText, term.source_text, term.aliases),
+      webResult,
+      confirmed_surface: result.candidate_ja || result.candidate_zh || term.surface_ja || undefined,
+      reason: result.confidence_reason || result.reason || term.reason,
+    };
+  }
+
+  const normalized = result.normalized_source_text?.trim();
+  const source_text = normalized && normalized !== term.source_text
+    ? normalized
+    : term.source_text;
+  const webResult = source_text !== result.source_text
+    ? { ...result, source_text }
+    : result;
+  return {
+    ...term,
+    source_text,
+    term_type: result.term_type || term.term_type,
+    webResult,
+    confirmed_surface: result.candidate_ja || result.candidate_zh || term.surface_ja || undefined,
+    reason: result.action === "review" && result.confidence_reason ? result.confidence_reason : term.reason,
+  };
+}
+
+function dedupeUnresolvedTerms(terms: UnresolvedTerm[]): UnresolvedTerm[] {
+  const byKey = new Map<string, UnresolvedTerm>();
+  for (const term of terms) {
+    const key = normalizeTermKey(term.source_text);
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, term);
+      continue;
+    }
+    byKey.set(key, {
+      ...existing,
+      ...term,
+      aliases: uniqueStrings([...(existing.aliases ?? []), ...(term.aliases ?? [])]),
+      webResult: term.webResult ?? existing.webResult,
+      confirmed_surface: term.confirmed_surface ?? existing.confirmed_surface,
+    });
+  }
+  return Array.from(byKey.values());
+}
+
 export interface SubtitleEntry {
   index: number;
   start: string;
@@ -43,6 +135,7 @@ interface SrtState {
   // Multi-file state
   folderPath: string | null;
   projectBaseDir: string | null;
+  activeFilePath: string | null;
   files: SrtFileState[];
   // Backward-compatible single-file accessors (reflects first file)
   entries: SubtitleEntry[];
@@ -70,17 +163,20 @@ interface SrtState {
   setFileAdoptedTerms: (path: string, adoptedTerms: GlossaryEntry[]) => void;
   setFileTranslationPrompt: (path: string, translationPrompt: string | null) => void;
   setProjectBaseDir: (dir: string | null) => void;
+  setActiveFilePath: (path: string | null) => void;
   // Legacy single-file action (kept for TranslatePanel compatibility)
   setEntries: (entries: SubtitleEntry[], fileName: string, filePath?: string) => void;
   clear: () => void;
 }
 
-function deriveSingleFile(state: Pick<SrtState, "files">): {
+function deriveSingleFile(state: Pick<SrtState, "files" | "activeFilePath">): {
   entries: SubtitleEntry[];
   fileName: string | null;
   filePath: string | null;
 } {
-  const loaded = state.files.find((f) => f.status === "loaded");
+  const loaded = state.activeFilePath
+    ? state.files.find((f) => f.path === state.activeFilePath && f.status === "loaded")
+    : state.files.find((f) => f.status === "loaded");
   return {
     entries: loaded?.entries ?? [],
     fileName: loaded?.name ?? null,
@@ -91,6 +187,7 @@ function deriveSingleFile(state: Pick<SrtState, "files">): {
 export const useSrtStore = create<SrtState>((set) => ({
   folderPath: null,
   projectBaseDir: null,
+  activeFilePath: null,
   files: [],
   entries: [],
   fileName: null,
@@ -116,7 +213,7 @@ export const useSrtStore = create<SrtState>((set) => ({
         termLoading: {},
         batchTermLoading: false,
       }));
-      const derived = deriveSingleFile({ files: newFiles });
+      const derived = deriveSingleFile({ files: newFiles, activeFilePath: state.activeFilePath });
       return {
         ...state,
         folderPath,
@@ -133,7 +230,7 @@ export const useSrtStore = create<SrtState>((set) => ({
           ? { ...f, entries, status: "loaded" as const, error: undefined }
           : f,
       );
-      const derived = deriveSingleFile({ files: newFiles });
+      const derived = deriveSingleFile({ files: newFiles, activeFilePath: state.activeFilePath });
       const isLoaded = newFiles.some((f) => f.status === "loaded");
       return { ...state, files: newFiles, ...derived, isLoaded };
     }),
@@ -150,7 +247,7 @@ export const useSrtStore = create<SrtState>((set) => ({
       const newFiles = state.files.map((f) =>
         f.path === path ? { ...f, status, error } : f,
       );
-      const derived = deriveSingleFile({ files: newFiles });
+      const derived = deriveSingleFile({ files: newFiles, activeFilePath: state.activeFilePath });
       const isLoaded = newFiles.some((f) => f.status === "loaded");
       return { ...state, files: newFiles, ...derived, isLoaded };
     }),
@@ -191,15 +288,9 @@ export const useSrtStore = create<SrtState>((set) => ({
         f.path === path
           ? {
               ...f,
-              unresolvedTerms: f.unresolvedTerms.map((t) =>
-                t.source_text === sourceText
-                  ? {
-                      ...t,
-                      webResult: result,
-                      confirmed_surface: result.candidate_ja || result.candidate_zh || t.surface_ja || undefined,
-                    }
-                  : t,
-              ),
+              unresolvedTerms: dedupeUnresolvedTerms(f.unresolvedTerms
+                .map((t) => (t.source_text === sourceText ? applyTermResolution(t, result) : t))
+                .filter((t): t is UnresolvedTerm => t !== null)),
             }
           : f,
       ),
@@ -296,16 +387,11 @@ export const useSrtStore = create<SrtState>((set) => ({
         return {
           ...f,
           batchTermLoading: false,
-          unresolvedTerms: f.unresolvedTerms.map((t) => {
+          unresolvedTerms: dedupeUnresolvedTerms(f.unresolvedTerms.map((t) => {
             const r = resultMap.get(t.source_text);
             if (!r) return t;
-            return {
-              ...t,
-              webResult: r,
-              // Also derive and save confirmed_surface from the paste result
-              confirmed_surface: r.candidate_ja || r.candidate_zh || t.surface_ja || undefined,
-            };
-          }),
+            return applyTermResolution(t, r);
+          }).filter((t): t is UnresolvedTerm => t !== null)),
         };
       }),
     })),
@@ -325,6 +411,8 @@ export const useSrtStore = create<SrtState>((set) => ({
     })),
 
   setProjectBaseDir: (dir) => set({ projectBaseDir: dir }),
+
+  setActiveFilePath: (path) => set({ activeFilePath: path }),
 
   setEntries: (entries, fileName, filePath) => {
     const singleFile: SrtFileState = {

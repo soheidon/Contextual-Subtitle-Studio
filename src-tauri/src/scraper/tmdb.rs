@@ -1,15 +1,15 @@
 use serde::{Deserialize, Serialize};
 
-use super::{ScrapedCharacter, ScrapeResult, ScrapeSource, score_search_candidate};
+use super::{score_search_candidate, ScrapeResult, ScrapeSource, ScrapedCharacter};
 
 const API_BASE: &str = "https://api.themoviedb.org/3";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
 fn api_key() -> Result<String, String> {
-    std::env::var("TMDB_API_KEY")
-        .map_err(|_| "TMDB_API_KEY が未設定です。設定ページで TMDb API キーを登録してください。"
-            .to_string())
+    std::env::var("TMDB_API_KEY").map_err(|_| {
+        "TMDB_API_KEY が未設定です。設定ページで TMDb API キーを登録してください。".to_string()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -177,8 +177,8 @@ pub async fn search_tmdb(query: &str) -> Result<Vec<TmdbSearchResult>, String> {
         .await
         .map_err(|e| format!("TMDb search レスポンス読み取り失敗: {}", e))?;
 
-    let response: TmdbSearchResponse = serde_json::from_str(&body)
-        .map_err(|e| format!("TMDb search パース失敗: {}", e))?;
+    let response: TmdbSearchResponse =
+        serde_json::from_str(&body).map_err(|e| format!("TMDb search パース失敗: {}", e))?;
 
     let results: Vec<TmdbSearchResult> = response
         .results
@@ -337,8 +337,8 @@ fn parse_tmdb_url(
     let lower = url.to_lowercase();
 
     if lower.contains("imdb.com") {
-        let re =
-            regex::Regex::new(r"imdb\.com/title/(tt\d+)").map_err(|e| format!("regex error: {}", e))?;
+        let re = regex::Regex::new(r"imdb\.com/title/(tt\d+)")
+            .map_err(|e| format!("regex error: {}", e))?;
         if let Some(caps) = re.captures(url) {
             return Ok((Some(caps[1].to_string()), None, None));
         }
@@ -371,10 +371,7 @@ fn parse_tmdb_url(
 // Credits fetch (shared: used by both URL-based and ID-based flows)
 // ---------------------------------------------------------------------------
 
-async fn fetch_credits_for_tmdb_id(
-    media_type: &str,
-    tmdb_id: u32,
-) -> Result<ScrapeResult, String> {
+async fn fetch_credits_for_tmdb_id(media_type: &str, tmdb_id: u32) -> Result<ScrapeResult, String> {
     // Fetch details for title/synopsis
     let details_json = tmdb_get(&format!("/{}/{}", media_type, tmdb_id)).await?;
     let details: TmdbDetailsResponse = serde_json::from_str(&details_json)
@@ -402,18 +399,21 @@ async fn fetch_credits_for_tmdb_id(
                         agg.push(c);
                     }
                 }
+                eprintln!("[TMDb] aggregate_credits + credits 統合後: {}件", agg.len());
+                agg
+            }
+            (Ok(agg), Err(_)) => {
                 eprintln!(
-                    "[TMDb] aggregate_credits + credits 統合後: {}件",
+                    "[TMDb] credits 取得失敗、aggregate_credits {}件を使用",
                     agg.len()
                 );
                 agg
             }
-            (Ok(agg), Err(_)) => {
-                eprintln!("[TMDb] credits 取得失敗、aggregate_credits {}件を使用", agg.len());
-                agg
-            }
             (Err(_), Ok(reg)) => {
-                eprintln!("[TMDb] aggregate_credits 失敗、credits {}件を使用", reg.len());
+                eprintln!(
+                    "[TMDb] aggregate_credits 失敗、credits {}件を使用",
+                    reg.len()
+                );
                 reg
             }
             (Err(e), Err(_)) => {
@@ -441,7 +441,10 @@ async fn fetch_credits_for_tmdb_id(
 
 /// Fetch /tv/{id}/aggregate_credits and parse into ScrapedCharacter vec.
 async fn try_fetch_aggregate_credits(tmdb_id: u32) -> Result<Vec<ScrapedCharacter>, String> {
-    eprintln!("[TMDb] aggregate_credits取得開始: /tv/{}/aggregate_credits", tmdb_id);
+    eprintln!(
+        "[TMDb] aggregate_credits取得開始: /tv/{}/aggregate_credits",
+        tmdb_id
+    );
     let json = tmdb_get(&format!("/tv/{}/aggregate_credits", tmdb_id)).await?;
     let resp: TmdbAggregateCreditsResponse = serde_json::from_str(&json)
         .map_err(|e| format!("TMDb aggregate_credits パース失敗: {}", e))?;
@@ -470,7 +473,11 @@ async fn try_fetch_aggregate_credits(tmdb_id: u32) -> Result<Vec<ScrapedCharacte
                 c.roles
                     .into_iter()
                     .map(move |r| {
-                        let an = if actor.is_empty() { None } else { Some(actor.clone()) };
+                        let an = if actor.is_empty() {
+                            None
+                        } else {
+                            Some(actor.clone())
+                        };
                         ScrapedCharacter {
                             source_id: format!("tmdb_agg_{:03}", i),
                             character_name: r.character,
@@ -493,8 +500,8 @@ async fn try_fetch_regular_credits(
     tmdb_id: u32,
 ) -> Result<Vec<ScrapedCharacter>, String> {
     let json = tmdb_get(&format!("/{}/{}/credits", media_type, tmdb_id)).await?;
-    let resp: TmdbCreditsResponse = serde_json::from_str(&json)
-        .map_err(|e| format!("TMDb credits パース失敗: {}", e))?;
+    let resp: TmdbCreditsResponse =
+        serde_json::from_str(&json).map_err(|e| format!("TMDb credits パース失敗: {}", e))?;
 
     eprintln!("[TMDb] credits: {}件", resp.cast.len());
 
@@ -509,7 +516,11 @@ async fn try_fetch_regular_credits(
             } else {
                 c.character
             },
-            actor_name: if c.name.is_empty() { None } else { Some(c.name) },
+            actor_name: if c.name.is_empty() {
+                None
+            } else {
+                Some(c.name)
+            },
             role_type: Some("main".to_string()),
             aliases: Vec::new(),
         })
@@ -523,7 +534,10 @@ async fn try_fetch_regular_credits(
 // ---------------------------------------------------------------------------
 
 /// Fetch credits by TMDb ID and media type (main route: search → select → credits).
-pub async fn fetch_tmdb_credits_by_id(tmdb_id: u32, media_type: &str) -> Result<ScrapeResult, String> {
+pub async fn fetch_tmdb_credits_by_id(
+    tmdb_id: u32,
+    media_type: &str,
+) -> Result<ScrapeResult, String> {
     let _ = api_key()?;
     eprintln!(
         "[TMDb] fetch_tmdb_credits_by_id: {}/{}",
@@ -546,12 +560,15 @@ pub async fn scrape_tmdb_from_url(url: &str) -> Result<ScrapeResult, String> {
         (media.as_str().to_string(), id)
     } else if let Some(ref iid) = imdb_id {
         let find_json = tmdb_get(&format!("/find/{}?external_source=imdb_id", iid)).await?;
-        let find: TmdbFindResponse = serde_json::from_str(&find_json)
-            .map_err(|e| format!("TMDb find パース失敗: {}", e))?;
+        let find: TmdbFindResponse =
+            serde_json::from_str(&find_json).map_err(|e| format!("TMDb find パース失敗: {}", e))?;
 
         let movie_count = find.movie_results.len();
         let tv_count = find.tv_results.len();
-        eprintln!("[TMDb] TMDb find: tv_results={}, movie_results={}", tv_count, movie_count);
+        eprintln!(
+            "[TMDb] TMDb find: tv_results={}, movie_results={}",
+            tv_count, movie_count
+        );
 
         let movie = find.movie_results.into_iter().next();
         let tv = find.tv_results.into_iter().next();

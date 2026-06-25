@@ -1,31 +1,37 @@
 {
   "name": "contextual-subtitle-studio",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.4.0",
+  "author": "soheidon",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "diag:surface": "tsx scripts/diagnose-surface-mapping.ts"
   },
   "dependencies": {
+    "@tanstack/react-table": "^8.20.0",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
     "@tauri-apps/plugin-fs": "^2.0.0",
+    "lucide-react": "^0.400.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.26.0",
-    "zustand": "^4.5.0",
-    "@tanstack/react-table": "^8.20.0",
-    "lucide-react": "^0.400.0"
+    "zustand": "^4.5.0"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
-    "@tauri-apps/cli": "^2.0.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "tsx": "^4.22.4",
     "typescript": "^5.5.0",
     "vite": "^5.4.0",
-    "@vitejs/plugin-react": "^4.3.0"
+    "vitest": "^4.1.9"
   }
 }

@@ -1,5 +1,7 @@
 pub mod dictionary;
 pub mod drama_info;
+pub mod ja_kanji;
+pub mod ja_kanji_batch;
 pub mod llm;
 pub mod project;
 pub mod scraper;
@@ -7,6 +9,4 @@ pub mod service_settings;
 pub mod srt;
 pub mod synopsis;
 pub mod translation;
-pub mod ja_kanji;
-pub mod ja_kanji_batch;
 pub mod util;

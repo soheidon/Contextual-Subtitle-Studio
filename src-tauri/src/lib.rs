@@ -36,10 +36,7 @@ pub fn run() {
                     if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&data) {
                         if let Some(name) = settings["active_env_var"].as_str() {
                             if !name.is_empty() {
-                                let mut active = app_state
-                                    .active_env_var
-                                    .lock()
-                                    .unwrap();
+                                let mut active = app_state.active_env_var.lock().unwrap();
                                 *active = Some(name.to_string());
                             }
                         }
@@ -49,8 +46,12 @@ pub fn run() {
             app.manage(app_state);
 
             // MDL WebView extraction state
-            app.manage(scraper::mydramalist::MdlExtractState(std::sync::Mutex::new(None)));
-            app.manage(scraper::mydramalist::MdlPageInfoState(std::sync::Mutex::new(None)));
+            app.manage(scraper::mydramalist::MdlExtractState(
+                std::sync::Mutex::new(None),
+            ));
+            app.manage(scraper::mydramalist::MdlPageInfoState(
+                std::sync::Mutex::new(None),
+            ));
 
             Ok(())
         })
@@ -70,6 +71,7 @@ pub fn run() {
             commands::srt::save_srt_analysis,
             commands::srt::load_srt_analyses,
             commands::srt::resolve_synopsis_katakana,
+            commands::srt::get_translation_readiness_for_srt,
             commands::srt::resolve_unresolved_term_ai,
             commands::srt::resolve_unresolved_term_ai_openai,
             commands::srt::resolve_unresolved_terms_batch_openai,
@@ -126,6 +128,8 @@ pub fn run() {
             commands::drama_info::load_drama_info,
             commands::service_settings::get_service_settings,
             commands::service_settings::save_service_settings,
+            commands::service_settings::get_llm_task_model_settings,
+            commands::service_settings::save_llm_task_model_settings,
             commands::service_settings::test_tmdb_connection,
             commands::service_settings::test_openai_ai_confirm,
             commands::service_settings::get_provider_settings,

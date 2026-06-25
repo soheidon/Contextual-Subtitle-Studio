@@ -52,7 +52,11 @@ fn parse_ddg_results(document: &Html, max_results: usize) -> Vec<SearchSnippet> 
             .unwrap_or_default();
 
         if !title.is_empty() || !snippet.is_empty() {
-            results.push(SearchSnippet { title, snippet, url });
+            results.push(SearchSnippet {
+                title,
+                snippet,
+                url,
+            });
         }
     }
     results
@@ -62,19 +66,15 @@ pub async fn search_duckduckgo(
     query: &str,
     max_results: usize,
 ) -> Result<Vec<SearchSnippet>, String> {
-    let url = format!("https://html.duckduckgo.com/html/?q={}", encode_query(query));
+    let url = format!(
+        "https://html.duckduckgo.com/html/?q={}",
+        encode_query(query)
+    );
     let html = fetch_html(&url).await?;
-    Ok(parse_ddg_results(
-        &Html::parse_document(&html),
-        max_results,
-    ))
+    Ok(parse_ddg_results(&Html::parse_document(&html), max_results))
 }
 
-pub async fn search_drama_context(
-    title_zh: &str,
-    title_en: &str,
-    year: Option<&str>,
-) -> String {
+pub async fn search_drama_context(title_zh: &str, title_en: &str, year: Option<&str>) -> String {
     let mut all_snippets: Vec<String> = Vec::new();
 
     let year_suffix = year.map(|y| format!(" {}", y)).unwrap_or_default();
@@ -86,10 +86,7 @@ pub async fn search_drama_context(
         match result {
             Ok(Ok(results)) => {
                 for r in &results {
-                    all_snippets.push(format!(
-                        "- [{}]({})\n  {}",
-                        r.title, r.url, r.snippet
-                    ));
+                    all_snippets.push(format!("- [{}]({})\n  {}", r.title, r.url, r.snippet));
                 }
             }
             _ => {}
@@ -104,10 +101,7 @@ pub async fn search_drama_context(
         match result {
             Ok(Ok(results)) => {
                 for r in &results {
-                    all_snippets.push(format!(
-                        "- [{}]({})\n  {}",
-                        r.title, r.url, r.snippet
-                    ));
+                    all_snippets.push(format!("- [{}]({})\n  {}", r.title, r.url, r.snippet));
                 }
             }
             _ => {}
@@ -120,10 +114,7 @@ pub async fn search_drama_context(
         match result {
             Ok(Ok(results)) => {
                 for r in &results {
-                    all_snippets.push(format!(
-                        "- [{}]({})\n  {}",
-                        r.title, r.url, r.snippet
-                    ));
+                    all_snippets.push(format!("- [{}]({})\n  {}", r.title, r.url, r.snippet));
                 }
             }
             _ => {}

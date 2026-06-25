@@ -56,8 +56,10 @@ impl LlmClient {
             Some(t) => format!("{}", t),
             None => "omitted".to_string(),
         };
-        eprintln!("[DEBUG] [LLM] Chat Completions API: model={} endpoint={} temperature={}",
-            self.config.model, url, temp_status);
+        eprintln!(
+            "[DEBUG] [LLM] Chat Completions API: model={} endpoint={} temperature={}",
+            self.config.model, url, temp_status
+        );
 
         let response = self
             .client
@@ -72,10 +74,16 @@ impl LlmClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            eprintln!("[ERROR] [LLM] Chat Completions API HTTP {}: {}",
+            eprintln!(
+                "[ERROR] [LLM] Chat Completions API HTTP {}: {}",
                 status.as_u16(),
-                crate::log::preview_chars(&body, 500));
-            return Err(format!("API error ({}): {}", status, crate::log::preview_chars(&body, 500)));
+                crate::log::preview_chars(&body, 500)
+            );
+            return Err(format!(
+                "API error ({}): {}",
+                status,
+                crate::log::preview_chars(&body, 500)
+            ));
         }
 
         let completion: ChatCompletionResponse = response
@@ -96,11 +104,7 @@ impl LlmClient {
     }
 
     /// Send a chat completion request expecting a JSON response and return the parsed value.
-    pub async fn chat_json(
-        &self,
-        system_prompt: &str,
-        user_prompt: &str,
-    ) -> Result<Value, String> {
+    pub async fn chat_json(&self, system_prompt: &str, user_prompt: &str) -> Result<Value, String> {
         let messages = vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -113,8 +117,13 @@ impl LlmClient {
         ];
         let response = self.chat(&messages, true).await?;
         let cleaned = extract_json(&response);
-        serde_json::from_str(&cleaned)
-            .map_err(|e| format!("Failed to parse JSON response: {} (raw: {})", e, crate::log::preview_chars(&response, 200)))
+        serde_json::from_str(&cleaned).map_err(|e| {
+            format!(
+                "Failed to parse JSON response: {} (raw: {})",
+                e,
+                crate::log::preview_chars(&response, 200)
+            )
+        })
     }
 
     /// Test the connection by sending a minimal request.
@@ -172,8 +181,7 @@ impl LlmClient {
 
         let response = self.chat(&messages, true).await?;
         let cleaned = extract_json(&response);
-        serde_json::from_str(&cleaned)
-            .map_err(|e| format!("Failed to parse JSON response: {}", e))
+        serde_json::from_str(&cleaned).map_err(|e| format!("Failed to parse JSON response: {}", e))
     }
 }
 
@@ -212,10 +220,7 @@ pub fn extract_json(raw: &str) -> &str {
     if let Some(fence_start) = trimmed.find("```") {
         let after_open = &trimmed[fence_start + 3..];
         // Skip optional language tag on the same line as opening ```
-        let body_start = after_open
-            .find('\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
+        let body_start = after_open.find('\n').map(|i| i + 1).unwrap_or(0);
         let body = &after_open[body_start..];
         // Find the closing ```
         if let Some(fence_end) = body.find("```") {
